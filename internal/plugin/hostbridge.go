@@ -102,6 +102,20 @@ func (b *HostBridge) AuthList(ctx context.Context) ([]pluginapi.HostAuthFileEntr
 	return resp.Files, nil
 }
 
+// AuthGet reads the physical credential selected by the host. Host error text
+// can contain credential JSON, so it must never leave this bridge.
+func (b *HostBridge) AuthGet(ctx context.Context, authIndex string) (pluginapi.HostAuthGetResponse, error) {
+	env, err := b.invoke(ctx, pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: authIndex}, "host auth get")
+	if err != nil {
+		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed")
+	}
+	var resp pluginapi.HostAuthGetResponse
+	if json.Unmarshal(env.Result, &resp) != nil || len(resp.JSON) == 0 {
+		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed: invalid response")
+	}
+	return resp, nil
+}
+
 // hostStreamIDReq addresses an existing stream by its ID.
 type hostStreamIDReq struct {
 	StreamID string `json:"stream_id"`

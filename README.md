@@ -1,14 +1,14 @@
-# CommandCode Go/GOAT/Pro/Max CLIProxyAPI Plugin
+# CommandCode GOAT CLIProxyAPI Plugin
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native dynamic Go plugin for [CLIProxyAPI](https://help.router-for.me/plugin/development) that exposes a **CommandCode Go/GOAT/Pro/Max** plan as a single provider (`commandcode`; published model ids carry the `commandcode/` prefix).
+A native dynamic Go plugin for [CLIProxyAPI](https://help.router-for.me/plugin/development) that exposes a **CommandCode GOAT** plan as a single provider (`commandcode`; published model ids carry the `commandcode/` prefix).
 
-The plugin owns model discovery, protocol translation, execution, key scheduling, and a quota page for the CommandCode account surface, so one API-key pool serves OpenAI, Anthropic, and Responses clients through CLIProxyAPI.
+The plugin owns model discovery, protocol translation, execution, and the CommandCode accounts and quota page. API keys come only from CLIProxyAPI auth files, so those accounts serve OpenAI, Anthropic, and Responses clients.
 
 ## What the upstream actually serves
 
-CommandCode Go/GOAT/Pro/Max is reached through its OpenAI-compatible provider surface:
+CommandCode GOAT is reached through its OpenAI-compatible provider surface:
 
 | Upstream route | Status |
 |---|---|
@@ -23,7 +23,7 @@ Because there is exactly one usable route for the catalog, **every model discove
 
 ## The Problem
 
-Without this plugin, using a CommandCode Go/GOAT/Pro/Max plan in CLIProxyAPI requires hand-written provider blocks per protocol family, and the pieces that CLI clients depend on are missing or wrong:
+Without this plugin, using a CommandCode GOAT plan in CLIProxyAPI requires hand-written provider blocks per protocol family, and the pieces that CLI clients depend on are missing or wrong:
 
 - **Duplicated configuration & keys**: the same keys must be configured in several provider blocks.
 - **Fragmented scheduling**: rotation, rate limits, and cooldowns cannot be shared, and the Management Center cannot show per-key usage.
@@ -33,7 +33,7 @@ Without this plugin, using a CommandCode Go/GOAT/Pro/Max plan in CLIProxyAPI req
 
 ## The Solution
 
-- **Unified auth pool**: the plugin registers each configured key as a CLIProxyAPI auth record, so the host's scheduler handles rotation, retries, error cooldowns, session affinity, and per-key statistics.
+- **Auth files are the only key source**: accounts are CLIProxyAPI auth files, not plugin `api-keys`. In Management Center → **CommandCode** → **CommandCode accounts and quota**, paste an API key and save it. You do not need to write JSON yourself; uploading an auth file still works. Disable and delete stay on the host auth-file page. Rotation, retries, cooldowns, session affinity, and per-account statistics stay with the host scheduler.
 - **Transparent translation & routing**: clients ask for `commandcode/<upstream-id>` and never need to know the upstream protocol.
 - **Reasoning fidelity**: upstream thinking text is preserved for all three client formats, and `reasoning_effort` is forwarded verbatim when the model declares no capability.
 - **One model catalog**: everything published by `{base-url}/models` is discoverable under the `commandcode/` prefix in `/v1/models`.
@@ -47,9 +47,9 @@ Without this plugin, using a CommandCode Go/GOAT/Pro/Max plan in CLIProxyAPI req
   - Responses clients get a leading `reasoning` output item with `response.reasoning_summary_*` events;
   - OpenAI clients get `reasoning_content` backfilled onto each chunk while the vendor fields stay intact.
 - **Capability-aware Reasoning Controls**: an explicit `route-overrides` declaration (or catalog thinking metadata) re-enables eager validation and clamping; with nothing declared, the client's `reasoning_effort` is forwarded verbatim (`auto`/`none` omit the field) and the upstream is the authority.
-- **Dynamic Catalog Discovery**: remote catalog with local fallback, deduplication, and diagnostics for what was excluded.
-- **CommandCode Quota Page**: a Management Center page listing every configured credential with its account email, plan, remaining plan credits, and the rolling 5-hour/weekly windows (used, cap, reset time), refreshed per card on demand.
-- **Multi-Key Auth Scheduling**: one key pool shared across all protocols through CLIProxyAPI's native scheduler.
+- **Dynamic Catalog Discovery**: remote catalog with local fallback, deduplication, and diagnostics for what was excluded. Discovery runs only when at least one account is enabled.
+- **CommandCode accounts and quota**: Management Center menu **CommandCode**, page **CommandCode accounts and quota** (CommandCode账户与额度). Paste an API key and save it as an auth file, then see each account's email, plan, remaining plan credits, and the rolling 5-hour/weekly windows (used, cap, reset time). Each card refreshes on demand. The plugin can start with no accounts.
+- **Host auth scheduling**: enabled auth-file accounts are shared across protocols by CLIProxyAPI's scheduler. Plugin config does not hold a key pool, and a retired `api-keys` block is not imported into one.
 
 ## Requirements
 
@@ -90,10 +90,8 @@ plugins:
         enabled: true              # true -> "commandcode/<model>" (default: true)
         value: "commandcode"
 
-      # CommandCode API keys (at least one required); supports ${ENV_VAR}
-      api-keys:
-        - value: "user_xxx"
-        - value: "${COMMANDCODE_API_KEY}"
+      # Accounts are CLIProxyAPI auth files, not keys in this file.
+      # Management Center → CommandCode → CommandCode accounts and quota.
 
       # Catalog discovery
       catalog:
@@ -122,7 +120,7 @@ plugins:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `api-keys` | `[]object` | *(Required)* | List of API keys (`- value: "..."`). Supports `${ENV_VAR}` expansion. Duplicates and empty values are rejected. |
+| `api-keys` | — | ignored | Retired. Not a key source. See [Accounts](#accounts). |
 | `base-url` | `string` | `https://api.commandcode.ai/provider/v1` | Upstream provider base URL. Valid HTTPS (or HTTP with `allow-http: true`), no query, fragment, or userinfo. |
 | `catalog-url` | `string` | `{base-url}/models` | Catalog discovery URL. |
 | `model-prefix.enabled` | `bool` | `true` | Client-facing ids use `<prefix>/<model>`; `false` publishes bare upstream ids. |
@@ -135,8 +133,18 @@ plugins:
 | `max-response-bytes` | `int64` | `67108864` | Maximum non-streaming response body size. |
 | `allow-http` | `bool` | `false` | Permit `http://` upstreams for local testing. |
 
+### Accounts
+
+API keys are not configured in this YAML. CLIProxyAPI auth files are the only source.
+
+- **Add**: Management Center → **CommandCode** → **CommandCode accounts and quota** (CommandCode账户与额度). Paste an API key and save. You do not need to upload a hand-written JSON file; uploading an auth file yourself still works.
+- **Disable / delete**: still on the host auth-file page, not on this page.
+- **No accounts**: the plugin can start. Catalog discovery runs only when at least one account is enabled, so this provider publishes nothing until then.
+- **Old `api-keys`**: an existing install may keep the block. The accounts page warns that it is ignored. It is not imported, not saved, and not used for routing, catalog discovery, or quota, and it cannot bring back an account you deleted. After you confirm the auth files are the accounts you want, remove the block yourself.
+
 ### Quota page
-The `CommandCode Quota` page (Management Center → plugins) reads the account surface on the same authority as `base-url`:
+
+The **CommandCode accounts and quota** page (Management Center → **CommandCode**) reads the account surface on the same authority as `base-url`:
 
 | Endpoint | Purpose |
 |---|---|
@@ -144,7 +152,9 @@ The `CommandCode Quota` page (Management Center → plugins) reads the account s
 | `GET {authority}/alpha/billing/subscriptions` | Plan id/status |
 | `GET {authority}/alpha/whoami?limits=1` | Account email for the card label |
 
-`{authority}` is derived from `base-url` by trimming its provider path (`/provider/v1`). Each card is refreshed manually and independently; the page never polls, and quota values never influence routing.
+`{authority}` is derived from `base-url` by trimming its provider path (`/provider/v1`). Cards are host auth files, not `api-keys` entries. Each card is refreshed manually and independently; the page never polls, and quota values never influence routing.
+
+**Known email-sync limitation**: after discovering an email, the plugin attempts to update the original auth file so both pages can display it. It checks for prior deletion or changes, but the final check and file replacement are not atomic with host edits. Concurrent deletion, disabling, or metadata edits can be overwritten, and a deleted file can be recreated. Keeping email on both pages retains this risk. Wait for quota refreshes to finish before editing auth files, then reload the list to confirm the result.
 
 ### Reasoning effort
 
@@ -163,6 +173,15 @@ go test ./...        # unit + mocked end-to-end tests
 go test ./... -cover # with coverage
 go vet ./...         # vetting
 ```
+
+The optional browser regression test covers adding accounts, keeping API keys out of browser storage, deleted/stale responses, disabled state, and mobile/dark layouts. It uses local mock endpoints only:
+
+```bash
+npx --yes playwright install chromium
+npx --yes -p playwright -c 'NODE_PATH=$(dirname $(dirname $(command -v playwright))) node tests/accounts_page.cjs'
+```
+
+Alternatively, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an existing Chrome executable and skip the browser download.
 
 ## Provenance
 

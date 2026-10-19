@@ -3,12 +3,11 @@ package plugin
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,7 +46,7 @@ type fakeCaller struct {
 	mu        sync.Mutex
 	calls     []capturedCall
 	responder func(method string, payload []byte) ([]byte, error)
-	authFiles map[string]struct{}
+	authFiles map[string]json.RawMessage
 }
 
 func (f *fakeCaller) call(method string, payload []byte) ([]byte, error) {
@@ -64,14 +63,30 @@ func (f *fakeCaller) call(method string, payload []byte) ([]byte, error) {
 	if method == pluginabi.MethodHostAuthList && err == nil && !hasExplicitAuthList(raw) {
 		return f.authListResponse(), nil
 	}
+	if method == pluginabi.MethodHostAuthGet && err == nil && hostEnvelopeOK(raw) {
+		var env pluginabi.Envelope
+		_ = json.Unmarshal(raw, &env)
+		var result map[string]json.RawMessage
+		_ = json.Unmarshal(env.Result, &result)
+		if _, ok := result["json"]; !ok {
+			var req pluginapi.HostAuthGetRequest
+			_ = json.Unmarshal(payload, &req)
+			f.mu.Lock()
+			f.initAuthFiles()
+			record, ok := f.authFiles[req.AuthIndex]
+			f.mu.Unlock()
+			if !ok {
+				return hostErr("not_found", "auth file not found"), nil
+			}
+			return hostOK(pluginapi.HostAuthGetResponse{AuthIndex: req.AuthIndex, Name: req.AuthIndex, JSON: record}), nil
+		}
+	}
 	if method == pluginabi.MethodHostAuthSave && err == nil && hostEnvelopeOK(raw) {
 		var req pluginapi.HostAuthSaveRequest
 		if json.Unmarshal(payload, &req) == nil && strings.TrimSpace(req.Name) != "" {
 			f.mu.Lock()
-			if f.authFiles == nil {
-				f.authFiles = make(map[string]struct{})
-			}
-			f.authFiles[req.Name] = struct{}{}
+			f.initAuthFiles()
+			f.authFiles[req.Name] = append(json.RawMessage(nil), req.JSON...)
 			f.mu.Unlock()
 		}
 	}
@@ -96,15 +111,40 @@ func hasExplicitAuthList(raw []byte) bool {
 	return ok
 }
 
+func (f *fakeCaller) initAuthFiles() {
+	if f.authFiles == nil {
+		raw, _ := json.Marshal(map[string]any{"type": ProviderID, "api_key": testKey})
+		f.authFiles = map[string]json.RawMessage{authFileNameFromHash(authKeyHash(testKey)): raw}
+	}
+}
+
+func (f *fakeCaller) setAuthFiles(keys ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authFiles = make(map[string]json.RawMessage)
+	for _, key := range keys {
+		raw, _ := json.Marshal(map[string]any{"type": ProviderID, "api_key": key})
+		f.authFiles[authFileNameFromHash(authKeyHash(key))] = raw
+	}
+}
+
 func (f *fakeCaller) authListResponse() []byte {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.initAuthFiles()
 	files := make([]pluginapi.HostAuthFileEntry, 0, len(f.authFiles))
-	for name := range f.authFiles {
+	for name, raw := range f.authFiles {
+		var record struct {
+			Type, Email string
+			Disabled    bool
+		}
+		_ = json.Unmarshal(raw, &record)
 		files = append(files, pluginapi.HostAuthFileEntry{
-			ID: strings.TrimSuffix(name, ".json"), Name: name, Source: "file", Path: name,
+			ID: name, AuthIndex: name, Name: name, Provider: record.Type, Email: record.Email,
+			Disabled: record.Disabled, Source: "file", Path: name,
 		})
 	}
-	f.mu.Unlock()
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 	return hostOK(hostAuthListResponse{Files: files})
 }
 
@@ -224,12 +264,12 @@ func installFastLoop(t *testing.T, m *Manager, yamlText string) {
 func manualTick(t *testing.T, m *Manager) {
 	t.Helper()
 	m.mu.RLock()
-	mgr, cfg := m.mgr, m.cfg
+	mgr := m.mgr
 	m.mu.RUnlock()
 	if mgr == nil {
 		t.Fatal("no served manager to tick")
 	}
-	if err := refreshOnce(context.Background(), mgr, m.bridge, time.Second, cfg); err != nil {
+	if err := refreshOnce(context.Background(), mgr, m.bridge, time.Second); err != nil {
 		t.Fatalf("tick refresh: %v", err)
 	}
 }
@@ -478,119 +518,55 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	}
 }
 
-func TestLifecycleMaterializesDeterministicAuthRecords(t *testing.T) {
-	first, second, third := "sk-materialize-a", "sk-materialize-b", "sk-materialize-c"
-	yamlText := "api-keys:\n  - value: " + first + "\n  - value: " + second + "\n"
+func TestLifecycleNeverImportsLegacyKeys(t *testing.T) {
 	f := &fakeCaller{responder: catalogResponder(true, testCatalogJSON)}
+	f.setAuthFiles()
 	m := NewManager(NewHostBridge(f.call))
 	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
-	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(yamlText)); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	if _, err := m.HandleCall("plugin.reconfigure", lifecycleRequestBody("api-keys:\n  - value: "+second+"\n  - value: "+first+"\n")); err != nil {
-		t.Fatalf("reconfigure: %v", err)
-	}
-	calls := f.callsOf(pluginabi.MethodHostAuthSave)
-	if len(calls) != 2 {
-		t.Fatalf("unchanged reconfigure auth saves = %d, want 2", len(calls))
-	}
-	seen := map[string]bool{}
-	for _, call := range calls {
-		var wire pluginapi.HostAuthSaveRequest
-		if err := json.Unmarshal(call.payload, &wire); err != nil {
-			t.Fatalf("auth payload: %v", err)
+	for _, method := range []string{"plugin.register", "plugin.reconfigure"} {
+		resp, err := m.HandleCall(method, lifecycleRequestBody(testValidYAML))
+		if err != nil || !decodeEnv(t, resp).OK {
+			t.Fatalf("%s: %s %v", method, resp, err)
 		}
-		var record struct {
-			Type   string `json:"type"`
-			ID     string `json:"id"`
-			Label  string `json:"label"`
-			APIKey string `json:"api_key"`
-		}
-		if err := json.Unmarshal(wire.JSON, &record); err != nil {
-			t.Fatalf("auth record: %v", err)
-		}
-		hash := sha256.Sum256([]byte(record.APIKey))
-		wantHash := hex.EncodeToString(hash[:])
-		if record.Type != ProviderID || record.ID != "commandcode-key-"+wantHash || record.Label != "CommandCode credential "+wantHash || wire.Name != record.ID+".json" {
-			t.Fatalf("record identity = %+v name=%q", record, wire.Name)
-		}
-		if record.APIKey == "" || strings.Contains(wire.Name, record.APIKey) || strings.Contains(record.ID, record.APIKey) {
-			t.Fatalf("secret leaked in identity: %+v name=%q", record, wire.Name)
-		}
-		seen[record.APIKey] = true
 	}
-	if len(seen) != 2 {
-		t.Fatalf("materialized keys = %v", seen)
+	if len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 || len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
+		t.Fatal("legacy config key was imported or used for discovery")
 	}
-	if _, err := m.HandleCall("plugin.reconfigure", lifecycleRequestBody("api-keys:\n  - value: "+first+"\n")); err != nil {
-		t.Fatalf("removed-key reconfigure: %v", err)
-	}
-	// No delete callback exists in the pinned ABI: the old record is stale and
-	// remains in CPA rather than being falsely reported as removed.
-	if len(f.callsOf(pluginabi.MethodHostAuthSave)) != 2 {
-		t.Fatalf("removed-key reconfigure changed save count = %d, want 2", len(f.callsOf(pluginabi.MethodHostAuthSave)))
-	}
-	if _, err := m.HandleCall("plugin.reconfigure", lifecycleRequestBody("api-keys:\n  - value: "+first+"\n  - value: "+third+"\n")); err != nil {
-		t.Fatalf("new-key reconfigure: %v", err)
-	}
-	calls = f.callsOf(pluginabi.MethodHostAuthSave)
-	if len(calls) != 3 {
-		t.Fatalf("new-key reconfigure auth saves = %d, want 3", len(calls))
-	}
-	var newRecord struct {
-		APIKey string `json:"api_key"`
-	}
-	var wire pluginapi.HostAuthSaveRequest
-	if err := json.Unmarshal(calls[2].payload, &wire); err != nil {
-		t.Fatalf("new auth wire: %v", err)
-	}
-	if err := json.Unmarshal(wire.JSON, &newRecord); err != nil || newRecord.APIKey != third {
-		t.Fatalf("new auth record = %+v, want key %q", newRecord, third)
+	if len(m.mgr.Models()) != 0 {
+		t.Fatal("keyless startup must have an empty catalog")
 	}
 }
 
 func TestLifecycleUsesCPAAuthListAfterManagerRestart(t *testing.T) {
 	f := &fakeCaller{responder: catalogResponder(true, testCatalogJSON)}
-	first := NewManager(NewHostBridge(f.call))
-	if _, err := first.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML)); err != nil {
-		t.Fatalf("first register: %v", err)
+	for i := 0; i < 2; i++ {
+		m := NewManager(NewHostBridge(f.call))
+		resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(""))
+		if err != nil || !decodeEnv(t, resp).OK || len(m.mgr.Models()) != 1 {
+			t.Fatalf("restart %d: %s %v", i, resp, err)
+		}
+		_, _ = m.HandleCall("plugin.shutdown", nil)
 	}
-	if _, err := first.HandleCall("plugin.shutdown", nil); err != nil {
-		t.Fatalf("first shutdown: %v", err)
-	}
-
-	second := NewManager(NewHostBridge(f.call))
-	t.Cleanup(func() { _, _ = second.HandleCall("plugin.shutdown", nil) })
-	if _, err := second.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML)); err != nil {
-		t.Fatalf("second register: %v", err)
-	}
-	if got := len(f.callsOf(pluginabi.MethodHostAuthSave)); got != 1 {
-		t.Fatalf("auth saves after manager restart = %d, want 1", got)
+	if len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 {
+		t.Fatal("restart rewrote auth files")
 	}
 }
 
 func TestLifecycleAuthListFailureDoesNotWrite(t *testing.T) {
 	f := &fakeCaller{responder: func(method string, _ []byte) ([]byte, error) {
 		if method == pluginabi.MethodHostAuthList {
-			return hostErr("auth_unavailable", "auth directory unavailable"), nil
+			return hostErr("unavailable", "sensitive host detail"), nil
 		}
 		return hostOK(map[string]any{}), nil
 	}}
 	m := NewManager(NewHostBridge(f.call))
 	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
-	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML))
-	if err != nil {
-		t.Fatalf("register: %v", err)
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(""))
+	if err != nil || !decodeEnv(t, resp).OK {
+		t.Fatalf("registration: %s %v", resp, err)
 	}
-	env := decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" {
-		t.Fatalf("list failure envelope = %+v", env.Error)
-	}
-	if got := len(f.callsOf(pluginabi.MethodHostAuthSave)); got != 0 {
-		t.Fatalf("auth saves after list failure = %d, want 0", got)
-	}
-	if got := len(f.callsOf(pluginabi.MethodHostHTTPDo)); got != 0 {
-		t.Fatalf("catalog calls after list failure = %d, want 0", got)
+	if len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 || len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
+		t.Fatal("unavailable auth list caused writes or upstream calls")
 	}
 }
 
@@ -735,8 +711,8 @@ func TestRegisterRefreshesWithConfiguredBearer(t *testing.T) {
 		t.Fatalf("bridge payload: %v", err)
 	}
 	headers := wire["headers"].(map[string]any)
-	if headers["Authorization"].([]any)[0].(string) != "Bearer "+dummyKey {
-		t.Fatalf("expected configured bearer key, got %v", headers)
+	if headers["Authorization"].([]any)[0].(string) != "Bearer "+testKey {
+		t.Fatalf("expected host credential bearer key, got %v", headers)
 	}
 }
 
@@ -964,8 +940,8 @@ func TestOverlappingLifecyclesLeaveSingleTicker(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if got := len(f.callsOf(pluginabi.MethodHostAuthSave)); got != 1 {
-		t.Fatalf("overlapping lifecycle auth saves = %d, want 1", got)
+	if got := len(f.callsOf(pluginabi.MethodHostAuthSave)); got != 0 {
+		t.Fatalf("overlapping lifecycle auth saves = %d, want 0", got)
 	}
 	done := m.closeStop()
 	if done == nil {

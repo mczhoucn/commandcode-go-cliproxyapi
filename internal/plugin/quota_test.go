@@ -22,10 +22,10 @@ func TestManagementRegistration(t *testing.T) {
 		Resources []struct{ Path, Menu, Description string } `json:"resources"`
 	}
 	decodeResult(t, mustHandle(t, m, pluginabi.MethodManagementRegister, []byte(`{}`)), &got)
-	if len(got.Routes) != 1 || got.Routes[0].Method != http.MethodPost || got.Routes[0].Path != "/plugins/"+pluginName+"/quota-usage" {
+	if len(got.Routes) != 2 || got.Routes[0].Method != http.MethodPost || got.Routes[0].Path != "/plugins/"+pluginName+"/quota-usage" || got.Routes[1].Path != "/plugins/"+pluginName+"/accounts" {
 		t.Fatalf("routes = %+v", got.Routes)
 	}
-	if len(got.Resources) != 1 || got.Resources[0].Path != "/quota" || got.Resources[0].Menu != "CommandCode Quota" {
+	if len(got.Resources) != 1 || got.Resources[0].Path != "/quota" || got.Resources[0].Menu != "CommandCode" {
 		t.Fatalf("resources = %+v", got.Resources)
 	}
 	var registration registrationResult
@@ -38,7 +38,7 @@ func TestManagementRegistration(t *testing.T) {
 func TestQuotaListDoesNotCallHost(t *testing.T) {
 	f := &fakeCaller{}
 	m := NewManager(NewHostBridge(f.call))
-	m.cfg = config.Config{APIKeys: []config.APIKey{{Value: "quota-key-a"}, {Value: "quota-key-b"}}}
+	f.setAuthFiles("quota-key-a", "quota-key-b")
 	var got quotaList
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{}`)})
 	if err != nil {
@@ -47,7 +47,7 @@ func TestQuotaListDoesNotCallHost(t *testing.T) {
 	if err := json.Unmarshal(resp.Body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Cards) != 2 || got.Cards[0].Label != "CommandCode credential "+mustHashPrefix("quota-key-a") || got.Cards[1].Label != "CommandCode credential "+mustHashPrefix("quota-key-b") {
+	if len(got.Cards) != 2 || got.Cards[0].FileName == "" || got.Cards[1].FileName == "" {
 		t.Fatalf("cards = %+v", got.Cards)
 	}
 	if strings.Contains(string(resp.Body), "quota-key-") || len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
@@ -60,20 +60,19 @@ func TestQuotaListDoesNotCallHost(t *testing.T) {
 
 func TestQuotaListSurfacesStoredEmail(t *testing.T) {
 	const key = "quota-list-email-secret"
-	id, _ := quotaIdentity(key)
+	id := authFileNameFromHash(authKeyHash(key))
 	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
 		if method == pluginabi.MethodHostHTTPDo {
 			t.Fatal("list must not call upstream")
 		}
 		if method == pluginabi.MethodHostAuthList {
 			return hostOK(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{{
-				ID: id, Name: id + ".json", Email: "dev@example.test", Source: "file",
+				ID: id, AuthIndex: id, Provider: ProviderID, Name: id, Email: "dev@example.test", Source: "file",
 			}}}), nil
 		}
 		return hostOK(map[string]any{}), nil
 	}}
 	m := NewManager(NewHostBridge(f.call))
-	m.cfg = config.Config{APIKeys: []config.APIKey{{Value: key}}}
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -125,8 +124,9 @@ func TestQuotaRefresh(t *testing.T) {
 	m := NewManager(NewHostBridge(f.call))
 	// base-url carries the OpenAI-compatible surface; the account calls must
 	// land on the same authority at /alpha/*.
-	m.cfg = config.Config{BaseURL: "https://quota.test/provider/v1", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
-	id, _ := quotaIdentity(key)
+	m.cfg = config.Config{BaseURL: "https://quota.test/provider/v1", RequestTimeout: config.DefaultRequestTimeout}
+	f.setAuthFiles(key)
+	id := authFileNameFromHash(authKeyHash(key))
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -218,8 +218,9 @@ func TestQuotaRefreshExhaustedAccount(t *testing.T) {
 		return nil, nil
 	}}
 	m := NewManager(NewHostBridge(f.call))
-	m.cfg = config.Config{BaseURL: "https://quota.test/provider/v1", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
-	id, _ := quotaIdentity(key)
+	m.cfg = config.Config{BaseURL: "https://quota.test/provider/v1", RequestTimeout: config.DefaultRequestTimeout}
+	f.setAuthFiles(key)
+	id := authFileNameFromHash(authKeyHash(key))
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -401,14 +402,14 @@ func TestQuotaUnknownKeyAndResource(t *testing.T) {
 	const key = "quota-known-secret"
 	f := &fakeCaller{}
 	m := NewManager(NewHostBridge(f.call))
-	m.cfg = config.Config{APIKeys: []config.APIKey{{Value: key}}}
+	f.setAuthFiles(key)
 	unknown := "commandcode-key-unknown"
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + unknown + `"}`)})
 	if err != nil || resp.StatusCode != http.StatusNotFound || strings.Contains(string(resp.Body), key) || strings.Contains(string(resp.Body), unknown) || len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
 		t.Fatalf("unknown response = %+v err=%v calls=%v", resp, err, f.callsOf(pluginabi.MethodHostHTTPDo))
 	}
 	resource, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/" + pluginName + "/quota"})
-	if err != nil || resource.StatusCode != 0 || resource.Headers.Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(string(resource.Body), "CommandCode Quota") || strings.Contains(string(resource.Body), key) {
+	if err != nil || resource.StatusCode != 0 || resource.Headers.Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(string(resource.Body), "CommandCode") || strings.Contains(string(resource.Body), key) {
 		t.Fatalf("resource response = %+v err=%v", resource, err)
 	}
 }
@@ -432,7 +433,7 @@ func TestQuotaPageDecodesCurrentCPAAuthStorage(t *testing.T) {
 // response.
 func TestQuotaErrorsAreRedacted(t *testing.T) {
 	const key = "quota-error-secret"
-	id, _ := quotaIdentity(key)
+	id := authFileNameFromHash(authKeyHash(key))
 	for name, responder := range map[string]func(string, []byte) ([]byte, error){
 		"bridge": func(string, []byte) ([]byte, error) { return nil, context.Canceled },
 		"status": func(string, []byte) ([]byte, error) {
@@ -443,9 +444,15 @@ func TestQuotaErrorsAreRedacted(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			f := &fakeCaller{responder: responder}
+			f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+				if method == pluginabi.MethodHostHTTPDo {
+					return responder(method, payload)
+				}
+				return hostOK(map[string]any{}), nil
+			}}
 			m := NewManager(NewHostBridge(f.call))
-			m.cfg = config.Config{BaseURL: "https://quota.test/provider/v1", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
+			m.cfg = config.Config{BaseURL: "https://quota.test/provider/v1", RequestTimeout: config.DefaultRequestTimeout}
+			f.setAuthFiles(key)
 			resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
 			if err != nil || resp.StatusCode != 0 || strings.Contains(string(resp.Body), key) || strings.Contains(string(resp.Body), "upstream body") {
 				t.Fatalf("response = %+v err=%v", resp, err)
@@ -457,7 +464,7 @@ func TestQuotaErrorsAreRedacted(t *testing.T) {
 			if got.Error == "" || got.Usage != nil {
 				t.Fatalf("card = %+v, want an error and no usage", got)
 			}
-			if got.Label != "CommandCode credential "+mustHashPrefix(key) {
+			if got.Label != authFileNameFromHash(authKeyHash(key)) {
 				t.Errorf("label = %q, want the credential fallback label", got.Label)
 			}
 		})
@@ -575,9 +582,4 @@ func TestQuotaPageUsesNativeQuotaStylesAndThemeBridge(t *testing.T) {
 			t.Fatalf("quota page still clones parent styles: %q", marker)
 		}
 	}
-}
-
-func mustHashPrefix(key string) string {
-	_, label := quotaIdentity(key)
-	return strings.TrimPrefix(label, "CommandCode credential ")
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,12 +17,22 @@ func requireErrContains(t *testing.T, err error, want string) {
 	}
 }
 
-// withKey satisfies the at-least-one-key rule (spec 04 §3) for fixtures
-// that target a later validation check.
+func assertLegacyMaterialDiscarded(t *testing.T, c Config, secrets ...string) {
+	t.Helper()
+	dump := fmt.Sprintf("%+v", c)
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(dump, secret) {
+			t.Errorf("config retained legacy api-keys material %q: %+v", secret, c)
+		}
+	}
+}
+
+// withKey is a retired api-keys block. Fixtures include it only to prove
+// that a legacy entry does not change validation of any other field.
 const withKey = "api-keys:\n  - value: sk-dummy\n"
 
 func TestLoadMinimalAppliesAllDefaults(t *testing.T) {
-	c, err := Load([]byte(withKey))
+	c, err := Load(nil)
 	if err != nil {
 		t.Fatalf("Load(minimal) failed: %v", err)
 	}
@@ -34,8 +45,8 @@ func TestLoadMinimalAppliesAllDefaults(t *testing.T) {
 	if !c.ModelPrefix.Enabled || c.ModelPrefix.Value != "commandcode" {
 		t.Errorf("ModelPrefix = %+v", c.ModelPrefix)
 	}
-	if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "sk-dummy" {
-		t.Errorf("APIKeys = %+v", c.APIKeys)
+	if c.LegacyAPIKeys {
+		t.Errorf("LegacyAPIKeys = true, want false when api-keys is absent")
 	}
 	if c.Catalog.RefreshInterval != 15*time.Minute {
 		t.Errorf("RefreshInterval = %v", c.Catalog.RefreshInterval)
@@ -97,9 +108,10 @@ max-response-bytes: 1024
 	if !c.ModelPrefix.Enabled || c.ModelPrefix.Value != "myprefix" {
 		t.Errorf("ModelPrefix = %+v", c.ModelPrefix)
 	}
-	if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "test-secret-value" {
-		t.Errorf("APIKeys = %+v", c.APIKeys)
+	if !c.LegacyAPIKeys {
+		t.Errorf("LegacyAPIKeys = false, want true when api-keys is present")
 	}
+	assertLegacyMaterialDiscarded(t, c, "test-secret-value", "${TEST_OG_KEY}")
 	if c.Catalog.RefreshInterval != time.Hour {
 		t.Errorf("RefreshInterval = %v", c.Catalog.RefreshInterval)
 	}
@@ -124,23 +136,83 @@ max-response-bytes: 1024
 	}
 }
 
-func TestLoadEnvExpansion(t *testing.T) {
-	t.Setenv("TEST_OG_KEY", "expanded-secret")
-	c, err := Load([]byte("api-keys:\n  - value: ${TEST_OG_KEY}\n"))
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
+func TestLoadWithoutAPIKeysAppliesDefaults(t *testing.T) {
+	inputs := [][]byte{nil, {}, []byte(""), []byte("\n"), []byte("# no keys\n"), []byte("allow-http: false\n")}
+	for _, in := range inputs {
+		c, err := Load(in)
+		if err != nil {
+			t.Fatalf("Load(%q) = %v, want an empty config to use defaults", in, err)
+		}
+		if c.LegacyAPIKeys {
+			t.Fatalf("Load(%q) LegacyAPIKeys = true, want false", in)
+		}
+		if c.BaseURL != DefaultBaseURL || c.CatalogURL != DefaultBaseURL+"/models" {
+			t.Fatalf("Load(%q) BaseURL=%q CatalogURL=%q", in, c.BaseURL, c.CatalogURL)
+		}
 	}
-	if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "expanded-secret" {
-		t.Fatalf("APIKeys = %+v", c.APIKeys)
+}
+
+func TestLoadLegacyAPIKeysIgnored(t *testing.T) {
+	t.Setenv("TEST_OG_KEY", "expanded-secret")
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"unset env", "api-keys:\n  - value: ${TEST_OG_DEFINITELY_UNSET_VAR}\n"},
+		{"set env is not expanded or stored", "api-keys:\n  - value: ${TEST_OG_KEY}\n"},
+		{"duplicate values", "api-keys:\n  - value: sk-live-dupsecret-7\n  - value: sk-live-dupsecret-7\n"},
+		{"bare scalar", "api-keys:\n  - sk-live-supersecret-42\n"},
+		{"empty value", "api-keys:\n  - value: \"\"\n"},
+		{"null", "api-keys: null\n"},
+		{"empty list", "api-keys: []\n"},
+		{"blank", "api-keys:\n"},
+		{"priority field", "api-keys:\n  - value: sk-priority-secret\n    priority: 7\n"},
+		{"scalar string", "api-keys: sk-live-scalar-9\n"},
+		{"mapping", "api-keys:\n  value: sk-mapping-secret\n"},
+		{"number", "api-keys: 12\n"},
+		{"mixed invalid shapes", "api-keys:\n  - value: ${TEST_OG_DEFINITELY_UNSET_VAR}\n  - value: ${TEST_OG_DEFINITELY_UNSET_VAR}\n  - sk-bare-old-shape\n"},
+	}
+	secrets := []string{
+		"expanded-secret",
+		"${TEST_OG_KEY}",
+		"TEST_OG_KEY",
+		"${TEST_OG_DEFINITELY_UNSET_VAR}",
+		"TEST_OG_DEFINITELY_UNSET_VAR",
+		"sk-live-dupsecret-7",
+		"sk-live-supersecret-42",
+		"sk-priority-secret",
+		"sk-live-scalar-9",
+		"sk-mapping-secret",
+		"sk-bare-old-shape",
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Load([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("legacy api-keys must be ignored, got %v", err)
+			}
+			if !c.LegacyAPIKeys {
+				t.Fatal("LegacyAPIKeys = false, want true")
+			}
+			if c.BaseURL != DefaultBaseURL {
+				t.Fatalf("BaseURL = %q", c.BaseURL)
+			}
+			assertLegacyMaterialDiscarded(t, c, secrets...)
+		})
 	}
 }
 
 func TestLoadIgnoresRemovedSchedulerFields(t *testing.T) {
 	doc := "routing:\n  strategy: round-robin\n  max-retries-per-request: 9\n  transient-retry-interval: 1s\n  fallback-cooldown: 1m\n" +
 		"api-keys:\n  - value: sk-dummy\n    priority: 7\n"
-	if _, err := Load([]byte(doc)); err != nil {
+	c, err := Load([]byte(doc))
+	if err != nil {
 		t.Fatalf("removed scheduler fields must remain unknown and ignored: %v", err)
 	}
+	if !c.LegacyAPIKeys {
+		t.Fatal("LegacyAPIKeys = false, want true")
+	}
+	assertLegacyMaterialDiscarded(t, c, "sk-dummy")
 }
 
 func TestLoadDerivedCatalogURLFromCustomBase(t *testing.T) {
@@ -209,8 +281,6 @@ func TestLoadRejections(t *testing.T) {
 	}{
 		{"invalid yaml syntax", "[unclosed", "decode config"},
 		{"unknown anchor has no line info", "request-timeout: *nope\n", "decode config: invalid YAML structure"},
-		{"bare-scalar api key never leaks", "api-keys:\n  - sk-live-secret-123\n", "decode config: invalid YAML structure"},
-		{"keyless config rejected", "", "api-keys: at least one key is required"},
 		{"request-timeout zero rejected", "request-timeout: 0s\n" + withKey, "request-timeout: must be positive"},
 		{
 			"duplicate route-override keys",
@@ -218,16 +288,6 @@ func TestLoadRejections(t *testing.T) {
 				"  gpt-5.6-luna:\n    protocol: responses\n    endpoint: /v1/responses\n" +
 				"  gpt-5.6-luna:\n    protocol: messages\n    endpoint: /v1/messages\n",
 			"decode config: invalid YAML structure near line",
-		},
-		{
-			"key expands to empty",
-			"api-keys:\n  - value: ${TEST_OG_DEFINITELY_UNSET_VAR}\n",
-			"api-keys[0].value: expanded to empty",
-		},
-		{
-			"second key expands to empty",
-			"api-keys:\n  - value: literal-ok\n  - value: ${TEST_OG_DEFINITELY_UNSET_VAR}\n",
-			"api-keys[1].value: expanded to empty",
 		},
 		{"explicitly empty base-url", `base-url: ""`, "base-url: must not be empty"},
 		{"explicitly empty catalog-url", `catalog-url: ""`, "catalog-url: must not be empty"},
@@ -272,24 +332,25 @@ func TestLoadRejections(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Load([]byte(tt.yaml))
 			requireErrContains(t, err, tt.wantErr)
-			if tt.name == "key expands to empty" && strings.Contains(err.Error(), "${") {
-				t.Errorf("error leaks environment reference: %q", err.Error())
-			}
 		})
 	}
 }
 
 // TestLoadErrorsNeverLeakDecodedValues pins the security property: decode
-// and validation failures must not echo raw scalars (a bare-scalar API key)
-// or embedded userinfo credentials into the error the host logs.
+// and validation failures must not echo legacy api-keys material or embedded
+// userinfo credentials into the error the host logs. Ignoring api-keys must
+// not suppress those other checks.
 func TestLoadErrorsNeverLeakDecodedValues(t *testing.T) {
 	cases := []struct {
 		name   string
 		yaml   string
 		secret string
 	}{
-		{"bare-scalar api key", "api-keys:\n  - sk-live-supersecret-42\n", "sk-live-supersecret-42"},
-		{"duplicate api key values", "api-keys:\n  - value: sk-live-dupsecret-7\n  - value: sk-live-dupsecret-7\n", "sk-live-dupsecret-7"},
+		{
+			"legacy api-keys beside rejected base-url",
+			"api-keys:\n  - value: sk-live-supersecret-42\nbase-url: ftp://files.example.com/v1\n",
+			"sk-live-supersecret-42",
+		},
 		{"userinfo credentials", "base-url: https://admin:p4ssw0rd@/v1\n", "p4ssw0rd"},
 	}
 	for _, tc := range cases {

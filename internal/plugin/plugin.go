@@ -80,8 +80,10 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return m.handleLifecycle(request)
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
+	case pluginabi.MethodModelStatic:
 		return m.handleModels()
+	case pluginabi.MethodModelForAuth:
+		return m.handleModelsForAuth(request)
 	case pluginabi.MethodPluginShutdown:
 		return m.handleShutdown()
 	case pluginabi.MethodExecutorExecute:
@@ -217,12 +219,13 @@ func (m *Manager) registerManagement(request []byte) ([]byte, error) {
 		Routes: []struct {
 			Method string `json:"method"`
 			Path   string `json:"path"`
-		}{{Method: "POST", Path: "/plugins/" + pluginName + "/quota-usage"}},
+		}{{Method: "POST", Path: "/plugins/" + pluginName + "/quota-usage"},
+			{Method: "POST", Path: "/plugins/" + pluginName + "/accounts"}},
 		Resources: []struct {
 			Path        string `json:"path"`
 			Menu        string `json:"menu"`
 			Description string `json:"description"`
-		}{{Path: "/quota", Menu: "CommandCode Quota", Description: "View CommandCode quota windows."}},
+		}{{Path: "/quota", Menu: "CommandCode", Description: "Manage CommandCode accounts and view quota."}},
 	}), nil
 }
 
@@ -256,12 +259,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	}
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
-	debugTrace("lifecycle config_loaded key_count=%d prefix_enabled=%t prefix=%s", len(cfg.APIKeys), cfg.ModelPrefix.Enabled, cfg.ModelPrefix.Value)
-	ctx, cancel := context.WithTimeout(context.Background(), registerRefreshTimeout)
-	defer cancel()
-	if err := m.materializeAuthRecords(ctx, cfg); err != nil {
-		return ErrEnvelope("auth_materialization_failed", err.Error()), nil
-	}
+	debugTrace("lifecycle config_loaded prefix_enabled=%t prefix=%s", cfg.ModelPrefix.Enabled, cfg.ModelPrefix.Value)
 	// A nil *HostBridge must not enter the interface as a typed nil, or
 	// catalog's nil-client guard never fires and Refresh panics inside Do.
 	var client catalog.HostClient
@@ -269,7 +267,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 		client = m.bridge
 	}
 	mgr := catalog.New(cfg, client)
-	refreshErr := refreshOnce(context.Background(), mgr, m.bridge, registerRefreshTimeout, cfg)
+	refreshErr := refreshOnce(context.Background(), mgr, m.bridge, registerRefreshTimeout)
 	debugTrace("lifecycle refresh_complete model_count=%d refresh_error=%t", len(mgr.Models()), refreshErr != nil)
 
 	// Retire any running loop and wait for its exit outside m.mu: a mid-refresh
@@ -305,9 +303,8 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	return registrationEnvelope(), nil
 }
 
-// authKeyHash is the non-secret digest that identifies one config key. It is
-// independent of config ordering, which is what keeps the records derived from
-// it idempotent across restarts.
+// authKeyHash is the non-secret digest used to name a newly added key's file.
+// Existing file names and runtime IDs remain owned by the host.
 func authKeyHash(key string) string {
 	digest := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(digest[:])
@@ -318,61 +315,6 @@ func authKeyHash(key string) string {
 // producer agrees without recomputing it.
 func authRecordIDFromHash(hash string) string { return ProviderID + "-key-" + hash }
 func authFileNameFromHash(hash string) string { return authRecordIDFromHash(hash) + ".json" }
-
-// materializeAuthRecords makes CPA-visible auth files idempotently. Existing
-// records are discovered through CPA so their host-managed metadata is never
-// overwritten. The full key digest is non-secret and independent of config
-// ordering. The host ABI has no delete/disable callback, so removed keys remain
-// stale records and are not claimed as removed.
-func (m *Manager) materializeAuthRecords(ctx context.Context, cfg config.Config) error {
-	if m.bridge == nil {
-		return nil
-	}
-	entries, err := m.bridge.AuthList(ctx)
-	if err != nil {
-		return fmt.Errorf("list existing auth records: %w", err)
-	}
-	existing := make(map[string]struct{}, len(entries)*2)
-	for _, entry := range entries {
-		if name := strings.TrimSpace(entry.Name); name != "" {
-			existing[name] = struct{}{}
-		}
-		if id := strings.TrimSpace(entry.ID); id != "" {
-			existing[id] = struct{}{}
-		}
-	}
-	for _, key := range cfg.APIKeys {
-		hash := authKeyHash(key.Value)
-		id := authRecordIDFromHash(hash)
-		name := authFileNameFromHash(hash)
-		if _, ok := existing[id]; ok {
-			continue
-		}
-		if _, ok := existing[name]; ok {
-			continue
-		}
-		record, err := json.Marshal(struct {
-			Type   string `json:"type"`
-			ID     string `json:"id"`
-			Label  string `json:"label"`
-			APIKey string `json:"api_key"`
-		}{
-			Type: ProviderID, ID: id, Label: "CommandCode credential " + hash, APIKey: key.Value,
-		})
-		if err != nil {
-			return fmt.Errorf("build auth record")
-		}
-		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{
-			Name: name, JSON: record,
-		}); err != nil {
-			return err
-		}
-		existing[id] = struct{}{}
-		existing[name] = struct{}{}
-		debugTrace("auth materialized id=%s file=%s", id, name)
-	}
-	return nil
-}
 
 // handleModels implements model.static / model.for_auth (FR-003): the last
 // good catalog snapshot mapped to wire ModelInfos; empty catalog yields an
@@ -398,6 +340,27 @@ func (m *Manager) handleModels() ([]byte, error) {
 		}
 	}
 	return okEnvelope(pluginapi.ModelResponse{Provider: ProviderID, Models: models}), nil
+}
+
+// On a fresh installation the catalog is empty until the first account is
+// added. The host requests models while registering that selected credential;
+// discover them here so adding a key never requires a plugin restart.
+func (m *Manager) handleModelsForAuth(request []byte) ([]byte, error) {
+	var req pluginapi.AuthModelRequest
+	if json.Unmarshal(request, &req) != nil {
+		return ErrEnvelope("invalid_request", "malformed model request"), nil
+	}
+	m.mu.RLock()
+	mgr := m.mgr
+	m.mu.RUnlock()
+	if mgr != nil && len(mgr.Models()) == 0 && req.AuthProvider == ProviderID {
+		if key := selectedAuthKey(req.Attributes, req.Metadata); key != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), registerRefreshTimeout)
+			defer cancel()
+			_ = mgr.Refresh(ctx, key)
+		}
+	}
+	return m.handleModels()
 }
 
 // shutdownDrainTimeout bounds how long handleShutdown waits for orphaned
@@ -461,7 +424,7 @@ func (m *Manager) startRefreshLoop(cfg config.Config, mgr *catalog.Manager, inte
 							_ = m.bridge.Log("error", "catalog refresh panicked", nil)
 						}
 					}()
-					refreshOnce(stopCtx, mgr, m.bridge, cfg.RequestTimeout, cfg)
+					refreshOnce(stopCtx, mgr, m.bridge, cfg.RequestTimeout)
 				}()
 			}
 		}
@@ -483,20 +446,24 @@ func (m *Manager) closeStop() chan struct{} {
 	return done
 }
 
-// refreshOnce runs one bounded catalog refresh. Catalog refresh is not a client
-// request, so the fallback uses the first configured key only and has no client
-// selection, rotation, cooldown, or retry state. parent bounds-and-cancels
-// the attempt: the lifecycle path passes context.Background() plus
-// registerRefreshTimeout; ticker ticks pass the loop's stop-derived context
-// plus the full request-timeout, so close(stop) aborts an in-flight tick
-// (F4). On failure it logs a warn via host.log — error text is a redacted
-// category label from the catalog package, never key material (FR-011).
-func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridge, timeout time.Duration, cfg config.Config) error {
-	// Fallback: configured materialization input is catalog-only; CPA client
-	// authentication remains owned by its AuthProvider and CPA.
+// refreshOnce discovers the catalog using the first readable, enabled host
+// credential, never a configured key. The bounded context also covers listing
+// and reading auth files. Upstream failure does not rotate client credentials.
+func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridge, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	err := mgr.Refresh(ctx, cfg.APIKeys[0].Value)
+	key := ""
+	files, _ := commandcodeAuthFiles(ctx, bridge)
+	for _, entry := range files {
+		if entry.Disabled || entry.Status == "disabled" {
+			continue
+		}
+		if candidate, err := authFileKey(ctx, bridge, entry); err == nil {
+			key = candidate
+			break
+		}
+	}
+	err := mgr.Refresh(ctx, key)
 	if err != nil {
 		if bridge != nil {
 			_ = bridge.Log("warn", "catalog refresh failed", map[string]any{"error": err.Error()})

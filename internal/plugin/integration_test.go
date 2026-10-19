@@ -533,7 +533,7 @@ func TestChatNonStreamRoundTrip(t *testing.T) {
 	if path != "/v1/chat/completions" {
 		t.Fatalf("mock path = %q", path)
 	}
-	if auth != "Bearer sk-test-1" {
+	if auth != "Bearer "+testKey {
 		t.Fatalf("mock Authorization = %q", auth)
 	}
 	st.mu.Lock()
@@ -665,7 +665,7 @@ func TestMessagesNonStreamRoundTrip(t *testing.T) {
 	st.mu.Lock()
 	auth, version, session, raw := st.lastMessagesAuth, st.lastMessagesVersion, st.lastMessagesSession, st.lastMessagesBody
 	st.mu.Unlock()
-	if auth != "sk-test-1" {
+	if auth != testKey {
 		t.Fatalf("mock x-api-key = %q", auth)
 	}
 	if version == "" {
@@ -732,7 +732,7 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 	st.mu.Lock()
 	auth, session, raw := st.lastResponsesAuth, st.lastResponsesSession, st.lastResponsesBody
 	st.mu.Unlock()
-	if auth != "Bearer sk-test-1" {
+	if auth != "Bearer "+testKey {
 		t.Fatalf("mock Authorization = %q", auth)
 	}
 	if session != "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4" {
@@ -1249,7 +1249,7 @@ func TestRouteOverrideEndpointReachesUpstream(t *testing.T) {
 	st.mu.Lock()
 	auth, raw := st.lastMessagesAuth, st.lastMessagesBody
 	st.mu.Unlock()
-	if auth != "sk-test-1" {
+	if auth != testKey {
 		t.Fatalf("override endpoint lost messages auth: %q", auth)
 	}
 	var upstream map[string]any
@@ -1332,7 +1332,7 @@ func TestE2EOpenAIClientToMessagesRoute(t *testing.T) {
 	if cc.Usage.PromptTokens != 12 || cc.Usage.CompletionTokens != 9 {
 		t.Fatalf("usage mapping wrong: %+v", cc.Usage)
 	}
-	if auth != "sk-test-1" || upstream.Model != "qwen3.7-max" {
+	if auth != testKey || upstream.Model != "qwen3.7-max" {
 		t.Fatalf("upstream auth=%q model=%q", auth, upstream.Model)
 	}
 }
@@ -1432,7 +1432,7 @@ func TestE2EOpenAIClientToResponsesRoute(t *testing.T) {
 	st.mu.Lock()
 	auth := st.lastResponsesAuth
 	st.mu.Unlock()
-	if auth != "Bearer sk-test-1" {
+	if auth != "Bearer "+testKey {
 		t.Fatalf("responses auth = %q", auth)
 	}
 }

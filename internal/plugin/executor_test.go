@@ -196,12 +196,7 @@ func newExecManager(t *testing.T) (*Manager, *fakeCaller) {
 
 func mustExecute(t *testing.T, m *Manager, model, format string, body []byte) pluginabi.Envelope {
 	t.Helper()
-	m.mu.RLock()
-	key := ""
-	if len(m.cfg.APIKeys) > 0 {
-		key = m.cfg.APIKeys[0].Value
-	}
-	m.mu.RUnlock()
+	key := testKey
 	resp, err := m.HandleCall("executor.execute", execReqBodyWithKey(model, format, body, false, key))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
@@ -472,7 +467,7 @@ func TestExecuteMessagesRouteNativeClaudePassesThrough(t *testing.T) {
 
 func TestExecuteMessagesUpstreamStatusClassified(t *testing.T) {
 	f := &fakeCaller{responder: wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
-		if method == pluginabi.MethodHostAuthList {
+		if method == pluginabi.MethodHostAuthList || method == pluginabi.MethodHostAuthGet {
 			return hostOK(map[string]any{}), nil
 		}
 		if method == pluginabi.MethodHostAuthSave {
@@ -1311,7 +1306,7 @@ func TestExecuteTransportErrorClassified(t *testing.T) {
 	m := NewManager(NewHostBridge(f.call))
 	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
 	f.responder = wrapWithCatalog(testCatalogJSON, func(method string, _ []byte) ([]byte, error) {
-		if method == pluginabi.MethodHostAuthList {
+		if method == pluginabi.MethodHostAuthList || method == pluginabi.MethodHostAuthGet {
 			return hostOK(map[string]any{}), nil
 		}
 		if method == pluginabi.MethodHostAuthSave {

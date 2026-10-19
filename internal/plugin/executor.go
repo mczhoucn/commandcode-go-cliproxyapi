@@ -57,7 +57,7 @@ func (m *Manager) resolveExecution(req executorRequest) (*resolvedExecution, []b
 	if req.AuthProvider != ProviderID {
 		return nil, classEnvelope(&errclass.Error{Class: errclass.ClassAuth, Message: "selected auth provider is not commandcode"})
 	}
-	key := strings.TrimSpace(req.AuthAttributes["api_key"])
+	key := selectedAuthKey(req.AuthAttributes, req.AuthMetadata)
 	debugTrace("executor auth model=%s auth_id=%s provider=%s attr_api_key_present=%t attr_count=%d storage_json_bytes=%d", req.Model, req.AuthID, req.AuthProvider, key != "", len(req.AuthAttributes), len(req.StorageJSON))
 	if key == "" {
 		return nil, classEnvelope(&errclass.Error{Class: errclass.ClassAuth, Message: "selected auth has no api key"})
@@ -103,7 +103,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	}
 
 	url := catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
-	debugTrace("executor resolved public_model=%s upstream_model=%s route=%s url=%s key_count=%d", req.Model, res.rec.UpstreamID, res.rec.Protocol, url, len(res.cfg.APIKeys))
+	debugTrace("executor resolved public_model=%s upstream_model=%s route=%s url=%s", req.Model, res.rec.UpstreamID, res.rec.Protocol, url)
 	debugTrace("executor sending non-stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()

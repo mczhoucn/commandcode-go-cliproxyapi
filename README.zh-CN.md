@@ -1,14 +1,14 @@
-# CommandCode Go/GOAT/Pro/Max CLIProxyAPI 插件
+# CommandCode GOAT CLIProxyAPI 插件
 
 [English](README.md) | **简体中文**
 
-一个 [CLIProxyAPI](https://help.router-for.me/plugin/development) 的原生动态 Go 插件，把 **CommandCode Go/GOAT/Pro/Max** 套餐作为单一 provider（`commandcode`；对外发布的模型 id 带 `commandcode/` 前缀）对外提供。
+一个 [CLIProxyAPI](https://help.router-for.me/plugin/development) 的原生动态 Go 插件，把 **CommandCode GOAT** 套餐作为单一 provider（`commandcode`；对外发布的模型 id 带 `commandcode/` 前缀）对外提供。
 
-插件自己负责模型发现、协议翻译、请求执行、密钥调度和配额页面，因此一份 API key 池就能同时服务 OpenAI、Anthropic 和 Responses 三种客户端。
+插件负责模型发现、协议翻译、请求执行，以及 CommandCode 账户与额度页面。API key 只来自 CLIProxyAPI 认证文件，因此同一批账户可以同时服务 OpenAI、Anthropic 和 Responses 三种客户端。
 
 ## 上游实际提供了什么
 
-CommandCode Go/GOAT/Pro/Max 通过它的 OpenAI 兼容入口访问：
+CommandCode GOAT 通过它的 OpenAI 兼容入口访问：
 
 | 上游路由 | 状态 |
 |---|---|
@@ -23,7 +23,7 @@ CommandCode Go/GOAT/Pro/Max 通过它的 OpenAI 兼容入口访问：
 
 ## 为什么需要这个插件
 
-不用插件时，把 CommandCode Go/GOAT/Pro/Max 接入 CLIProxyAPI 需要手写多个 provider 段，而且几个客户端强依赖的能力要么缺失、要么是错的：
+不用插件时，把 CommandCode GOAT 接入 CLIProxyAPI 需要手写多个 provider 段，而且几个客户端强依赖的能力要么缺失、要么是错的：
 
 - **配置与密钥重复**：同一批 key 要在多个 provider 段里各配一遍。
 - **调度被割裂**：轮换、限流、冷却无法共享，管理后台也看不到每个 key 的用量。
@@ -33,7 +33,7 @@ CommandCode Go/GOAT/Pro/Max 通过它的 OpenAI 兼容入口访问：
 
 ## 解决方式
 
-- **统一密钥池**：插件把每个配置的 key 注册为 CLIProxyAPI 的 auth 记录，轮换、重试、错误冷却、会话粘性和每 key 统计全部交给宿主调度器。
+- **认证文件是唯一密钥来源**：账户是 CLIProxyAPI 认证文件，不是插件配置里的 `api-keys`。在管理后台 → **CommandCode** → **CommandCode账户与额度** 粘贴 API key 并保存。不必手写 JSON；仍然可以自行上传认证文件。禁用和删除仍在宿主认证文件页。轮换、重试、冷却、会话粘性和每个账户的统计仍由宿主调度器负责。
 - **透明翻译与路由**：客户端只写 `commandcode/<上游 id>`，不需要知道上游协议。
 - **思考保真**：三种客户端格式都能拿到上游的思考文本；模型没有能力声明时，`reasoning_effort` 原样转发。
 - **单一模型目录**：`{base-url}/models` 里的模型全部以 `commandcode/` 前缀出现在 `/v1/models`。
@@ -47,9 +47,9 @@ CommandCode Go/GOAT/Pro/Max 通过它的 OpenAI 兼容入口访问：
   - Responses 客户端：前置一个 `reasoning` output item + `response.reasoning_summary_*` 事件；
   - OpenAI 客户端：每个 chunk 回填 `reasoning_content`，厂商原始字段保持不变。
 - **能力感知的思考控制**：`route-overrides` 或模型目录里的 thinking 元数据一旦声明能力，就恢复严格校验与预算夹取；没有任何声明时，客户端的 `reasoning_effort` 原样转发（`auto`/`none` 省略该字段），以上游为准。
-- **动态目录发现**：远程目录 + 本地兜底、去重，并对被排除的模型给出诊断。
-- **CommandCode 配额页面**：管理后台单独一页，列出每个凭据对应的账号邮箱、套餐、剩余套餐额度和滚动 5 小时/每周窗口（已用、上限、重置时间），每张卡片按需独立刷新。
-- **多密钥调度**：一份 key 池通过 CLIProxyAPI 原生调度器跨所有协议共享。
+- **动态目录发现**：远程目录 + 本地兜底、去重，并对被排除的模型给出诊断。至少有一个启用的账户时才会发现目录。
+- **CommandCode账户与额度**：管理后台菜单是 **CommandCode**，页面是 **CommandCode账户与额度**。粘贴 API key 并保存为认证文件后，可查看每个账户的邮箱、套餐、剩余套餐额度，以及滚动 5 小时/每周窗口（已用、上限、重置时间）；每张卡片按需独立刷新。没有账户也可以启动。
+- **宿主认证调度**：启用的认证文件账户经 CLIProxyAPI 调度器跨协议共享。插件配置里没有密钥池，旧的 `api-keys` 也不会被导入进去。
 
 ## 环境要求
 
@@ -90,10 +90,8 @@ plugins:
         enabled: true              # true -> "commandcode/<model>"（默认 true）
         value: "commandcode"
 
-      # CommandCode API key（至少一个）；支持 ${ENV_VAR}
-      api-keys:
-        - value: "user_xxx"
-        - value: "${COMMANDCODE_API_KEY}"
+      # 账户只来自 CLIProxyAPI 认证文件，不写在这里。
+      # 管理后台 → CommandCode → CommandCode账户与额度。
 
       # 目录发现
       catalog:
@@ -122,7 +120,7 @@ plugins:
 
 | 配置 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `api-keys` | `[]object` | *(必填)* | 形如 `- value: "..."` 的密钥列表；支持 `${ENV_VAR}`；重复值和空值会被拒绝。 |
+| `api-keys` | — | 忽略 | 已停用，不再作为密钥来源。见下方「账户」。 |
 | `base-url` | `string` | `https://api.commandcode.ai/provider/v1` | 上游 provider 地址。必须是合法 HTTPS（`allow-http: true` 时可用 HTTP），不能带 query、fragment 或 userinfo。 |
 | `catalog-url` | `string` | `{base-url}/models` | 目录发现地址。 |
 | `model-prefix.enabled` | `bool` | `true` | `true` 时客户端用 `<prefix>/<model>`，`false` 时直接暴露上游裸 id。 |
@@ -135,9 +133,18 @@ plugins:
 | `max-response-bytes` | `int64` | `67108864` | 非流式响应体上限。 |
 | `allow-http` | `bool` | `false` | 允许 `http://` 上游，仅供本地测试。 |
 
+### 账户
+
+API key 不写在这份 YAML 里。CLIProxyAPI 认证文件是唯一来源。
+
+- **添加**：管理后台 → **CommandCode** → **CommandCode账户与额度**。粘贴 API key 并保存。不必上传自制 JSON；仍然可以自行上传认证文件。
+- **禁用 / 删除**：仍在宿主认证文件页，不在这个页面。
+- **没有账户**：插件可以启动。目录发现只在至少一个账户启用时进行，在此之前该 provider 不会对外发布模型。
+- **旧 `api-keys`**：已有安装可以保留这段配置。账户页会提示它已被忽略。它不会被导入、不会被保存，也不参与路由、目录发现或额度，也不能把已删除的账户带回来。确认认证文件就是想保留的账户之后，请自行删掉这段。
+
 ### 配额页面
 
-管理后台 → 插件 里的 `CommandCode Quota` 页面读取与 `base-url` 同源的账号接口：
+管理后台 → **CommandCode** 里的 **CommandCode账户与额度** 页面读取与 `base-url` 同源的账号接口：
 
 | 接口 | 用途 |
 |---|---|
@@ -145,7 +152,9 @@ plugins:
 | `GET {authority}/alpha/billing/subscriptions` | 套餐 id/状态 |
 | `GET {authority}/alpha/whoami?limits=1` | 卡片标题用的账号邮箱 |
 
-`{authority}` 由 `base-url` 去掉 provider 路径（`/provider/v1`）得到。每张卡片手动独立刷新，页面从不轮询，配额数值也不参与路由决策。
+`{authority}` 由 `base-url` 去掉 provider 路径（`/provider/v1`）得到。卡片对应宿主认证文件，而不是 `api-keys` 条目。每张卡片手动独立刷新，页面从不轮询，配额数值也不参与路由决策。
+
+**邮箱同步的已知限制**：查到邮箱后，插件会尽量写回原认证文件，让插件页和宿主认证文件页都能显示邮箱。写回前会检查文件是否已删除或更改，但最后一次检查与替换文件之间仍存在竞争窗口；同时删除、禁用或修改备注，可能被旧内容覆盖，删除的文件也可能被重新创建。当前选择保留两处显示邮箱的行为，未消除这一风险。建议等额度刷新结束后再修改认证文件，操作后刷新列表确认结果。
 
 ### reasoning effort（思考强度）
 
@@ -164,6 +173,15 @@ go test ./...        # 单元测试 + 带 mock 的端到端测试
 go test ./... -cover # 带覆盖率
 go vet ./...         # 静态检查
 ```
+
+可选的浏览器回归测试覆盖新增表单、密钥不进入浏览器存储、删除后的旧响应、禁用状态及窄屏/深色主题。它只使用本地模拟接口，不访问真实账户：
+
+```bash
+npx --yes playwright install chromium
+npx --yes -p playwright -c 'NODE_PATH=$(dirname $(dirname $(command -v playwright))) node tests/accounts_page.cjs'
+```
+
+也可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定本机已有的 Chrome 可执行文件，跳过下载浏览器。
 
 ## 来源
 

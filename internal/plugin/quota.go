@@ -12,7 +12,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/config"
 	"commandcode-go-cliproxyapi/resources"
 )
 
@@ -58,11 +57,14 @@ type quotaUsage struct {
 }
 
 type quotaCard struct {
-	KeyID string      `json:"key_id"`
-	Label string      `json:"label"`
-	Email string      `json:"email,omitempty"`
-	Usage *quotaUsage `json:"usage,omitempty"`
-	Error string      `json:"error,omitempty"`
+	KeyID    string      `json:"key_id"`
+	Label    string      `json:"label"`
+	Email    string      `json:"email,omitempty"`
+	FileName string      `json:"file_name"`
+	Disabled bool        `json:"disabled"`
+	Status   string      `json:"status"`
+	Usage    *quotaUsage `json:"usage,omitempty"`
+	Error    string      `json:"error,omitempty"`
 }
 
 type quotaRequest struct {
@@ -70,7 +72,8 @@ type quotaRequest struct {
 }
 
 type quotaList struct {
-	Cards []quotaCard `json:"cards"`
+	Cards                []quotaCard `json:"cards"`
+	LegacyAPIKeysIgnored bool        `json:"legacy_api_keys_ignored"`
 }
 
 // ---- account API response shapes (probed live) --------------------------
@@ -170,73 +173,78 @@ func planFor(planID string) (string, float64) {
 	return planNames[best], planAllowances[best]
 }
 
-func quotaIdentity(key string) (id, label string) {
-	hash := authKeyHash(key)
-	return authRecordIDFromHash(hash), "CommandCode credential " + hash[:12]
+func accountCard(entry pluginapi.HostAuthFileEntry) quotaCard {
+	label := entry.Email
+	if label == "" {
+		label = entry.Label
+	}
+	if label == "" {
+		label = entry.Name
+	}
+	return quotaCard{KeyID: entry.AuthIndex, Label: label, Email: entry.Email, FileName: entry.Name,
+		Disabled: entry.Disabled || entry.Status == "disabled", Status: entry.Status}
 }
 
 func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	if req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginName+"/quota" {
 		return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}}, Body: []byte(resources.QuotaPage)}, nil
 	}
-	if req.Method != http.MethodPost || req.Path != "/v0/management/plugins/"+pluginName+"/quota-usage" {
-		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Body: []byte(`{"error":"not found"}`)}, nil
+	if req.Method != http.MethodPost {
+		return managementError(http.StatusNotFound, "not found")
+	}
+	ctx, cancel := context.WithTimeout(ctx, quotaMaxTimeout)
+	defer cancel()
+	if req.Path == "/v0/management/plugins/"+pluginName+"/accounts" {
+		return m.addAccount(ctx, req.Body)
+	}
+	if req.Path != "/v0/management/plugins/"+pluginName+"/quota-usage" {
+		return managementError(http.StatusNotFound, "not found")
 	}
 	var body quotaRequest
-	if len(req.Body) > 0 {
-		if err := json.Unmarshal(req.Body, &body); err != nil {
-			return pluginapi.ManagementResponse{StatusCode: http.StatusBadRequest, Body: []byte(`{"error":"invalid request"}`)}, nil
-		}
+	if len(req.Body) > 0 && json.Unmarshal(req.Body, &body) != nil {
+		return managementError(http.StatusBadRequest, "invalid request")
 	}
 	m.mu.RLock()
-	baseURL, timeout := m.cfg.BaseURL, m.cfg.RequestTimeout
-	keys := append([]config.APIKey(nil), m.cfg.APIKeys...)
+	baseURL, timeout, legacy := m.cfg.BaseURL, m.cfg.RequestTimeout, m.cfg.LegacyAPIKeys
 	m.mu.RUnlock()
-	if body.KeyID == "" {
-		// List is deliberately cheap: no upstream account calls. The page
-		// uses the email (already synced into the auth file by a prior
-		// refresh) as the signal that a credential has been fetched once,
-		// and only auto-refreshes cards that still lack one.
-		emails := m.accountEmails(ctx)
-		cards := make([]quotaCard, 0, len(keys))
-		for _, key := range keys {
-			id, label := quotaIdentity(key.Value)
-			email := emails[id]
-			if email != "" {
-				label = email
-			}
-			cards = append(cards, quotaCard{KeyID: id, Label: label, Email: email})
-		}
-		return quotaJSON(quotaList{Cards: cards})
+	files, err := commandcodeAuthFiles(ctx, m.bridge)
+	if err != nil {
+		return managementError(http.StatusBadGateway, "无法读取认证文件，请稍后重试")
 	}
-	for _, key := range keys {
-		id, label := quotaIdentity(key.Value)
-		if id != body.KeyID {
+	if body.KeyID == "" {
+		cards := make([]quotaCard, 0, len(files))
+		for _, entry := range files {
+			cards = append(cards, accountCard(entry))
+		}
+		return quotaJSON(quotaList{Cards: cards, LegacyAPIKeysIgnored: legacy})
+	}
+	for _, entry := range files {
+		if entry.AuthIndex != body.KeyID {
 			continue
 		}
-		usage, account, email, err := fetchQuota(ctx, m.bridge, baseURL, timeout, key.Value)
+		card := accountCard(entry)
+		key, err := authFileKey(ctx, m.bridge, entry)
 		if err != nil {
-			// One unreachable or unsupported account must not blank the
-			// whole page: the card carries the failure so the others still
-			// render, and the credential hash stays as the label.
-			return quotaJSON(quotaCard{KeyID: id, Label: label, Error: err.Error()})
+			card.Error = "无法读取此认证文件的 API key，请刷新账户列表"
+			return quotaJSON(card)
+		}
+		usage, account, email, err := fetchQuota(ctx, m.bridge, baseURL, timeout, key)
+		if err != nil {
+			card.Error = err.Error()
+			return quotaJSON(card)
 		}
 		if account != "" {
-			label = account
+			card.Label = account
 		}
-		// The account email is known only here, so this is where it is
-		// carried back into the credential's own auth file, which is what
-		// lets the host (and the panel's auth-file list) title the
-		// credential with the mailbox. Best-effort by design: a failed
-		// sync is a cosmetic loss and must never blank the quota card.
+		card.Email, card.Usage = email, &usage
 		if email != "" {
-			if errSync := m.syncAccountEmail(ctx, key.Value, email); errSync != nil {
-				_ = m.bridge.Log("warn", "commandcode credential email not synced", map[string]any{"reason": errSync.Error()})
+			if errSync := m.syncAccountEmail(ctx, entry, key, email); errSync != nil {
+				_ = m.bridge.Log("warn", "commandcode credential email not synced", nil)
 			}
 		}
-		return quotaJSON(quotaCard{KeyID: id, Label: label, Email: email, Usage: &usage})
+		return quotaJSON(card)
 	}
-	return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Body: []byte(`{"error":"unknown quota key"}`)}, nil
+	return managementError(http.StatusNotFound, "unknown quota key")
 }
 
 func quotaJSON(v any) (pluginapi.ManagementResponse, error) {

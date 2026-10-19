@@ -177,6 +177,9 @@ func (m *Manager) SeedFrom(prev *Manager) {
 // catalog.stale-while-unavailable is enabled, otherwise the routable set
 // is cleared until the next success (FR-002).
 func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
+	if strings.TrimSpace(apiKey) == "" {
+		return m.fail("no enabled CommandCode auth files")
+	}
 	if m.client == nil {
 		// Only direct construction can produce a nil host client
 		// (production always wires the bridge); fail loudly through the

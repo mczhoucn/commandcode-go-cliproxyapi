@@ -5,7 +5,6 @@ package config
 import (
 	"fmt"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -27,10 +26,6 @@ type ModelPrefix struct {
 	Value   string
 }
 
-type APIKey struct {
-	Value string
-}
-
 type Catalog struct {
 	RefreshInterval       time.Duration
 	StaleWhileUnavailable bool
@@ -48,10 +43,12 @@ type RouteOverride struct {
 }
 
 type Config struct {
-	BaseURL          string
-	CatalogURL       string
-	ModelPrefix      ModelPrefix
-	APIKeys          []APIKey
+	BaseURL     string
+	CatalogURL  string
+	ModelPrefix ModelPrefix
+	// LegacyAPIKeys reports that a retired api-keys key was present.
+	// Its contents are not kept or used as credentials.
+	LegacyAPIKeys    bool
 	Catalog          Catalog
 	Protocols        Protocols
 	RouteOverrides   map[string]RouteOverride
@@ -64,10 +61,12 @@ type Config struct {
 // (apply default) from explicitly-set values including "" (validate as-is).
 // Unknown fields are ignored (host may pass extra keys).
 type rawConfig struct {
-	BaseURL          *string                  `yaml:"base-url"`
-	CatalogURL       *string                  `yaml:"catalog-url"`
-	ModelPrefix      rawPrefix                `yaml:"model-prefix"`
-	APIKeys          []rawKey                 `yaml:"api-keys"`
+	BaseURL     *string   `yaml:"base-url"`
+	CatalogURL  *string   `yaml:"catalog-url"`
+	ModelPrefix rawPrefix `yaml:"model-prefix"`
+	// LegacyAPIKeys carries the retired api-keys node only long enough
+	// to see whether the key exists. Its contents are not interpreted.
+	LegacyAPIKeys    yaml.Node                `yaml:"api-keys"`
 	Catalog          rawCatalog               `yaml:"catalog"`
 	Protocols        rawProtocols             `yaml:"protocols"`
 	RouteOverrides   map[string]RouteOverride `yaml:"route-overrides"`
@@ -79,10 +78,6 @@ type rawConfig struct {
 type rawPrefix struct {
 	Enabled *bool   `yaml:"enabled"`
 	Value   *string `yaml:"value"`
-}
-
-type rawKey struct {
-	Value string `yaml:"value"`
 }
 
 type rawCatalog struct {
@@ -100,10 +95,10 @@ var (
 	validProtocols = map[string]bool{"chat-completions": true, "messages": true, "responses": true}
 )
 
-// Load decodes YAML, expands ${VAR} references in api-key values only,
-// applies defaults, and validates (spec 04 §6). Decode errors never echo
-// decoded node values — a malformed entry (e.g. a bare-scalar API key)
-// must not leak into the invalid_config envelope the host logs.
+// Load decodes YAML, applies defaults, and validates (spec 04 §6).
+// A legacy api-keys entry is recorded only as present or absent: its
+// contents are not parsed into credentials, expanded, stored, or
+// validated. Decode errors never echo decoded node values.
 func Load(yamlBytes []byte) (Config, error) {
 	var raw rawConfig
 	if err := yaml.Unmarshal(yamlBytes, &raw); err != nil {
@@ -112,10 +107,8 @@ func Load(yamlBytes []byte) (Config, error) {
 		}
 		return Config{}, fmt.Errorf("decode config: invalid YAML structure")
 	}
-	keys := make([]APIKey, len(raw.APIKeys))
-	for i, k := range raw.APIKeys {
-		keys[i] = APIKey{Value: os.ExpandEnv(k.Value)}
-	}
+	legacyAPIKeys := raw.LegacyAPIKeys.Kind != 0
+	raw.LegacyAPIKeys = yaml.Node{}
 	refreshInterval, err := parseDuration("catalog.refresh-interval", raw.Catalog.RefreshInterval, DefaultRefreshInterval)
 	if err != nil {
 		return Config{}, err
@@ -133,7 +126,7 @@ func Load(yamlBytes []byte) (Config, error) {
 			Enabled: orDefault(raw.ModelPrefix.Enabled, true),
 			Value:   orDefault(raw.ModelPrefix.Value, DefaultModelPrefix),
 		},
-		APIKeys: keys,
+		LegacyAPIKeys: legacyAPIKeys,
 		Catalog: Catalog{
 			RefreshInterval:       refreshInterval,
 			StaleWhileUnavailable: orDefault(raw.Catalog.StaleWhileUnavailable, true),
@@ -175,21 +168,6 @@ func (c Config) validate() error {
 	}
 	if err := validateURL("catalog-url", c.CatalogURL, c.AllowHTTP); err != nil {
 		return err
-	}
-	if len(c.APIKeys) == 0 {
-		return fmt.Errorf("api-keys: at least one key is required")
-	}
-	for i, k := range c.APIKeys {
-		if k.Value == "" {
-			return fmt.Errorf("api-keys[%d].value: expanded to empty", i)
-		}
-	}
-	seen := make(map[string]bool, len(c.APIKeys))
-	for _, k := range c.APIKeys {
-		if seen[k.Value] {
-			return fmt.Errorf("api-keys: duplicate key values are not allowed")
-		}
-		seen[k.Value] = true
 	}
 	if c.Catalog.RefreshInterval < time.Minute {
 		return fmt.Errorf("catalog.refresh-interval: must be at least 1m")

@@ -27,17 +27,42 @@ const (
 )
 
 // authRecorder answers host.http.do, records every Authorization header, and
-// rejects the cooled first key 401-style while any other key gets a good
-// catalog body.
+// authRecorder exposes host-owned test credentials and records every upstream
+// Authorization header. The first credential fails with 401; no upstream
+// rotation should occur during a catalog refresh.
 type authRecorder struct {
 	mu    sync.Mutex
 	auths []string
 	logs  [][]byte
 	// body, when non-empty, replaces testCatalogJSON as the served catalog.
 	body []byte
+	keys []string
 }
 
 func (r *authRecorder) call(method string, payload []byte) ([]byte, error) {
+	keys := r.keys
+	if len(keys) == 0 {
+		keys = []string{cooledRefreshKey, goodRefreshKey}
+	}
+	if method == pluginabi.MethodHostAuthList {
+		files := make([]pluginapi.HostAuthFileEntry, len(keys))
+		for i := range keys {
+			name := fmt.Sprintf("%d.json", i)
+			files[i] = pluginapi.HostAuthFileEntry{ID: name, Name: name, AuthIndex: name, Provider: ProviderID, Source: "file"}
+		}
+		return hostOK(hostAuthListResponse{Files: files}), nil
+	}
+	if method == pluginabi.MethodHostAuthGet {
+		var req pluginapi.HostAuthGetRequest
+		_ = json.Unmarshal(payload, &req)
+		for i, key := range keys {
+			if req.AuthIndex == fmt.Sprintf("%d.json", i) {
+				raw, _ := json.Marshal(map[string]any{"type": ProviderID, "api_key": key})
+				return hostOK(pluginapi.HostAuthGetResponse{JSON: raw}), nil
+			}
+		}
+		return hostErr("not_found", "missing auth"), nil
+	}
 	if method == pluginabi.MethodHostLog {
 		r.mu.Lock()
 		r.logs = append(r.logs, append([]byte(nil), payload...))
@@ -94,13 +119,12 @@ func twoKeyFixture(t *testing.T) (config.Config, *catalog.Manager, *HostBridge, 
 	return cfg, catalog.New(cfg, bridge), bridge, rec
 }
 
-// TestRefreshUsesFirstConfiguredKey pins the Phase 5 fallback: catalog refresh
-// uses the deterministic first configured key and does not try another
-// configured key when that key fails.
-func TestRefreshUsesFirstConfiguredKey(t *testing.T) {
-	cfg, mgr, bridge, rec := twoKeyFixture(t)
-	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err == nil {
-		t.Fatal("expected first configured key failure")
+// Catalog discovery uses the first readable, enabled host credential and
+// does not rotate on an upstream 401.
+func TestRefreshUsesFirstEnabledAuthFile(t *testing.T) {
+	_, mgr, bridge, rec := twoKeyFixture(t)
+	if err := refreshOnce(context.Background(), mgr, bridge, time.Second); err == nil {
+		t.Fatal("expected first enabled auth file key failure")
 	}
 	auths := rec.seen()
 	if len(auths) != 1 || auths[0] != "Bearer "+cooledRefreshKey {
@@ -125,10 +149,10 @@ func TestRefreshUnsupportedLogQuotesNewlineIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	rec := &authRecorder{body: []byte(`{"data":[{"id":"evil\n2027-01-01 ERROR forged host.log line"}]}`)}
+	rec := &authRecorder{keys: []string{"sk-refresh-evil-key"}, body: []byte(`{"data":[{"id":"evil\n2027-01-01 ERROR forged host.log line"}]}`)}
 	bridge := NewHostBridge(rec.call)
 	mgr := catalog.New(cfg, bridge)
-	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err != nil {
+	if err := refreshOnce(context.Background(), mgr, bridge, time.Second); err != nil {
 		t.Fatalf("refreshOnce: %v", err)
 	}
 	logCalls := rec.logCalls()

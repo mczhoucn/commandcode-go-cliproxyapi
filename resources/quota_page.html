@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CommandCode Quota</title>
+<title>CommandCode 账户与额度</title>
 <style>
 :root {
   --bg-primary: #f0eee8;
@@ -49,6 +49,14 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 .quota-header { margin-bottom: 24px; }
 .quota-title { margin: 0; font-size: 28px; font-weight: 700; line-height: 1.2; }
 .quota-description { margin: 8px 0 0; color: var(--text-secondary); }
+.quota-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 8px; }
+.quota-field-label { color: var(--text-secondary); }
+.quota-input { flex: 1 1 240px; min-width: 0; border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 10px; color: var(--text-primary); background: var(--bg-primary); font: inherit; }
+.quota-input:disabled { cursor: not-allowed; opacity: .6; }
+.quota-status { margin: 8px 0; }
+.quota-success { color: var(--success-color); }
+.quota-toolbar { margin: 0 0 8px; }
+.quota-account { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: -8px; }
 .quota-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
 .quota-card { padding: 20px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-primary); box-shadow: var(--shadow); }
 .quota-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
@@ -78,8 +86,17 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 </head>
 <body>
 <div class="quota-page">
-  <header class="quota-header"><h1 class="quota-title">CommandCode Quota</h1><p class="quota-description">Usage for each configured credential. New accounts refresh automatically.</p></header>
-  <main id="app"><p class="quota-muted">Loading credentials...</p></main>
+  <header class="quota-header"><h1 class="quota-title">CommandCode 账户与额度</h1><p class="quota-description">粘贴 API key 保存为认证文件，并查看各账户额度。仅没有邮箱的账户会自动查询一次。禁用账户仍可手动刷新。启用、禁用和删除请到认证文件页操作。</p></header>
+  <form id="save-form" class="quota-form" autocomplete="off">
+    <label class="quota-field-label" for="api-key">API key</label>
+    <input id="api-key" class="quota-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="off">
+    <button id="save-account" class="quota-refresh" type="submit">保存</button>
+  </form>
+  <p id="save-status" class="quota-status" role="status"></p>
+  <div class="quota-toolbar"><button id="reload-accounts" class="quota-refresh" type="button">刷新账户列表</button></div>
+  <p id="list-status" class="quota-status" role="status"></p>
+  <p id="legacy-status" class="quota-status quota-warning" role="status"></p>
+  <main id="app"><p class="quota-muted">正在加载账户…</p></main>
 </div>
 <script>
 (() => {
@@ -107,7 +124,15 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 <script>
 (() => {
   const app = document.getElementById("app");
-  const endpoint = "/v0/management/plugins/commandcode-go-cliproxyapi/quota-usage";
+  const saveForm = document.getElementById("save-form");
+  const apiKeyInput = document.getElementById("api-key");
+  const saveButton = document.getElementById("save-account");
+  const saveStatus = document.getElementById("save-status");
+  const reloadButton = document.getElementById("reload-accounts");
+  const listStatus = document.getElementById("list-status");
+  const legacyStatus = document.getElementById("legacy-status");
+  const quotaEndpoint = "/v0/management/plugins/commandcode-go-cliproxyapi/quota-usage";
+  const accountsEndpoint = "/v0/management/plugins/commandcode-go-cliproxyapi/accounts";
   const storageKey = "commandcode-go-cliproxyapi:quota";
   const values = new Map();
   const labels = new Map();
@@ -115,6 +140,12 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
   const errors = new Map();
   const inFlight = new Set();
   let cache = {};
+  let cards = [];
+  let listGeneration = 0;
+  let listLoading = false;
+  let listReady = false;
+  let listError = "";
+  let saving = false;
   try {
     const stored = sessionStorage.getItem(storageKey);
     const parsed = stored ? JSON.parse(stored) : {};
@@ -137,27 +168,39 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     cache[keyID] = {usage, fetched_at: timestamp, label: labels.get(keyID) || ""};
     saveCache();
   }
-  function refreshCard(card, cards, alreadyQueued) {
+  function currentCard(keyID) {
+    return cards.find(item => item && item.key_id === keyID) || null;
+  }
+  function refreshCard(card, alreadyQueued) {
+    const keyID = card.key_id;
+    if (!keyID) return Promise.resolve();
     if (!alreadyQueued) {
-      if (inFlight.has(card.key_id)) return Promise.resolve();
-      inFlight.add(card.key_id);
-      errors.delete(card.key_id);
-      render(cards);
+      if (inFlight.has(keyID)) return Promise.resolve();
+      inFlight.add(keyID);
+      errors.delete(keyID);
+      render();
     }
-    return request({key_id: card.key_id}).then(result => {
-      inFlight.delete(card.key_id);
+    return request(quotaEndpoint, {key_id: keyID}).then(result => {
+      inFlight.delete(keyID);
+      const live = currentCard(keyID);
+      if (!live) return;
+      // Account state belongs to the latest list snapshot, not to a possibly
+      // older quota request that was started before a disable or rename.
+      if (typeof result.label === "string" && result.label) live.label = result.label;
+      if (result.email) live.email = result.email;
       if (result.error) {
-        errors.set(card.key_id, result.error);
-        render(cards);
+        errors.set(keyID, result.error);
+        render();
         return;
       }
-      if (result.email) card.email = result.email;
-      applyUsage(card.key_id, result.usage, result.label);
-      render(cards);
+      errors.delete(keyID);
+      if (result.usage && typeof result.usage === "object") applyUsage(keyID, result.usage, result.label || live.label);
+      render();
     }).catch(err => {
-      inFlight.delete(card.key_id);
-      errors.set(card.key_id, err.message || "Refresh failed");
-      render(cards);
+      inFlight.delete(keyID);
+      if (!currentCard(keyID)) return;
+      errors.set(keyID, err.message || "Refresh failed");
+      render();
     });
   }
   function auth() {
@@ -176,15 +219,31 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       return "";
     } catch (_) { return ""; }
   }
-  function request(body) {
+  function request(url, body) {
     const headers = {"Content-Type": "application/json"};
     const key = auth();
     if (key) headers.Authorization = "Bearer " + key;
-    return fetch(endpoint, {method: "POST", headers, body: JSON.stringify(body)}).then(async response => {
+    return fetch(url, {method: "POST", headers, body: JSON.stringify(body)}).then(async response => {
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "Request failed");
       return data;
     });
+  }
+  function setSaveStatus(message, isError) {
+    saveStatus.className = message ? (isError ? "quota-status quota-error" : "quota-status quota-success") : "quota-status";
+    saveStatus.textContent = message || "";
+  }
+  function setListStatus(message) {
+    listError = message || "";
+    listStatus.className = listError ? "quota-status quota-error" : "quota-status";
+    listStatus.textContent = listError;
+  }
+  function setLegacy(ignored) {
+    legacyStatus.textContent = ignored ? "旧的 api-keys 已停用，不会导入。可以移除旧配置。" : "";
+  }
+  function syncReloadButton() {
+    reloadButton.disabled = listLoading;
+    reloadButton.textContent = listLoading ? "正在刷新列表…" : "刷新账户列表";
   }
   function text(parent, value) { const node = document.createElement("span"); node.textContent = value == null || value === "" ? "-" : value; parent.appendChild(node); }
   function renderUsage(row, usage, extraParts, withDaysLeft) {
@@ -210,9 +269,12 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     text(meta, parts.join(" · "));
     row.append(value, track, meta);
   }
-  function render(cards) {
+  function render() {
     app.textContent = "";
-    if (!cards.length) { const p = document.createElement("p"); p.className = "quota-muted"; p.setAttribute("role", "status"); p.textContent = "No configured credentials."; app.appendChild(p); return; }
+    if (!cards.length) {
+      if (listError) return;
+      const p = document.createElement("p"); p.className = "quota-muted"; p.setAttribute("role", "status"); p.textContent = listReady ? "还没有 CommandCode 账户。" : "正在加载账户…"; app.appendChild(p); return;
+    }
     const grid = document.createElement("div"); grid.className = "quota-grid";
     cards.forEach(card => {
       const section = document.createElement("section"); section.className = "quota-card";
@@ -220,6 +282,10 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       const cached = values.get(card.key_id);
       const badge = document.createElement("span"); badge.className = "credential-badge"; badge.textContent = (cached && cached.plan) || "CC"; badge.setAttribute("aria-hidden", "true");
       const title = document.createElement("h2"); title.className = "credential-name"; title.textContent = labels.get(card.key_id) || card.label; header.append(badge, title); section.appendChild(header);
+      const account = document.createElement("div"); account.className = "quota-account";
+      const fileName = document.createElement("span"); fileName.className = "quota-meta"; fileName.textContent = "文件名 " + (card.file_name || "-");
+      const accountState = document.createElement("span"); accountState.className = card.disabled ? "quota-warning" : "quota-meta"; accountState.textContent = card.disabled ? "已禁用" : "已启用";
+      account.append(fileName, accountState); section.appendChild(account);
       [["five_hour", "5-hour window"], ["weekly", "Weekly window"]].forEach(entry => {
         const name = entry[0];
         const row = document.createElement("div"); row.className = "quota-row";
@@ -241,27 +307,85 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       const actions = document.createElement("div"); actions.className = "quota-actions";
       const button = document.createElement("button"); button.className = "quota-refresh"; button.textContent = inFlight.has(card.key_id) ? "Refreshing..." : "Refresh"; button.disabled = inFlight.has(card.key_id); button.setAttribute("aria-label", "Refresh " + card.label);
       const error = document.createElement("span"); error.className = "quota-error"; error.setAttribute("role", "status"); error.textContent = errors.get(card.key_id) || "";
-      button.onclick = () => { refreshCard(card, cards); };
+      button.onclick = () => { refreshCard(card); };
       actions.append(button, error); section.appendChild(actions); grid.appendChild(section);
     });
     app.appendChild(grid);
   }
-  if (!auth()) { app.textContent = ""; const p = document.createElement("p"); p.className = "quota-error"; p.setAttribute("role", "status"); p.textContent = "Enable Remember password in Management Center to use this page."; app.appendChild(p); return; }
-  request({}).then(result => {
-    const cards = result.cards || [];
-    const configured = new Set(cards.map(card => card.key_id));
-    Object.keys(cache).forEach(keyID => {
-      if (!configured.has(keyID)) { delete cache[keyID]; values.delete(keyID); labels.delete(keyID); fetchedAt.delete(keyID); }
+  function loadList() {
+    const generation = ++listGeneration;
+    listLoading = true;
+    syncReloadButton();
+    setListStatus("");
+    return request(quotaEndpoint, {}).then(result => {
+      if (generation !== listGeneration) return;
+      cards = Array.isArray(result.cards) ? result.cards : [];
+      const configured = new Set(cards.map(card => card.key_id));
+      Object.keys(cache).forEach(keyID => {
+        if (!configured.has(keyID)) { delete cache[keyID]; values.delete(keyID); labels.delete(keyID); fetchedAt.delete(keyID); errors.delete(keyID); }
+      });
+      [values, labels, fetchedAt, errors].forEach(map => {
+        for (const keyID of map.keys()) if (!configured.has(keyID)) map.delete(keyID);
+      });
+      cards.forEach(card => {
+        if (card.email && !labels.has(card.key_id)) labels.set(card.key_id, card.label);
+        if (card.usage && typeof card.usage === "object") applyUsage(card.key_id, card.usage, card.label);
+        if (card.error) errors.set(card.key_id, card.error);
+        else if (!inFlight.has(card.key_id)) errors.delete(card.key_id);
+      });
+      saveCache();
+      setLegacy(result.legacy_api_keys_ignored === true);
+      listReady = true;
+      const missing = cards.filter(card => !card.email).filter(card => card.key_id && !inFlight.has(card.key_id));
+      missing.forEach(card => inFlight.add(card.key_id));
+      render();
+      missing.forEach(card => refreshCard(card, true));
+    }).catch(err => {
+      if (generation !== listGeneration) return;
+      setListStatus(err.message && err.message !== "Request failed" ? err.message : "无法加载账户列表。");
+      render();
+    }).then(() => {
+      if (generation !== listGeneration) return;
+      listLoading = false;
+      syncReloadButton();
     });
-    cards.forEach(card => {
-      if (card.email && !labels.has(card.key_id)) labels.set(card.key_id, card.label);
+  }
+  function onSave(event) {
+    event.preventDefault();
+    if (saving) return;
+    const trimmedKey = apiKeyInput.value.trim();
+    if (!trimmedKey) {
+      setSaveStatus("请输入 API key。", true);
+      return;
+    }
+    saving = true;
+    apiKeyInput.disabled = true;
+    saveButton.disabled = true;
+    setSaveStatus("正在保存…", false);
+    request(accountsEndpoint, {api_key: trimmedKey}).then(result => {
+      apiKeyInput.value = "";
+      const fileName = result && typeof result.file_name === "string" ? result.file_name : "";
+      setSaveStatus(fileName ? "已保存为文件 " + fileName + "。随后的额度查询失败不会影响这次保存。" : "已保存。随后的额度查询失败不会影响这次保存。", false);
+      return loadList().catch(() => {});
+    }).catch(err => {
+      setSaveStatus(err.message && err.message !== "Request failed" ? err.message : "保存失败。", true);
+    }).then(() => {
+      saving = false;
+      apiKeyInput.disabled = false;
+      saveButton.disabled = false;
     });
-    saveCache();
-    const missing = cards.filter(card => !card.email);
-    missing.forEach(card => inFlight.add(card.key_id));
-    render(cards);
-    missing.forEach(card => refreshCard(card, cards, true));
-  }).catch(err => { app.textContent = ""; const p = document.createElement("p"); p.className = "quota-error"; p.setAttribute("role", "status"); p.textContent = err.message || "Unable to load credentials."; app.appendChild(p); });
+  }
+  if (!auth()) {
+    apiKeyInput.disabled = true;
+    saveButton.disabled = true;
+    reloadButton.disabled = true;
+    app.textContent = "";
+    const p = document.createElement("p"); p.className = "quota-error"; p.setAttribute("role", "status"); p.textContent = "Enable Remember password in Management Center to use this page."; app.appendChild(p);
+    return;
+  }
+  saveForm.addEventListener("submit", onSave);
+  reloadButton.addEventListener("click", () => { if (!listLoading) loadList(); });
+  loadList();
 })();
 </script>
 </body>
