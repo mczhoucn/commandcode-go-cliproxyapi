@@ -56,6 +56,13 @@ Without this plugin, using a CommandCode GOAT plan in CLIProxyAPI requires hand-
 - **CLIProxyAPI**: `v7.2.138+`
 - **Go Toolchain**: Go 1.26+ (CGO enabled for `-buildmode=c-shared`)
 
+## v0.1.2 upgrade and release notes
+
+- Existing auth files remain usable. Plugin `api-keys` config is retired and is not imported. Add accounts in **CommandCode → CommandCode accounts and quota**, or upload auth files; disable and delete remain on the host auth-file page.
+- For a manual upgrade, replace the library for the target OS/architecture, restart CLIProxyAPI, then refresh Management Center. Updating this repository's version does not update an already running installation.
+- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.1.2`. Each supported platform needs `commandcode-go-cliproxyapi_0.1.2_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
+- Each ZIP must contain exactly one matching library at its root: `commandcode-go-cliproxyapi.so`, `commandcode-go-cliproxyapi.dylib`, or `commandcode-go-cliproxyapi.dll`. Keep the plugin ID and repository URL unchanged; the store reads the version from the latest GitHub release.
+
 ## Build
 
 ```bash

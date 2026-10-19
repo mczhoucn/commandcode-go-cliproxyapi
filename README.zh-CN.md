@@ -56,6 +56,13 @@ CommandCode GOAT 通过它的 OpenAI 兼容入口访问：
 - **CLIProxyAPI**：`v7.2.138+`
 - **Go**：1.26+（`-buildmode=c-shared` 需要启用 CGO）
 
+## v0.1.2 升级与发布说明
+
+- 已有认证文件继续使用。插件配置中的 `api-keys` 已停用，不会自动导入。新增账户请进入 **CommandCode → CommandCode账户与额度**，或自行上传认证文件；禁用和删除仍在宿主认证文件页。
+- 手动升级时，替换与目标操作系统、处理器架构对应的插件库，重启 CLIProxyAPI，再刷新管理后台。只修改本仓库的版本号，不会更新已经运行的插件。
+- 向 [CPA 插件仓库](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements)提交前，需要发布 GitHub 标签 `v0.1.2`。每个受支持平台应提供 `commandcode-go-cliproxyapi_0.1.2_<goos>_<goarch>.zip`，并提供汇总的 SHA-256 校验文件 `checksums.txt`。推送版本标签后，现有构建流程会生成这些文件。
+- 每个 ZIP 的根目录只能包含一个对应的插件库：`commandcode-go-cliproxyapi.so`、`commandcode-go-cliproxyapi.dylib` 或 `commandcode-go-cliproxyapi.dll`。插件 ID 和仓库地址保持不变；插件仓库通过最新 GitHub Release 获取版本。
+
 ## 构建
 
 ```bash

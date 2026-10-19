@@ -1,8 +1,8 @@
 # Release Notes
 
-## Unreleased — auth files are the only API key source
+## v0.1.2 — Auth-file account management
 
-Not a release. This does not mean the change is already deployed.
+Upgrade notice: auth files are now the only API key source. The retired plugin `api-keys` block is not imported; preserve the auth files you want to keep.
 
 - The Management Center menu is **CommandCode**. **CommandCode accounts and quota** (CommandCode账户与额度) can paste an API key and save it as a host auth file. Hand-written JSON is unnecessary; uploading an auth file still works.
 - Disable and delete stay on the host auth-file page.
