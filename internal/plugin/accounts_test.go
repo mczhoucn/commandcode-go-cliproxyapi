@@ -74,13 +74,7 @@ func TestAccountListFollowsAuthFiles(t *testing.T) {
 }
 
 func TestAccountAddSavesOnlyAuthFile(t *testing.T) {
-	f := &fakeCaller{responder: func(method string, _ []byte) ([]byte, error) {
-		if method == pluginabi.MethodHostAuthList {
-			return hostOK(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{}}), nil
-		}
-		return hostOK(map[string]any{}), nil
-	}}
-	m := NewManager(NewHostBridge(f.call))
+	m, f := oauthTestManager()
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{
 		Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/accounts", Body: []byte(`{"api_key":"  new-account-secret  "}`),
 	})
@@ -108,8 +102,8 @@ func TestAccountAddSavesOnlyAuthFile(t *testing.T) {
 	if strings.Contains(string(resp.Body), "new-account-secret") {
 		t.Fatal("add response leaked key")
 	}
-	if len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
-		t.Fatal("saving a key depends on an upstream round-trip")
+	if len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 2 || record["credential_source"] != "api_key" || record["plan_id"] != "individual-goat" {
+		t.Fatal("account was not verified before save")
 	}
 }
 
@@ -190,6 +184,8 @@ func TestAccountAddErrorsNeverSaveOrLeakSecrets(t *testing.T) {
 		"empty":          `{"api_key":""}`,
 		"spaces":         `{"api_key":"  "}`,
 		"header newline": `{"api_key":"injected\r\nsecret"}`,
+		"control":        string(mustJSON(map[string]string{"api_key": "credential" + string(rune(0)) + "secret"})),
+		"delete control": string(mustJSON(map[string]string{"api_key": "credential" + string(rune(127)) + "secret"})),
 		"malformed":      `{"api_key":"malformed-secret"`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -203,16 +199,21 @@ func TestAccountAddErrorsNeverSaveOrLeakSecrets(t *testing.T) {
 	}
 	for _, method := range []string{pluginabi.MethodHostAuthList, pluginabi.MethodHostAuthGet, pluginabi.MethodHostAuthSave} {
 		t.Run(method, func(t *testing.T) {
-			f := &fakeCaller{responder: func(actual string, _ []byte) ([]byte, error) {
+			_, valid := oauthTestManager()
+			f := &fakeCaller{responder: func(actual string, payload []byte) ([]byte, error) {
 				if actual == method {
 					return hostErr("denied", "credential-secret echoed by host"), nil
 				}
-				return hostOK(map[string]any{}), nil
+				return valid.responder(actual, payload)
 			}}
+			f.setAuthFiles("existing-unrelated-key")
 			m := NewManager(NewHostBridge(f.call))
 			resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/accounts", Body: []byte(`{"api_key":"new-safe-test-key"}`)})
 			if err != nil || resp.StatusCode != http.StatusBadGateway || strings.Contains(string(resp.Body), "credential-secret") {
 				t.Fatalf("host failure: status=%d body=%s err=%v", resp.StatusCode, resp.Body, err)
+			}
+			if len(f.callsOf(method)) == 0 {
+				t.Fatal("test did not reach failing host callback")
 			}
 			if method != pluginabi.MethodHostAuthSave && len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 {
 				t.Fatal("failed duplicate check still saved")
@@ -222,9 +223,7 @@ func TestAccountAddErrorsNeverSaveOrLeakSecrets(t *testing.T) {
 }
 
 func TestAccountAddConcurrentDuplicateWritesOnce(t *testing.T) {
-	f := &fakeCaller{}
-	f.setAuthFiles()
-	m := NewManager(NewHostBridge(f.call))
+	m, f := oauthTestManager()
 	var wg sync.WaitGroup
 	results := make(chan int, 2)
 	for i := 0; i < 2; i++ {

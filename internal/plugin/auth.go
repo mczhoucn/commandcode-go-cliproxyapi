@@ -6,14 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 type authProvider struct{}
-
-var _ pluginapi.AuthProvider = authProvider{}
 
 func (authProvider) Identifier() string { return ProviderID }
 
@@ -52,14 +49,6 @@ func (authProvider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest)
 		Attributes: map[string]string{"api_key": strings.TrimSpace(raw.APIKey)},
 	}
 	return pluginapi.AuthParseResponse{Handled: true, Auth: auth}, nil
-}
-
-func (authProvider) StartLogin(context.Context, pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
-	return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("commandcode login is unsupported; configure a manual api key")
-}
-
-func (authProvider) PollLogin(context.Context, pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
-	return pluginapi.AuthLoginPollResponse{}, fmt.Errorf("commandcode login is unsupported; configure a manual api key")
 }
 
 func (authProvider) RefreshAuth(_ context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
@@ -129,47 +118,21 @@ func (m *Manager) addAccount(ctx context.Context, body []byte) (pluginapi.Manage
 	var req struct {
 		APIKey string `json:"api_key"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if len(body) > 16*1024 || json.Unmarshal(body, &req) != nil {
 		return managementError(http.StatusBadRequest, "API key 请求格式无效")
 	}
-	key := strings.TrimSpace(req.APIKey)
-	if key == "" || strings.IndexFunc(key, unicode.IsSpace) >= 0 {
-		return managementError(http.StatusBadRequest, "请输入不含空白字符的 API key")
-	}
-	// Serialize additions with each other and with lifecycle mutations. A
-	// duplicate submission must not overwrite disabled state or user metadata.
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
-	if m.bridge == nil {
-		return managementError(http.StatusBadGateway, "无法读取认证文件，请稍后重试")
+	auth, failure := m.prepareCredentialLocked(ctx, req.APIKey, "api_key")
+	if failure != nil {
+		return managementError(failure.status, failure.message)
 	}
-	files, err := m.bridge.AuthList(ctx)
-	if err != nil {
-		return managementError(http.StatusBadGateway, "无法读取认证文件，请稍后重试")
+	// A timed-out callback may still finish its save. Only observing a matching
+	// file reconciles the digest claim, even if AuthSave returned an error.
+	if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: auth.FileName, JSON: auth.StorageJSON}); err != nil {
+		return managementError(http.StatusBadGateway, "保存结果尚未确认，请先刷新认证文件列表；不会自动重新保存")
 	}
-	name := authFileNameFromHash(authKeyHash(key))
-	for _, entry := range files {
-		if entry.Source == "file" && entry.Name == name {
-			return managementError(http.StatusConflict, "同名认证文件已存在，请在认证文件页面管理")
-		}
-		if !isCommandcodeAuthFile(entry) {
-			continue
-		}
-		existingKey, err := authFileKey(ctx, m.bridge, entry)
-		if err != nil {
-			return managementError(http.StatusBadGateway, "无法核对现有认证文件，未保存 API key")
-		}
-		if existingKey == key {
-			return managementError(http.StatusConflict, "此 API key 已存在，请在认证文件页面管理")
-		}
-	}
-	// Omit an independent JSON id: both host.auth.save and ParseAuth derive
-	// the same runtime ID from the filename, avoiding duplicate credentials.
-	record, _ := json.Marshal(map[string]any{"type": ProviderID, "api_key": key})
-	if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: name, JSON: record}); err != nil {
-		return managementError(http.StatusBadGateway, "保存认证文件失败，请刷新账户列表确认后重试")
-	}
-	resp, err := quotaJSON(map[string]string{"file_name": name})
+	resp, err := quotaJSON(map[string]string{"file_name": auth.FileName})
 	resp.StatusCode = http.StatusCreated
 	return resp, err
 }

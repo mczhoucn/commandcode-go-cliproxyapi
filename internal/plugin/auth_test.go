@@ -90,11 +90,12 @@ func TestAuthDispatchMethods(t *testing.T) {
 	if !got.Handled || got.Auth.Attributes["api_key"] != "sk-dispatch-1" {
 		t.Fatalf("parse dispatch = %#v", got)
 	}
-	for _, method := range []string{pluginabi.MethodAuthLoginStart, pluginabi.MethodAuthLoginPoll} {
-		raw, _ = m.HandleCall(method, []byte(`{}`))
-		if env := decodeEnv(t, raw); env.OK || env.Error == nil || env.Error.Code != "unsupported" {
-			t.Fatalf("%s = %#v", method, env.Error)
-		}
+	var start pluginapi.AuthLoginStartResponse
+	decodeResult(t, mustHandle(t, m, pluginabi.MethodAuthLoginStart, []byte(`{}`)), &start)
+	var pending pluginapi.AuthLoginPollResponse
+	decodeResult(t, mustHandle(t, m, pluginabi.MethodAuthLoginPoll, mustJSON(pluginapi.AuthLoginPollRequest{State: start.State})), &pending)
+	if pending.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("new login is not pending: %s", pending.Status)
 	}
 	raw, err = m.HandleCall(pluginabi.MethodAuthRefresh, mustJSON(struct{ pluginapi.AuthRefreshRequest }{pluginapi.AuthRefreshRequest{AuthID: "id", AuthProvider: ProviderID, Attributes: map[string]string{"api_key": "sk-refresh-1"}}}))
 	if err != nil {

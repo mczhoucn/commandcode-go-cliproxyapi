@@ -1,5 +1,33 @@
 # Release Notes
 
+User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **CommandCode GOAT / Pro / Max**, not CommandCode Go.
+
+## Unreleased — Easier account setup and browser authorization
+
+- **Supported plans and naming**: support CommandCode GOAT / Pro / Max, not Go. Go uses the official CLI's private, non-OpenAI-compatible interface/protocol and has no Provider API access; CPA's current CommandCode integration does not implement it. The `go` in `commandcode-go-cliproxyapi` is inherited from `opencode-go-cliproxyapi`, not a plan-support claim.
+- **Easier manual setup**: enter an existing API key on the independent **CommandCode accounts and quota** page; the plugin validates it and saves an auth file. No hand-written auth JSON or manual key entry in plugin configuration is needed. Old `api-keys` configuration remains retired and is not imported.
+- **CommandCode OAuth login**: authorize through the official website without manually pre-creating an API key. The official flow generates a credential; copy it from the fallback page into CPA to finish. This is not an automatic callback or token-renewal implementation.
+- **Expected fallback transition**: credentials are returned by HTTP POST, not in the callback HTTP GET URL. The Chrome-blocked localhost:6000 callback intentionally triggers the official failed-delivery fallback. A brief callback-URL/credential-delivery error may precede the credential-copy page; this is expected. No fallback, inability to copy, or failed CPA validation/save remains a real error.
+- **Equivalent, coexisting accounts**: both entry points verify identity and an active, unexpired subscription, then create the same kind of auth file with the same model/quota capabilities; only the source label differs. Identical keys are deduplicated; different keys may coexist without multiplying subscription quota. Existing auth files and host uploads are unchanged.
+- **Retained Chat Completions translation**: Responses was unavailable when the plugin was created; the official API now supports it for most OpenAI/open models. At the 2026-10-20 release-preparation snapshot, GLM-5.3 Flash, Tencent Hy4 Preview and DeepSeek V4 Flash Fast still declare only Chat Completions. Keep the default translation path, rather than claiming native Responses works for every model or implementing automatic endpoint switching.
+- **Login compatibility**: preserve sessions when older CPA versions resend identical configuration; decode HTML-escaped official URLs before validating their parameters. Browser regressions verify the final visible link, including state and fallback callback.
+- **Save and security boundaries**: OAuth completion only stages credentials; CPA polling saves. Cross-entry digest claims avoid duplicate delivery and retain uncertain saves without automatic rewriting. The guide requires a remembered same-origin management login. Only the Chrome fallback has been verified. Post-delivery cancellation, concurrent host file edits, CPA redirects and the earlier email-sync race retain their documented limitations.
+- **Quota location**: quota remains on the plugin page; the standard `QuotaProvider` for CPA auth-file cards is not implemented.
+- These entries describe unpublished source changes, not a new GitHub Release or version bump. See [ChangeLog](CHANGELOG.md) and the README for user steps and compatibility evidence.
+
+**中文**
+
+- **支持范围与名称**：支持 CommandCode GOAT / Pro / Max，**不支持 Go 套餐**。Go 使用官方 CLI 专用的私有接口与协议，没有 Provider API 权限，CPA 当前的 CommandCode 接入没有实现这套协议。`commandcode-go-cliproxyapi` 中的 `go` 仅继承自 `opencode-go-cliproxyapi`。
+- **优化易用性**：在插件添加的独立 **CommandCode账户与额度** 页面直接输入已有 API key，联网核验后自动保存为认证文件；不再需要手工向配置文件添加 API key，也不用手写认证 JSON。旧 `api-keys` 配置停用且不导入。
+- **增加 CommandCode OAuth 登录**：无需预先到官网手动创建 API key；在官网授权后，从官方备用页复制授权流程生成的凭据，粘回 CPA 完成。不承诺自动回调或自动续期。
+- **预期的错误页过渡**：官网通过 HTTP POST 返回凭据，不把认证 Token / API key 放进 Callback HTTP GET URL。Chrome 默认拦截 localhost:6000 回调后，官网会进入失败备用流程；授权后可能短暂显示回调网址或凭据传递错误，再跳到凭据复制备用页，这是当前设计。没有跳转、无法复制或 CPA 最终核验/保存失败仍需处理，不能忽略。
+- **两种添加方式并行共存、能力相同**：都核验身份及有效订阅，生成同类认证文件，模型调用和额度能力一致，仅来源标记不同。相同 key 去重，不同 key 可共存，但不会增加同一订阅的总额度。不迁移或删除旧认证，不改变宿主上传入口。
+- **保留 Chat Completions 转换**：插件创建时官方尚无 Responses 接口，现在多数 OpenAI 与开放模型已支持；截至 2026-10-20 本次发布准备，GLM-5.3 Flash、Tencent Hy4 Preview、DeepSeek V4 Flash Fast 等仍只声明 Chat Completions，因此保留默认转换路径，不宣称全模型原生 Responses 或自动切换接口。
+- **修复登录兼容性**：旧版 CPA 重发相同配置不再清除会话；引导页先还原官方链接的 HTML 转义，再校验参数。浏览器回归检查最终显示链接的 state 和备用回调地址。
+- **保存与安全边界**：OAuth 完成接口只暂存，由 CPA 轮询负责保存；两个入口共用 key 摘要占用，结果不明不自动重写。引导页要求同源管理登录并记住密码，仅验证过 Chrome 备用流程。交付后取消、宿主并发文件操作、HTTP 跳转和既有邮箱回写的限制仍未消除。
+- **额度位置**：额度仍在插件页查看，未接入 CPA 认证文件卡片的标准 `QuotaProvider`。
+- 以上为未发布源码的更新记录，不代表已创建新的 GitHub Release 或升版本。操作说明和兼容证据见 [ChangeLog](CHANGELOG.md) 与 README。
+
 ## v0.1.2 — Auth-file account management
 
 Upgrade notice: auth files are now the only API key source. The retired plugin `api-keys` block is not imported; preserve the auth files you want to keep.
@@ -31,9 +59,9 @@ parts are still rejected.
 
 - Replace the plugin binary and restart CLIProxyAPI.
 
-## v0.1.0 — CommandCode GOAT provider
+## v0.1.0 — CommandCode GOAT / Pro / Max provider
 
-First release of the plugin as a CommandCode GOAT provider, derived from
+First release of the plugin as a CommandCode GOAT / Pro / Max provider, derived from
 opencode-go-cliproxyapi v0.1.7.
 
 **Adaptations**
@@ -43,10 +71,12 @@ opencode-go-cliproxyapi v0.1.7.
   emitted as a leading Claude `thinking` block, a leading Responses `reasoning`
   item with summary events, or a backfilled `reasoning_content` on the OpenAI
   passthrough — streaming and non-streaming.
-- **Chat-completions-only routing**: every catalog model defaults to
-  `{base-url}/chat/completions`, because CommandCode's `/messages` endpoint
-  accepts Claude models only and `/responses` is not registered. The family
-  prefix table was removed; `route-overrides` remain for other upstreams.
+- **Chat-completions-only routing at creation**: every catalog model defaulted to
+  `{base-url}/chat/completions`. At that time, CommandCode's `/messages` endpoint
+  accepted Claude models only and `/responses` was not yet available. The family
+  prefix table was removed; `route-overrides` remained. The official Responses
+  endpoint is now available for most OpenAI/open models; see the current README
+  for the remaining exceptions and why Chat Completions translation is retained.
 - **Effort passthrough**: models without thinking metadata (all CommandCode
   models) are no longer validated or clamped locally — `xhigh`/`max` reach the
   upstream verbatim, `auto`/`none` omit the field. A model that declares levels

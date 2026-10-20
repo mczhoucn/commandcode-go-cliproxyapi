@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>CommandCode 浏览器授权</title>
+<style>
+:root{color-scheme:light dark;font-family:system-ui,sans-serif;color:#182230;background:#f6f7f9}
+*{box-sizing:border-box}body{margin:0;padding:24px}main{max-width:720px;margin:auto;padding:28px;background:#fff;border:1px solid #dce1e7;border-radius:12px}
+h1{font-size:24px;margin-top:0}p,li{line-height:1.7}a{color:#2257d6;overflow-wrap:anywhere}label{display:block;font-weight:600;margin:20px 0 8px}
+input{width:100%;padding:12px;border:1px solid #adb8c6;border-radius:6px;font:inherit;background:transparent;color:inherit}
+button,.link-button{display:inline-block;padding:10px 16px;margin:12px 8px 0 0;border:1px solid #2257d6;border-radius:6px;background:#2257d6;color:white;font:inherit;text-decoration:none;cursor:pointer}
+button.secondary{color:inherit;background:transparent;border-color:#adb8c6}button:disabled{opacity:.5;cursor:not-allowed}
+.note{padding:12px;background:#f0f4fa;border-radius:6px}.error{color:#b42318}.success{color:#067647}#status{white-space:pre-wrap;overflow-wrap:anywhere}#authorization-link[hidden]{display:none}
+@media(prefers-color-scheme:dark){:root{color:#e1e7ee;background:#111722}main{background:#1b2430;border-color:#3e4b5c}.note{background:#253347}a{color:#93b7ff}.error{color:#ff9c94}.success{color:#79dba8}}
+@media(max-width:520px){body{padding:12px}main{padding:18px}h1{font-size:21px}button{width:100%}}
+</style>
+</head>
+<body>
+<main>
+<h1>CommandCode 浏览器授权</h1>
+<p>支持 GOAT / Pro / Max，不支持 Go。无需提前手动创建 API key。</p>
+<ol>
+<li>打开官方授权页，登录个人账户并点击“授权”。</li>
+<li>官方自动传递失败后进入备用页，复制生成的 API key。<strong>不是复制地址栏中的网址。</strong></li>
+<li>将 key 粘贴到下面并验证，等待 CPA 确认保存。</li>
+</ol>
+<p class="note">这是“浏览器授权、复制凭据完成”，不是自动回调。授权仍使用 API key，不提供自动续期。只在已验证的 Chrome 默认设置下使用；不要解除浏览器对端口 6000 的限制。</p>
+<a id="authorization-link" class="link-button" target="_blank" rel="noopener noreferrer" hidden>打开官方授权页</a>
+<p><a id="authorization-url" target="_blank" rel="noopener noreferrer"></a></p>
+<form id="complete-form">
+<label for="api-key">官方备用页提供的 API key</label>
+<input id="api-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" disabled>
+<button id="complete" type="submit" disabled>验证并提交</button>
+<button id="cancel" class="secondary" type="button" disabled>取消登录</button>
+<button id="check" class="secondary" type="button" disabled>重新确认状态</button>
+</form>
+<p id="status" role="status" aria-live="polite">正在确认登录会话…</p>
+<p id="file-name"></p>
+<p class="note">交付前可以取消；交给 CPA 后不能保证取消会撤回保存。保存结果不确定时，请先查看认证文件，不要再次添加同一个 key。官方页面临时存储和剪贴板可能包含 key，请勿截图、分享或提交到仓库。</p>
+<p><a id="accounts-link">返回 CommandCode 账户与额度</a></p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const state = new URLSearchParams(location.hash.slice(1)).get("state") || "";
+  const marker = "/v0/resource/plugins/commandcode-go-cliproxyapi/oauth";
+  const prefix = location.pathname.endsWith(marker) ? location.pathname.slice(0, -marker.length) : "";
+  const management = prefix + "/v0/management";
+  const endpoint = management + "/plugins/commandcode-go-cliproxyapi/oauth/";
+  $("accounts-link").href = prefix + "/v0/resource/plugins/commandcode-go-cliproxyapi/quota";
+  let timer, submitting = false, checking = false, terminal = false, uncertain = false, submissionUncertain = false;
+  let phase = "pending";
+  function auth() {
+    try {
+      const raw = localStorage.getItem("cli-proxy-auth");
+      if (!raw) return "";
+      let decoded = raw;
+      if (raw.startsWith("enc::v1::")) {
+        const bytes = Uint8Array.from(atob(raw.slice(9)), char => char.charCodeAt(0));
+        const seed = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + location.host + "|" + navigator.userAgent);
+        for (let i = 0; i < bytes.length; i++) bytes[i] ^= seed[i % seed.length];
+        decoded = new TextDecoder().decode(bytes);
+      }
+      const key = JSON.parse(decoded)?.state?.managementKey;
+      return typeof key === "string" ? key : "";
+    } catch (_) { return ""; }
+  }
+  function message(text, error = false, success = false) {
+    $("status").textContent = text;
+    $("status").className = error ? "error" : success ? "success" : "";
+  }
+  function controls() {
+    const pending = !terminal && !submitting && !uncertain && phase === "pending";
+    $("api-key").disabled = !pending;
+    $("complete").disabled = !pending;
+    $("cancel").disabled = terminal || submitting || phase === "delivered" || phase === "present";
+    $("check").disabled = checking || submitting || terminal;
+  }
+  async function request(url, method, body) {
+    const key = auth();
+    if (!key) throw new Error("请先在同一地址的 CPA 管理页面登录并勾选“记住密码”，然后重新打开本页。管理密码不会通过网址传递。");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 40000);
+    try {
+      const response = await fetch(url, {method, headers: {"Content-Type":"application/json", Authorization:"Bearer " + key},
+        body: body === undefined ? undefined : JSON.stringify(body), signal:controller.signal, redirect:"error"});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(response.status === 401 || response.status === 403 ? "管理登录已失效，请重新登录 CPA。" : data.error || "请求失败，请确认状态");
+        error.definitive = true;
+        throw error;
+      }
+      return data;
+    } finally { clearTimeout(timeout); }
+  }
+  const session = action => request(endpoint + action, "POST", {state});
+  async function inspect() {
+    if (checking || submitting || terminal) return;
+    checking = true; controls(); clearTimeout(timer);
+    try {
+      const host = await request(management + "/get-auth-status?state=" + encodeURIComponent(state), "GET");
+      if (terminal) return;
+      if (host.status === "error") {
+        terminal = true;
+        $("api-key").value = "";
+        message("CPA 登录未完成：" + (host.error || "会话失效") + "。请先检查认证文件；本页不会自动重新保存。", true);
+        return;
+      }
+      const info = await session("session");
+      if (terminal || submitting) return;
+      phase = info.status;
+      uncertain = submissionUncertain && phase === "pending";
+      if (info.file_name) $("file-name").textContent = "认证文件：" + info.file_name;
+      if (host.status === "ok" && phase === "present") {
+        terminal = true;
+        $("api-key").value = "";
+        message("CPA 已确认完成，已核对认证文件中的凭据。可以关闭本页。", false, true);
+        return;
+      }
+      if (phase === "pending") {
+        // CPA sanitizes management JSON strings, including URL query separators.
+        const decoded = document.createElement("textarea");
+        decoded.innerHTML = info.authorization_url;
+        const link = new URL(decoded.value);
+        if (link.origin !== "https://commandcode.ai" || link.pathname !== "/studio/auth/cli" ||
+            link.username || link.password || link.hash || link.searchParams.get("state") !== state ||
+            link.searchParams.get("callback") !== "http://localhost:6000/callback" || link.searchParams.has("mode")) {
+          throw new Error("官方授权地址异常，已停止");
+        }
+        $("authorization-link").href = link.href;
+        $("authorization-link").hidden = false;
+        $("authorization-url").href = link.href;
+        $("authorization-url").textContent = link.href;
+        message(uncertain ? "上次提交结果仍不明确，不能仅凭等待状态再次提交。请取消本次登录后重新开始，或先检查认证文件。" : "会话有效至 " + new Date(info.expires_at).toLocaleTimeString() + "。请在官方备用页复制 key 后粘贴。", uncertain);
+      } else if (phase === "ready" || phase === "delivered" || phase === "present") {
+        $("api-key").value = "";
+        $("authorization-link").hidden = true;
+        message("已验证，正在等待 CPA 保存并确认。请勿重复添加或同时修改此认证文件。");
+      } else {
+        terminal = true;
+        $("api-key").value = "";
+        message(info.message || "登录已取消或失效，请重新开始", true);
+      }
+    } catch (error) {
+      if (!terminal) {
+        uncertain = true;
+        message((error.name === "AbortError" ? "请求超时。" : error.message + "。") + "先重新确认状态或查看认证文件，不要重复提交。", true);
+      }
+    } finally {
+      checking = false; controls();
+      if (!terminal && !uncertain) timer = setTimeout(inspect, 2000);
+    }
+  }
+  $("complete-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    if (submitting || uncertain || terminal || phase !== "pending") return;
+    const key = $("api-key").value.trim();
+    if (!key || /\s/.test(key)) { message("请输入不含空白字符的 API key", true); return; }
+    submitting = true; clearTimeout(timer); controls();
+    message("正在联网核验身份与有效订阅…");
+    try {
+      await request(endpoint + "complete", "POST", {state, api_key:key});
+      phase = "ready";
+      message("已验证，等待 CPA 保存；尚不能认定认证文件已保存。");
+    } catch (error) {
+      uncertain = true;
+      submissionUncertain = !error.definitive;
+      message((error.name === "AbortError" ? "请求超时" : error.message) + "。请先重新确认状态，不要重复提交。", true);
+    } finally {
+      $("api-key").value = "";
+      submitting = false; controls();
+      if (!uncertain) inspect();
+    }
+  });
+  $("cancel").addEventListener("click", async () => {
+    if (terminal || submitting || phase === "delivered" || phase === "present") return;
+    submitting = true; clearTimeout(timer); controls();
+    try {
+      await session("cancel"); // Stop delivery BEFORE asking CPA to cancel its session.
+      terminal = true; $("api-key").value = "";
+      message("插件登录已取消，未交付的凭据已清除。");
+      try { await request(management + "/oauth-session?state=" + encodeURIComponent(state), "DELETE"); }
+      catch (_) { message("插件已阻止交付，但未能确认 CPA 会话取消。请关闭本页；不会自动重试。", true); }
+    } catch (error) {
+      uncertain = true;
+      message(error.message + "。不能认定取消成功，请先查看认证文件。", true);
+    } finally { submitting = false; controls(); }
+  });
+  $("check").addEventListener("click", inspect);
+  window.addEventListener("pagehide", () => { clearTimeout(timer); $("api-key").value = ""; });
+  if (!/^[a-f0-9]{64}$/.test(state)) {
+    terminal = true; message("缺少有效登录会话，请从 CPA 的 CommandCode OAuth 登录项重新开始。", true); controls();
+  } else if (!auth()) {
+    terminal = true; message("请先在同一地址的 CPA 管理页面登录并勾选“记住密码”，然后重新打开本页。", true); controls();
+  } else { inspect(); }
+})();
+</script>
+</body>
+</html>

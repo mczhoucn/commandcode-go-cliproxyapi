@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -50,9 +51,12 @@ type Manager struct {
 	// their stop-wait-install steps cannot interleave into orphaned tickers.
 	lifeMu sync.Mutex
 
-	mu  sync.RWMutex
-	cfg config.Config
-	mgr *catalog.Manager
+	// Login sessions and unresolved saves share lifeMu with account admission.
+	logins           map[string]*loginSession
+	credentialClaims map[string]bool
+	mu               sync.RWMutex
+	cfg              config.Config
+	mgr              *catalog.Manager
 	// stop/done manage the one background refresh goroutine; both nil
 	// when no loop is running.
 	stop chan struct{}
@@ -110,15 +114,19 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 		if json.Unmarshal(request, &req) != nil {
 			return ErrEnvelope("invalid_request", "malformed auth login request body"), nil
 		}
-		_, err := (authProvider{}).StartLogin(context.Background(), req.AuthLoginStartRequest)
-		return ErrEnvelope("unsupported", err.Error()), nil
+		resp, err := m.startLogin(req.AuthLoginStartRequest)
+		if err != nil {
+			return ErrEnvelope("auth_failure", err.Error()), nil
+		}
+		return okEnvelope(resp), nil
 	case pluginabi.MethodAuthLoginPoll:
 		var req struct{ pluginapi.AuthLoginPollRequest }
 		if json.Unmarshal(request, &req) != nil {
 			return ErrEnvelope("invalid_request", "malformed auth poll request body"), nil
 		}
-		_, err := (authProvider{}).PollLogin(context.Background(), req.AuthLoginPollRequest)
-		return ErrEnvelope("unsupported", err.Error()), nil
+		ctx, cancel := context.WithTimeout(context.Background(), quotaMaxTimeout)
+		defer cancel()
+		return okEnvelope(m.pollLogin(ctx, req.AuthLoginPollRequest)), nil
 	case pluginabi.MethodAuthRefresh:
 		var req struct{ pluginapi.AuthRefreshRequest }
 		if json.Unmarshal(request, &req) != nil {
@@ -220,12 +228,16 @@ func (m *Manager) registerManagement(request []byte) ([]byte, error) {
 			Method string `json:"method"`
 			Path   string `json:"path"`
 		}{{Method: "POST", Path: "/plugins/" + pluginName + "/quota-usage"},
-			{Method: "POST", Path: "/plugins/" + pluginName + "/accounts"}},
+			{Method: "POST", Path: "/plugins/" + pluginName + "/accounts"},
+			{Method: "POST", Path: "/plugins/" + pluginName + "/oauth/complete"},
+			{Method: "POST", Path: "/plugins/" + pluginName + "/oauth/session"},
+			{Method: "POST", Path: "/plugins/" + pluginName + "/oauth/cancel"}},
 		Resources: []struct {
 			Path        string `json:"path"`
 			Menu        string `json:"menu"`
 			Description string `json:"description"`
-		}{{Path: "/quota", Menu: "CommandCode", Description: "Manage CommandCode accounts and view quota."}},
+		}{{Path: "/quota", Menu: "CommandCode", Description: "Manage CommandCode accounts and view quota."},
+			{Path: "/oauth"}},
 	}), nil
 }
 
@@ -259,6 +271,14 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	}
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
+	m.mu.RLock()
+	configChanged := !reflect.DeepEqual(m.cfg, cfg)
+	m.mu.RUnlock()
+	// Older hosts resend identical plugin config after auth-file mutations.
+	// Only a real config change invalidates credentials not yet delivered.
+	if configChanged {
+		m.clearPendingLoginsLocked()
+	}
 	debugTrace("lifecycle config_loaded prefix_enabled=%t prefix=%s", cfg.ModelPrefix.Enabled, cfg.ModelPrefix.Value)
 	// A nil *HostBridge must not enter the interface as a typed nil, or
 	// catalog's nil-client guard never fires and Refresh panics inside Do.
@@ -376,6 +396,7 @@ var shutdownDrainTimeout = 15 * time.Second
 func (m *Manager) handleShutdown() ([]byte, error) {
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
+	m.clearPendingLoginsLocked()
 	oldDone := m.closeStop()
 	if oldDone != nil {
 		<-oldDone
@@ -408,6 +429,8 @@ func (m *Manager) startRefreshLoop(cfg config.Config, mgr *catalog.Manager, inte
 	}()
 	go func() {
 		ticker := time.NewTicker(interval)
+		cleanupTicker := time.NewTicker(time.Minute)
+		defer cleanupTicker.Stop()
 		defer close(done)
 		defer ticker.Stop()
 		defer cancel()
@@ -415,6 +438,7 @@ func (m *Manager) startRefreshLoop(cfg config.Config, mgr *catalog.Manager, inte
 			select {
 			case <-stop:
 				return
+			case <-cleanupTicker.C:
 			case <-ticker.C:
 				func() {
 					defer func() {
@@ -426,6 +450,12 @@ func (m *Manager) startRefreshLoop(cfg config.Config, mgr *catalog.Manager, inte
 					}()
 					refreshOnce(stopCtx, mgr, m.bridge, cfg.RequestTimeout)
 				}()
+			}
+			// Lifecycle changes hold lifeMu while waiting for this loop to exit.
+			// Never wait for that lock here; a busy lifecycle will clean or retry.
+			if m.lifeMu.TryLock() {
+				m.pruneLoginsLocked()
+				m.lifeMu.Unlock()
 			}
 		}
 	}()

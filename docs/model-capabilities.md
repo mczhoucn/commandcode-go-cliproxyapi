@@ -1,12 +1,65 @@
-# Model capabilities (reasoning effort)
+# Model capabilities (Provider API, endpoints and reasoning effort)
 
-CommandCode **does not expose a capability API**. This file records the only
-authoritative per-model capability data that exists today, what was probed to
-establish that, and how the plugin behaves because of it.
+## Current release scope
 
-## There is no capability endpoint
+The current CPA CommandCode Provider integration supports **GOAT, Pro and Max**
+through the official Provider API. **Go is not supported**: it uses an official
+CLI-specific private interface, not an OpenAI-compatible API, and this plugin
+does not implement that private protocol. Independently, Go has **no Provider
+API access**. Whether an account has an API key is therefore not a support test.
+The name `commandcode-go-cliproxyapi` is inherited from `opencode-go-cliproxyapi`;
+its `go` component does not indicate Go-plan support.
 
-Evidence gathered 2026-09-17 against `api.commandcode.ai`:
+The [official Provider documentation][provider] says every plan except Go has
+API access, explicitly including GOAT, Pro, Max and Team; it documents Go's
+rejection as `403 upgrade_required`. That broader upstream entitlement list is
+not a claim that this release has verified every plan. The Go CLI private
+protocol boundary above comes from the maintainer's release context (2026-10-20),
+not a new wire-level protocol test.
+
+## Current Responses support
+
+When this plugin was created, the upstream did not offer Responses (release
+history supplied by the maintainer). The [current official documentation][provider] now
+lists `POST https://api.commandcode.ai/provider/v1/responses`: OpenAI and open
+models use Chat Completions, and **most**, not all, also support Responses.
+Claude models use `/messages` only. The official recommendation is to check each
+model's `supported_endpoints` in the [public models catalog][models].
+
+The maintainer's compatibility record for this release (2026-10-20) identifies
+these Responses exceptions. An unauthenticated catalog read on **2026-10-20 UTC**
+confirmed that each lists only `/chat/completions`, with no `/responses`:
+
+| Model | Exact upstream id | Catalog `supported_endpoints` |
+|---|---|---|
+| GLM-5.3 Flash | `z-ai/glm-5.3-flash` | `["/chat/completions"]` |
+| Tencent Hy4 Preview | `tencent/hy4-preview` | `["/chat/completions"]` |
+| DeepSeek V4 Flash Fast | `deepseek/deepseek-v4-flash-fast` | `["/chat/completions"]` |
+
+These are release compatibility records corroborated by the [catalog][models],
+not paid inference tests, an exhaustive list of unsupported models, or a promise
+of permanent non-support. Do not confuse Flash with
+`z-ai/glm-5.3-flashx`: the latter lists both `/chat/completions` and `/responses`
+in the same read. Recheck the exact id before changing a route.
+
+The current catalog includes `supported_endpoints` in addition to the six fields
+seen in the historical snapshot below. This field describes **serving endpoints**,
+not `thinking`, supported reasoning efforts, budgets, or whether an effort is
+honoured. No thinking/effort declaration was present in the catalog read for
+this update; endpoint support must not be used to infer one.
+
+Evidence checked on **2026-10-20 UTC**: the official Provider page (direct read
+and Context7), the public catalog (unauthenticated GET), and the local source
+files cited below. No real key, authenticated account request, or inference
+request was used. The 2026-09-17 probes and vendor effort table are retained
+historical records and **were not rerun or re-extracted** for this update.
+
+## Historical capability investigation (2026-09-17)
+
+The following evidence was gathered against `api.commandcode.ai` on
+**2026-09-17**. In particular, the six-field catalog row is a historical
+observation, not the current schema or a permanent claim that no capability
+metadata can exist:
 
 | Probe | Result |
 |---|---|
@@ -15,15 +68,16 @@ Evidence gathered 2026-09-17 against `api.commandcode.ai`:
 | Vendor CLI (`command-code` v1.54.2, `dist/cli.mjs`) | `getSupportedEfforts(model)` reads a static `new Map([...])` of 40 models; a model outside it yields `null` → the CLI reports "Reasoning effort not supported for X" and sends no effort field |
 | Vendor web app (`commandcode.ai`, `assets/constants-*.js`) | ships a static model registry with `reasoning: true` and `reasoningEfforts: [...]` per model — the effort selector in the UI reads that bundled table, not an API |
 
-So the vendor's own clients hardcode this data; nothing in this repository can
-fetch it, and a plugin has to embed it (or forward the client's request
-verbatim) if it wants per-model behaviour.
+At that time, the examined vendor clients bundled their per-model effort data
+rather than fetching thinking declarations from an API. This observation does
+not establish a permanent absence of capability metadata or endpoint support.
 
-## What the upstream actually enforces
+## Historical effort probes (2026-09-17)
 
-Live probes against `/provider/v1/chat/completions` with a real provider key
-(2026-09-17) show the upstream validates only the **union**
-`low | medium | high | xhigh | max` and ignores the per-model table:
+The retained live-probe record for `/provider/v1/chat/completions`, made with a
+real provider key on **2026-09-17**, reported acceptance of the union
+`low | medium | high | xhigh | max` for the sampled efforts below, including
+values outside each model's vendor-declared list:
 
 | Model | Vendor-declared list | Probed efforts | Upstream answer |
 |---|---|---|---|
@@ -31,8 +85,8 @@ Live probes against `/provider/v1/chat/completions` with a real provider key
 | `z-ai/glm-5.3-flash` | low, high, max | low, high, max, **medium** | 200 for all |
 | `Qwen/Qwen3.8-Max` | low, medium, xhigh | high, **max** | 200 for both |
 
-Rejected values are the ones outside the union: `reasoning_effort: "none"`
-(observed in real client traffic) fails with
+In that historical record, `reasoning_effort: "none"` (observed in real client
+traffic) was rejected with
 `Invalid option: expected one of "low"|"medium"|"high"|"xhigh"|"max"`.
 
 **Acceptance is not the same as effect.** Whether the upstream *honours* an
@@ -40,7 +94,7 @@ effort outside a model's declared list, or silently falls back to a default, is
 not verified here; that would need comparing
 `usage.completion_tokens_details.reasoning_tokens` across efforts.
 
-## Vendor-declared table (for reference / possible future embedding)
+## Historical vendor-declared effort table (2026-09-17)
 
 Source: the web app's model registry (63 models, of which those below carry an
 explicit effort list). Extracted 2026-09-17; `command-code` CLI 1.54.2 agrees on
@@ -61,19 +115,47 @@ every model the two share.
 
 ## How the plugin behaves
 
-`internal/thinking/thinking.go` treats a model's catalog `thinking` object
-(`levels`, `min`, `max`, `zero_allowed`, `dynamic_allowed` — decoded by
-`internal/catalog/catalog.go`'s `rawThinking`) as the capability declaration and
-uses it when present. CommandCode's catalog declares nothing, so:
+Source inspection for this update:
+[local catalog implementation](../internal/catalog/catalog.go),
+[configuration](../internal/config/config.go) and
+[executor](../internal/plugin/executor.go).
 
-- the client's `reasoning_effort` is forwarded to the upstream **verbatim**
-  (`auto` and `none` omit the field), with the upstream as the authority;
-- a model whose catalog entry *does* declare levels or bounds opts back into
-  eager validation and budget clamping.
+- `catalog.DefaultRoute` remains **`chat-completions`**. `Manager.resolve`
+  applies a per-model `route-overrides` entry first; otherwise it uses that
+  default, even when the upstream now supports Responses.
+- `rawModel` does **not** decode `supported_endpoints`. The plugin does not
+  automatically select an endpoint from that field, switch by model family, or
+  retry another endpoint after a protocol failure. The executor returns upstream
+  errors; any host-level account/provider retry is a separate concern.
+- Enabling `protocols.responses` permits a Responses route; it does not select
+  it. A caller's Responses request can still be translated to Chat Completions.
+  An explicit `route-overrides` entry, keyed by the exact upstream model id, is
+  what changes the default route. Check the catalog before choosing
+  `responses` with `/v1/responses`, or `messages` with `/v1/messages` for
+  Claude. An override cannot grant Go API access or add upstream model support.
 
-Embedding the vendor table above as per-model declarations is possible (it would
-restore local validation and let a numeric-budget client — the Anthropic
-Messages target — map effort to a budget) but is deliberately not done: the
-upstream accepts the whole union, so local validation would only create false
-rejections, and the table is undocumented vendor client data that can change
-without notice.
+For reasoning, [`internal/thinking/thinking.go`](../internal/thinking/thinking.go)
+treats a model's catalog `thinking` object (`levels`, `min`, `max`,
+`zero_allowed`, `dynamic_allowed` — decoded by `rawThinking` in the catalog
+implementation) as the capability declaration and uses it when present.
+The current catalog read has no such declaration; `supported_endpoints` is
+not a replacement for it. With undeclared thinking capabilities:
+
+- on the default Chat Completions route, supplied effort choices are forwarded
+  subject to the conversion branch. Native Chat Completions input and
+  Responses-to-Chat conversion retain supplied `auto` and `none`; those values
+  do not guarantee field omission. Omit the input effort setting when no effort
+  field should be sent. Upstream acceptance and effect remain authoritative;
+- a model whose catalog entry *does* declare valid levels or bounds provides
+  capability checks and budget bounds to the relevant conversion paths. A
+  `route-overrides` entry alone does not declare these capabilities.
+
+Embedding the historical vendor table as per-model declarations would restore
+local validation and let a numeric-budget target (Anthropic Messages) map effort
+to a budget, but it is deliberately not done. The historical samples accepted
+efforts beyond the vendor lists, so embedding those lists could cause false
+rejections. They are undocumented vendor-client snapshots that may change;
+neither that table nor HTTP 200 proves the present per-model effect of an effort.
+
+[provider]: https://commandcode.ai/docs/provider
+[models]: https://api.commandcode.ai/provider/v1/models

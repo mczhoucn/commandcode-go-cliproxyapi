@@ -57,14 +57,15 @@ type quotaUsage struct {
 }
 
 type quotaCard struct {
-	KeyID    string      `json:"key_id"`
-	Label    string      `json:"label"`
-	Email    string      `json:"email,omitempty"`
-	FileName string      `json:"file_name"`
-	Disabled bool        `json:"disabled"`
-	Status   string      `json:"status"`
-	Usage    *quotaUsage `json:"usage,omitempty"`
-	Error    string      `json:"error,omitempty"`
+	KeyID            string      `json:"key_id"`
+	Label            string      `json:"label"`
+	Email            string      `json:"email,omitempty"`
+	FileName         string      `json:"file_name"`
+	CredentialSource string      `json:"credential_source,omitempty"`
+	Disabled         bool        `json:"disabled"`
+	Status           string      `json:"status"`
+	Usage            *quotaUsage `json:"usage,omitempty"`
+	Error            string      `json:"error,omitempty"`
 }
 
 type quotaRequest struct {
@@ -130,7 +131,6 @@ type accountWhoami struct {
 // monthly credit allowance). It is display metadata only: an unknown plan
 // simply shows the remaining credits without a denominator.
 var planAllowances = map[string]float64{
-	"individual-go":       10,
 	"individual-goat":     70,
 	"individual-pro":      30,
 	"individual-pro-v1":   80,
@@ -141,7 +141,6 @@ var planAllowances = map[string]float64{
 }
 
 var planNames = map[string]string{
-	"individual-go":       "Go",
 	"individual-goat":     "GOAT",
 	"individual-pro":      "Pro",
 	"individual-pro-v1":   "Pro",
@@ -189,11 +188,19 @@ func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.Management
 	if req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginName+"/quota" {
 		return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}}, Body: []byte(resources.QuotaPage)}, nil
 	}
+	if req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginName+"/oauth" {
+		return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}, "Referrer-Policy": {"no-referrer"}}, Body: []byte(resources.OAuthPage)}, nil
+	}
 	if req.Method != http.MethodPost {
 		return managementError(http.StatusNotFound, "not found")
 	}
 	ctx, cancel := context.WithTimeout(ctx, quotaMaxTimeout)
 	defer cancel()
+	for _, action := range []string{"complete", "session", "cancel"} {
+		if req.Path == "/v0/management/plugins/"+pluginName+"/oauth/"+action {
+			return m.handleLoginManagement(ctx, action, req.Body)
+		}
+	}
 	if req.Path == "/v0/management/plugins/"+pluginName+"/accounts" {
 		return m.addAccount(ctx, req.Body)
 	}
@@ -214,7 +221,16 @@ func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.Management
 	if body.KeyID == "" {
 		cards := make([]quotaCard, 0, len(files))
 		for _, entry := range files {
-			cards = append(cards, accountCard(entry))
+			card := accountCard(entry)
+			if record, err := m.bridge.AuthGet(ctx, entry.AuthIndex); err == nil {
+				var stored struct {
+					Source string `json:"credential_source"`
+				}
+				if json.Unmarshal(record.JSON, &stored) == nil && (stored.Source == "api_key" || stored.Source == "browser_authorization") {
+					card.CredentialSource = stored.Source
+				}
+			}
+			cards = append(cards, card)
 		}
 		return quotaJSON(quotaList{Cards: cards, LegacyAPIKeysIgnored: legacy})
 	}

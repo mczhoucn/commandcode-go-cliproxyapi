@@ -86,7 +86,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 </head>
 <body>
 <div class="quota-page">
-  <header class="quota-header"><h1 class="quota-title">CommandCode 账户与额度</h1><p class="quota-description">粘贴 API key 保存为认证文件，并查看各账户额度。仅没有邮箱的账户会自动查询一次。禁用账户仍可手动刷新。启用、禁用和删除请到认证文件页操作。</p></header>
+  <header class="quota-header"><h1 class="quota-title">CommandCode 账户与额度</h1><p class="quota-description">支持 GOAT / Pro / Max，不支持 Go。新 key 联网核验身份和有效订阅后才保存。也可从 CPA 的 OAuth 登录项进行浏览器授权。仅没有邮箱的账户会自动查询一次额度。启用、禁用和删除请到认证文件页操作。</p></header>
   <form id="save-form" class="quota-form" autocomplete="off">
     <label class="quota-field-label" for="api-key">API key</label>
     <input id="api-key" class="quota-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="off">
@@ -131,8 +131,10 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
   const reloadButton = document.getElementById("reload-accounts");
   const listStatus = document.getElementById("list-status");
   const legacyStatus = document.getElementById("legacy-status");
-  const quotaEndpoint = "/v0/management/plugins/commandcode-go-cliproxyapi/quota-usage";
-  const accountsEndpoint = "/v0/management/plugins/commandcode-go-cliproxyapi/accounts";
+  const marker = "/v0/resource/plugins/commandcode-go-cliproxyapi/quota";
+  const prefix = location.pathname.endsWith(marker) ? location.pathname.slice(0, -marker.length) : "";
+  const quotaEndpoint = prefix + "/v0/management/plugins/commandcode-go-cliproxyapi/quota-usage";
+  const accountsEndpoint = prefix + "/v0/management/plugins/commandcode-go-cliproxyapi/accounts";
   const storageKey = "commandcode-go-cliproxyapi:quota";
   const values = new Map();
   const labels = new Map();
@@ -285,7 +287,9 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       const account = document.createElement("div"); account.className = "quota-account";
       const fileName = document.createElement("span"); fileName.className = "quota-meta"; fileName.textContent = "文件名 " + (card.file_name || "-");
       const accountState = document.createElement("span"); accountState.className = card.disabled ? "quota-warning" : "quota-meta"; accountState.textContent = card.disabled ? "已禁用" : "已启用";
-      account.append(fileName, accountState); section.appendChild(account);
+      const source = document.createElement("span"); source.className = "quota-meta";
+      source.textContent = card.credential_source === "browser_authorization" ? "来源：浏览器授权入口" : card.credential_source === "api_key" ? "来源：手动 API key" : "来源：已有认证";
+      account.append(fileName, accountState, source); section.appendChild(account);
       [["five_hour", "5-hour window"], ["weekly", "Weekly window"]].forEach(entry => {
         const name = entry[0];
         const row = document.createElement("div"); row.className = "quota-row";
@@ -361,7 +365,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     saving = true;
     apiKeyInput.disabled = true;
     saveButton.disabled = true;
-    setSaveStatus("正在保存…", false);
+    setSaveStatus("正在核验身份、订阅并保存…", false);
     request(accountsEndpoint, {api_key: trimmedKey}).then(result => {
       apiKeyInput.value = "";
       const fileName = result && typeof result.file_name === "string" ? result.file_name : "";
