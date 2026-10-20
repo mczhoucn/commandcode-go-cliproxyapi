@@ -2,6 +2,18 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
+## v0.1.3 — 2026-10-20
+
+- 修复通过 Responses 接口接收流式工具调用时，回复已经结束、客户端却仍将工具视为未完成而不执行的问题；覆盖上游 Chat Completions 和 Messages 两条转换路径。
+- 在 `response.completed` 前，按原输出序号发送 `response.function_call_arguments.done` 和 `response.output_item.done`；开始、参数增量、结束事件与最终输出复用同一个 `fc_` 工具项编号，并保留原始 `call_id`。
+- 不改变套餐支持范围、认证文件或配置：仍支持 **CommandCode GOAT / Pro / Max，不支持 Go**。已有安装需更新插件并重启 CPA，发布新版本不会自动替换运行中的插件。
+
+### v0.1.3 English highlights — 2026-10-20
+
+- Fix streamed Responses tool calls remaining unfinished in clients after the response ends, for both Chat Completions and Messages upstream conversion paths.
+- Emit `response.function_call_arguments.done` and `response.output_item.done` before `response.completed`, preserving the announced output index and reusing the same `fc_` item ID across events and final output while retaining the original `call_id`.
+- No plan-support, auth-file or configuration changes: **CommandCode GOAT / Pro / Max only; Go is not supported**. Update the plugin and restart CPA; publishing does not automatically replace an installed plugin.
+
 ## v0.1.2 — 2026-10-20
 
 ### 支持范围与名称

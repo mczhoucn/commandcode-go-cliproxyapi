@@ -25,7 +25,7 @@ const ProviderID = "commandcode"
 // pluginName / pluginVersion are reported in registration metadata.
 const (
 	pluginName    = "commandcode-go-cliproxyapi"
-	pluginVersion = "0.1.2"
+	pluginVersion = "0.1.3"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go

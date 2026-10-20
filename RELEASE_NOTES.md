@@ -2,6 +2,20 @@
 
 User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **CommandCode GOAT / Pro / Max**, not CommandCode Go.
 
+## v0.1.3 — Complete streamed Responses tool calls (2026-10-20)
+
+- Fix tools remaining unfinished in Responses clients after the stream ends when converting Chat Completions or Messages upstream responses.
+- Emit `response.function_call_arguments.done`, then `response.output_item.done`, before `response.completed`. Keep each tool's announced output index, stable `fc_` item ID and original `call_id` throughout the stream and final output.
+- Supported plans remain **CommandCode GOAT / Pro / Max; CommandCode Go is not supported**. Existing auth files and configuration remain unchanged.
+- Upgrade: replace the platform-specific plugin library, restart CPA and refresh Management Center. Publishing a release does not update an already running plugin.
+
+**中文**
+
+- 修复将 Chat Completions 或 Messages 上游转换为 Responses 流时，回复已结束但客户端仍认为工具未完成、不执行工具的问题。
+- 在 `response.completed` 前依次发送参数结束和工具项结束事件，保持原来的输出序号，在整个流与最终输出中复用稳定的 `fc_` 工具项编号，并保留原始 `call_id`。
+- 仍然只支持 **CommandCode GOAT / Pro / Max，不支持 Go 套餐**；不改变已有认证文件和配置。
+- 升级时替换对应平台的插件库、重启 CPA 并刷新管理后台；发布不会自动更新正在运行的插件。
+
 ## v0.1.2 — Easier account setup and browser authorization (2026-10-20)
 
 - **Supported plans and naming**: support CommandCode GOAT / Pro / Max, not Go. Go uses the official CLI's private, non-OpenAI-compatible interface/protocol and has no Provider API access; CPA's current CommandCode integration does not implement it. The `go` in `commandcode-go-cliproxyapi` is inherited from `opencode-go-cliproxyapi`, not a plan-support claim.
