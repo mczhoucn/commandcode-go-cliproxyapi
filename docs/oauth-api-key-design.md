@@ -1,6 +1,6 @@
 # CommandCode 双入口认证设计
 
-> 状态：已完成实现、隔离验收与审查，并于 2026-10-19 经另行授权更新到 Kubernetes 中的 CPA；尚未发布 GitHub Release。线上引导页与授权链接已检查，真实账号经新插件核验及保存仍待本人验证。
+> 状态：已完成实现、隔离验收与审查，并于 2026-10-19 经另行授权更新到 Kubernetes 中的 CPA；目标公共版本为 [v0.1.2](https://github.com/mczhoucn/commandcode-go-cliproxyapi/releases/tag/v0.1.2)，安装包以该版本发布成功后的附件为准。线上引导页与授权链接已检查，真实账号经新插件核验及保存仍待本人验证。
 > 用户已按 Chrome 指引真实确认 localhost:6000 可进入官方备用页；127.0.0.1:1 和 localhost:1 被拒绝。模拟验证及线上页面检查不替代真实订阅返回值确认。
 
 ## 1. 目标与范围

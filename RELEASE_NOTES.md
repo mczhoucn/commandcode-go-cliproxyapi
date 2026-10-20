@@ -2,7 +2,7 @@
 
 User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **CommandCode GOAT / Pro / Max**, not CommandCode Go.
 
-## Unreleased — Easier account setup and browser authorization
+## v0.1.2 — Easier account setup and browser authorization (2026-10-20)
 
 - **Supported plans and naming**: support CommandCode GOAT / Pro / Max, not Go. Go uses the official CLI's private, non-OpenAI-compatible interface/protocol and has no Provider API access; CPA's current CommandCode integration does not implement it. The `go` in `commandcode-go-cliproxyapi` is inherited from `opencode-go-cliproxyapi`, not a plan-support claim.
 - **Easier manual setup**: enter an existing API key on the independent **CommandCode accounts and quota** page; the plugin validates it and saves an auth file. No hand-written auth JSON or manual key entry in plugin configuration is needed. Old `api-keys` configuration remains retired and is not imported.
@@ -13,7 +13,7 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 - **Login compatibility**: preserve sessions when older CPA versions resend identical configuration; decode HTML-escaped official URLs before validating their parameters. Browser regressions verify the final visible link, including state and fallback callback.
 - **Save and security boundaries**: OAuth completion only stages credentials; CPA polling saves. Cross-entry digest claims avoid duplicate delivery and retain uncertain saves without automatic rewriting. The guide requires a remembered same-origin management login. Only the Chrome fallback has been verified. Post-delivery cancellation, concurrent host file edits, CPA redirects and the earlier email-sync race retain their documented limitations.
 - **Quota location**: quota remains on the plugin page; the standard `QuotaProvider` for CPA auth-file cards is not implemented.
-- These entries describe unpublished source changes, not a new GitHub Release or version bump. See [ChangeLog](CHANGELOG.md) and the README for user steps and compatibility evidence.
+- Target release tag: `v0.1.2`; platform assets are available only after a successful GitHub Release. See [ChangeLog](CHANGELOG.md) and the README for user steps, compatibility evidence and upgrade instructions.
 
 **中文**
 
@@ -26,9 +26,9 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 - **修复登录兼容性**：旧版 CPA 重发相同配置不再清除会话；引导页先还原官方链接的 HTML 转义，再校验参数。浏览器回归检查最终显示链接的 state 和备用回调地址。
 - **保存与安全边界**：OAuth 完成接口只暂存，由 CPA 轮询负责保存；两个入口共用 key 摘要占用，结果不明不自动重写。引导页要求同源管理登录并记住密码，仅验证过 Chrome 备用流程。交付后取消、宿主并发文件操作、HTTP 跳转和既有邮箱回写的限制仍未消除。
 - **额度位置**：额度仍在插件页查看，未接入 CPA 认证文件卡片的标准 `QuotaProvider`。
-- 以上为未发布源码的更新记录，不代表已创建新的 GitHub Release 或升版本。操作说明和兼容证据见 [ChangeLog](CHANGELOG.md) 与 README。
+- 目标发布标签为 `v0.1.2`；平台安装包以 GitHub Release 发布成功后的附件为准。操作步骤、兼容证据和升级方法见 [ChangeLog](CHANGELOG.md) 与 README。
 
-## v0.1.2 — Auth-file account management
+### Account management and upgrade notes
 
 Upgrade notice: auth files are now the only API key source. The retired plugin `api-keys` block is not imported; preserve the auth files you want to keep.
 

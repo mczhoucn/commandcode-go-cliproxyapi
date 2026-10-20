@@ -2,7 +2,7 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
-## 未发布 / Unreleased
+## v0.1.2 — 2026-10-20
 
 ### 支持范围与名称
 
@@ -48,7 +48,7 @@
 
 ## English summary
 
-### Unreleased
+### v0.1.2 English highlights — 2026-10-20
 
 - Support **CommandCode GOAT / Pro / Max**, not **Go**. Go uses the official CLI's private protocol and has no Provider API access; CPA's current CommandCode integration does not implement it. The plugin name `commandcode-go-cliproxyapi` is inherited from `opencode-go-cliproxyapi`, not a Go-plan support claim.
 - Improve usability: paste an existing API key on the independent **CommandCode accounts and quota** page; verification and auth-file creation replace manual key configuration and hand-written JSON. Old `api-keys` config is not imported.
@@ -58,4 +58,4 @@
 - Retain default **OpenAI Chat Completions translation**: Responses was unavailable at creation and now supports most OpenAI/open models, but GLM-5.3 Flash, Tencent Hy4 Preview and DeepSeek V4 Flash Fast still declare only Chat Completions in the 2026-10-20 catalog snapshot. Routes do not switch automatically.
 - Fix same-configuration reloads interrupting login and HTML-escaped official URLs losing state. Browser regression checks the final visible authorization link. Existing save/cancel, host-file, email-sync and redirect limitations remain documented in the README.
 
-“未发布 / Unreleased”表示尚未创建对应公共 GitHub Release，不代表运行环境从未更新。本次文档更新不创建版本、标签或发布。
+本版本的目标发布页为 [GitHub Release v0.1.2](https://github.com/mczhoucn/commandcode-go-cliproxyapi/releases/tag/v0.1.2)；安装包和校验文件仅以发布成功后的实际附件为准。发布不会自动更新已有 CPA 安装；请按 README 更新插件并重启 CPA。
