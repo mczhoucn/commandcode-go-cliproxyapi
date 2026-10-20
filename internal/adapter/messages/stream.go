@@ -41,6 +41,7 @@ type StreamConverter struct {
 type blockState struct {
 	kind    string
 	id      string
+	itemID  string // fc_-prefixed Responses item id shared by deltas and done events
 	name    string
 	ordinal int             // compact tool_calls index for openai chunks
 	outIdx  int             // responses: compacted output_index assigned at block start
@@ -277,8 +278,9 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 			sc.toolsSeen = true
 			bs.outIdx = sc.outCount
 			sc.outCount++
+			bs.itemID = shared.FunctionCallItemID(bs.id)
 			*events = append(*events, sc.responsesEm().ItemAdded(bs.outIdx, map[string]any{
-				"type": "function_call", "call_id": bs.id, "name": bs.name, "arguments": "",
+				"type": "function_call", "id": bs.itemID, "call_id": bs.id, "name": bs.name, "arguments": "",
 			}))
 		}
 	case "content_block_delta":
@@ -301,7 +303,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 				return false, errclass.Translation("tool arguments fragment without a tool_use block start")
 			}
 			bs.args.WriteString(ev.Delta.PartialJSON)
-			*events = append(*events, sc.responsesEm().ArgsDelta(bs.id, bs.outIdx, ev.Delta.PartialJSON))
+			*events = append(*events, sc.responsesEm().ArgsDelta(bs.itemID, bs.outIdx, ev.Delta.PartialJSON))
 		case "thinking_delta":
 			// FR-005 explicit omission policy: no standard Responses
 			// reasoning-delta event; dropped.
@@ -314,7 +316,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 		sc.captureCache(ev.Usage)
 		sc.stopReason = ev.Delta.StopReason
 	case "message_stop":
-		*events = append(*events, sc.responsesCompleted())
+		*events = append(*events, sc.responsesCompleted()...)
 		return true, nil
 	case "error":
 		return false, sseError(ev.Error)
@@ -328,13 +330,32 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 // from the Responses vocabulary {completed, incomplete} via the observed
 // stop_reason (max_tokens truncation → incomplete); tool calls are
 // represented by their function_call output items and never override the
-// status (FR-006). Shared by message_stop and Flush so an early upstream
-// close cannot diverge from the normal-path shape.
-func (sc *StreamConverter) responsesCompleted() []byte {
+// status (FR-006). Each function_call is closed at its announced
+// output_index before completed, because clients finish a call only after
+// the matching done event. Shared by message_stop and Flush so an early
+// upstream close cannot diverge from the normal-path shape.
+func (sc *StreamConverter) responsesCompleted() [][]byte {
 	status := shared.ResponseStatusFromClaudeStop(sc.stopReason)
 	usage := shared.NewResponsesUsageFrom(sc.promptTokens+valueOrZero(sc.cacheRead)+valueOrZero(sc.cacheCreation), sc.completionTokens,
 		shared.UsageDetails{CachedTokens: sc.cacheRead, CacheWriteTokens: sc.cacheCreation})
-	return sc.responsesEm().Completed(status, usage, sc.outputItems())
+	em := sc.responsesEm()
+	indexes := make([]int, 0, len(sc.blocks))
+	for i := range sc.blocks {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+	events := make([][]byte, 0, len(indexes)*2+1)
+	for _, i := range indexes {
+		bs := sc.blocks[i]
+		if bs == nil || bs.kind != "tool_use" {
+			continue
+		}
+		args := shared.DefaultArgs(bs.args.String())
+		events = append(events, em.CloseFunctionCall(bs.outIdx, shared.RespItem{
+			Type: "function_call", ID: bs.itemID, CallID: bs.id, Name: bs.name, Arguments: args,
+		})...)
+	}
+	return append(events, em.Completed(status, usage, sc.outputItems()))
 }
 
 // responsesEm binds the shared Responses emitter kernel to the captured
@@ -360,7 +381,7 @@ func (sc *StreamConverter) Flush() [][]byte {
 	}
 	switch sc.sourceFormat {
 	case "openai-response":
-		return [][]byte{sc.responsesCompleted()}
+		return sc.responsesCompleted()
 	case "openai":
 		return nil
 	default: // claude passthrough forwards verbatim; nothing deferred

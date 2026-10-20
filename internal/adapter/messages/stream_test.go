@@ -391,10 +391,8 @@ func TestStreamResponsesFlow(t *testing.T) {
 			second["type"] != "function_call" || second["call_id"] != "call_1" {
 			t.Errorf("added items wrong: %v %v", first, second)
 		}
-		// function_call announcements stay call_id-only per the canonical
-		// shape (deltas resolve item_id via call_id).
-		if _, has := second["id"]; has {
-			t.Errorf("function_call announcement must not carry an id key: %v", second)
+		if second["id"] != "fc_call_1" {
+			t.Errorf("function_call announcement must carry the fc_ item id: %v", second)
 		}
 		if added[0]["output_index"] != float64(0) || added[1]["output_index"] != float64(1) {
 			t.Errorf("added output_index wrong: %v %v", added[0], added[1])
@@ -406,7 +404,7 @@ func TestStreamResponsesFlow(t *testing.T) {
 		t.Errorf("text deltas = %v", textDeltas)
 	}
 	args := byName["response.function_call_arguments.delta"]
-	if len(args) != 1 || args[0]["item_id"] != "call_1" || args[0]["output_index"] != float64(1) || args[0]["delta"] != "{}" {
+	if len(args) != 1 || args[0]["item_id"] != "fc_call_1" || args[0]["output_index"] != float64(1) || args[0]["delta"] != "{}" {
 		t.Errorf("args deltas = %v", args)
 	}
 	completed := byName["response.completed"][0]["response"].(map[string]any)
@@ -434,8 +432,18 @@ func TestStreamResponsesFlow(t *testing.T) {
 		callItem["name"] != "f" || callItem["arguments"] != "{}" {
 		t.Errorf("function_call item wrong: %v", callItem)
 	}
-	if _, has := callItem["id"]; has {
-		t.Errorf("function_call items stay call_id-only: %v", callItem)
+	if callItem["id"] != "fc_call_1" {
+		t.Errorf("function_call item must carry the fc_ item id: %v", callItem)
+	}
+	argsDone := byName["response.function_call_arguments.done"]
+	itemDone := byName["response.output_item.done"]
+	if len(argsDone) != 1 || argsDone[0]["item_id"] != "fc_call_1" || argsDone[0]["output_index"] != float64(1) || argsDone[0]["arguments"] != "{}" {
+		t.Errorf("arguments done = %v", argsDone)
+	}
+	if len(itemDone) != 1 || itemDone[0]["output_index"] != float64(1) {
+		t.Errorf("function_call item done = %v", itemDone)
+	} else if doneItem, _ := itemDone[0]["item"].(map[string]any); doneItem["type"] != "function_call" || doneItem["id"] != "fc_call_1" || doneItem["call_id"] != "call_1" || doneItem["arguments"] != "{}" {
+		t.Errorf("function_call item done = %v", itemDone[0])
 	}
 }
 

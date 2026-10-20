@@ -857,7 +857,7 @@ func (e ResponsesEventEmitter) Created() []byte {
 
 // ItemAdded announces one output item before its first delta; item carries
 // the block-type-specific fields (message id/role/content, or function_call
-// call_id/name/arguments per the canonical call_id-only shape).
+// id/call_id/name/arguments).
 func (e ResponsesEventEmitter) ItemAdded(outputIndex int, item map[string]any) []byte {
 	return SSEEvent("response.output_item.added", map[string]any{
 		"type": "response.output_item.added", "output_index": outputIndex, "item": item,
@@ -878,6 +878,33 @@ func (e ResponsesEventEmitter) ArgsDelta(itemID string, outputIndex int, delta s
 	return SSEEvent("response.function_call_arguments.delta", map[string]any{
 		"type": "response.function_call_arguments.delta", "item_id": itemID, "output_index": outputIndex, "delta": delta,
 	})
+}
+
+// ArgsDone closes one function_call argument stream with the complete
+// arguments. Clients that finish a call only after this event otherwise keep
+// the streamed fragments open.
+func (e ResponsesEventEmitter) ArgsDone(itemID string, outputIndex int, arguments string) []byte {
+	return SSEEvent("response.function_call_arguments.done", map[string]any{
+		"type": "response.function_call_arguments.done", "item_id": itemID, "output_index": outputIndex, "arguments": arguments,
+	})
+}
+
+// FunctionCallItemDone closes the announced function_call at the same
+// output_index. The item id must use an fc_ prefix: clients that drop any
+// other id otherwise leave the call unfinished or unbound.
+func (e ResponsesEventEmitter) FunctionCallItemDone(outputIndex int, item RespItem) []byte {
+	return SSEEvent("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": outputIndex, "item": item,
+	})
+}
+
+// CloseFunctionCall emits the argument-done and item-done pair that finishes
+// one function_call before response.completed.
+func (e ResponsesEventEmitter) CloseFunctionCall(outputIndex int, item RespItem) [][]byte {
+	return [][]byte{
+		e.ArgsDone(item.ID, outputIndex, item.Arguments),
+		e.FunctionCallItemDone(outputIndex, item),
+	}
 }
 
 // ReasoningItemAdded announces the reasoning item before any of its summary
@@ -1205,8 +1232,9 @@ func (r *ResponsesRequest) DecodeInputItems() ([]RespItem, *errclass.Error) {
 // or function_call_output). ID carries the item identity of synthesized
 // terminal message items (FR-006 sibling parity: the Chat Completions
 // and Messages routes emit the same "id" the streaming
-// response.output_item.added announcement used); function_call items stay
-// call_id-only per the documented canonical shape.
+// response.output_item.added announcement used). Function-call items also
+// carry an fc_-prefixed id so clients that drop any other id can still bind
+// the call.
 type RespItem struct {
 	Type      string          `json:"type"`
 	ID        string          `json:"id,omitempty"`
@@ -1719,12 +1747,27 @@ func (a *OutputAssembler) AddText(fragment string) {
 	a.text.WriteString(fragment)
 }
 
+// FunctionCallItemID returns the Responses item id for a synthesized
+// function_call. Clients such as Pi keep only ids with an fc_ prefix and
+// otherwise record the item id as missing, so every synthesized call gets
+// that prefix. The result depends only on callID so stream announcements,
+// terminal output, and the non-stream converter stay identical.
+func FunctionCallItemID(callID string) string {
+	if strings.HasPrefix(callID, "fc_") {
+		return callID
+	}
+	if callID == "" {
+		return "fc_0"
+	}
+	return "fc_" + callID
+}
+
 // AppendFunctionCall adds one function_call item in arrival order;
 // arguments pass through verbatim — callers apply the absent-arguments
 // policy themselves.
 func (a *OutputAssembler) AppendFunctionCall(callID, name, args string) {
 	a.items = append(a.items, RespItem{
-		Type: "function_call", CallID: callID, Name: name, Arguments: args,
+		Type: "function_call", ID: FunctionCallItemID(callID), CallID: callID, Name: name, Arguments: args,
 	})
 }
 

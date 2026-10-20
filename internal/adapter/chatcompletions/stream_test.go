@@ -522,7 +522,7 @@ func TestStreamConverterResponses(t *testing.T) {
 	for i, want := range []string{`{"j":`, `2}`} {
 		e := evs[i]
 		if e.Name != "response.function_call_arguments.delta" ||
-			e.Data["item_id"] != "c1" || e.Data["output_index"] != float64(1) || e.Data["delta"] != want {
+			e.Data["item_id"] != "fc_c1" || e.Data["output_index"] != float64(1) || e.Data["delta"] != want {
 			t.Fatalf("argument delta %d wrong: %v", i, e)
 		}
 	}
@@ -537,10 +537,23 @@ func TestStreamConverterResponses(t *testing.T) {
 		t.Fatalf("response.completed must be deferred past finish_reason: %v", evs)
 	}
 	evs = feedAll(t, sc, `data: {"choices":[{"delta":{},"finish_reason":"length"}]}`)
-	if len(evs) != 1 || evs[0].Name != "response.completed" {
-		t.Fatalf("completed event wrong: %v", evs)
+	var completed sseEvt
+	var argsDone, itemDone bool
+	for _, e := range evs {
+		switch e.Name {
+		case "response.function_call_arguments.done":
+			argsDone = e.Data["item_id"] == "fc_c1" && e.Data["output_index"] == float64(1) && e.Data["arguments"] == `{"j":2}`
+		case "response.output_item.done":
+			item, _ := e.Data["item"].(map[string]any)
+			itemDone = e.Data["output_index"] == float64(1) && item["type"] == "function_call" && item["id"] == "fc_c1" && item["call_id"] == "c1"
+		case "response.completed":
+			completed = e
+		}
 	}
-	resp := evs[0].Data["response"].(map[string]any)
+	if !argsDone || !itemDone || completed.Name != "response.completed" {
+		t.Fatalf("function_call must close at output_index 1 before completed: %v", evs)
+	}
+	resp := completed.Data["response"].(map[string]any)
 	if resp["id"] != "r1" || resp["object"] != "response" || resp["status"] != "completed" {
 		t.Fatalf("completed response wrong: %v", resp)
 	}
@@ -823,12 +836,9 @@ func TestStreamResponsesCompletedOutputFunctionCall(t *testing.T) {
 		t.Fatalf("output = %v", completed["output"])
 	}
 	item := output[0].(map[string]any)
-	// F-R5 pin: function_call items carry call_id only — no "id" key.
-	if item["type"] != "function_call" || item["call_id"] != "cc" || item["name"] != "f" {
+	// Function-call items carry an fc_ item id so clients can bind the done event.
+	if item["type"] != "function_call" || item["id"] != "fc_cc" || item["call_id"] != "cc" || item["name"] != "f" {
 		t.Fatalf("function_call item wrong: %v", item)
-	}
-	if _, has := item["id"]; has {
-		t.Fatalf("function_call must not carry an id key: %v", item)
 	}
 	if item["arguments"] != `{"j":1,"k":2}` {
 		t.Fatalf("accumulated arguments wrong: %v", item["arguments"])
@@ -1004,4 +1014,102 @@ func TestStreamConverterFlushAfterFinishWithoutDONE(t *testing.T) {
 			t.Fatalf("second flush must return nothing: %v", again)
 		}
 	})
+}
+
+func TestStreamResponsesFunctionCallDoneBeforeCompleted(t *testing.T) {
+	t.Run("tool only", func(t *testing.T) {
+		sc := NewStreamConverter("openai-response")
+		evs := feedAll(t, sc,
+			`data: {"id":"r","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","function":{"name":"codemode","arguments":""}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"k\":"}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+			`data: [DONE]`)
+		assertFunctionCallClosed(t, evs, 0, "fc_call_1", "call_1", "codemode", `{"k":1}`)
+	})
+	t.Run("text then tool keeps the tool index", func(t *testing.T) {
+		sc := NewStreamConverter("openai-response")
+		evs := feedAll(t, sc,
+			`data: {"id":"r","choices":[{"delta":{"content":"Hi"}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"f","arguments":"{}"}}]}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`data: [DONE]`)
+		assertFunctionCallClosed(t, evs, 1, "fc_c9", "c9", "f", "{}")
+	})
+	t.Run("two tools close independently", func(t *testing.T) {
+		sc := NewStreamConverter("openai-response")
+		evs := feedAll(t, sc,
+			`data: {"id":"r","choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"fa","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"fb","arguments":"{}"}}]}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`data: [DONE]`)
+		assertFunctionCallClosed(t, evs, 0, "fc_a", "a", "fa", "{}")
+		assertFunctionCallClosed(t, evs, 1, "fc_b", "b", "fb", "{}")
+	})
+	t.Run("text only emits no function-call close", func(t *testing.T) {
+		sc := NewStreamConverter("openai-response")
+		evs := feedAll(t, sc,
+			`data: {"id":"r","choices":[{"delta":{"content":"Hi"}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`)
+		for _, e := range evs {
+			if e.Name == "response.function_call_arguments.done" || (e.Name == "response.output_item.done" && e.Data["item"].(map[string]any)["type"] == "function_call") {
+				t.Fatalf("text-only stream closed a function call: %v", e)
+			}
+		}
+	})
+	t.Run("existing fc_ call id is kept", func(t *testing.T) {
+		sc := NewStreamConverter("openai-response")
+		evs := feedAll(t, sc,
+			`data: {"id":"r","choices":[{"delta":{"tool_calls":[{"index":0,"id":"fc_9","function":{"name":"f","arguments":"{}"}}]}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`data: [DONE]`)
+		assertFunctionCallClosed(t, evs, 0, "fc_9", "fc_9", "f", "{}")
+	})
+}
+
+func assertFunctionCallClosed(t *testing.T, evs []sseEvt, outputIndex float64, itemID, callID, name, arguments string) {
+	t.Helper()
+	var argsDone, itemDone, completed bool
+	completedAt := -1
+	for i, e := range evs {
+		switch e.Name {
+		case "response.function_call_arguments.done":
+			if e.Data["output_index"] != outputIndex {
+				continue
+			}
+			if e.Data["item_id"] != itemID || e.Data["arguments"] != arguments {
+				t.Fatalf("arguments done = %v", e.Data)
+			}
+			argsDone = true
+			if completedAt >= 0 && i > completedAt {
+				t.Fatalf("arguments done followed completed")
+			}
+		case "response.output_item.done":
+			if e.Data["output_index"] != outputIndex {
+				continue
+			}
+			item, _ := e.Data["item"].(map[string]any)
+			if item["type"] != "function_call" || item["id"] != itemID || item["call_id"] != callID || item["name"] != name || item["arguments"] != arguments {
+				t.Fatalf("item done = %v", e.Data)
+			}
+			itemDone = true
+			if completedAt >= 0 && i > completedAt {
+				t.Fatalf("item done followed completed")
+			}
+		case "response.completed":
+			completed = true
+			completedAt = i
+			output, _ := e.Data["response"].(map[string]any)["output"].([]any)
+			if int(outputIndex) >= len(output) {
+				t.Fatalf("completed output missing index %v: %v", outputIndex, output)
+			}
+			term, _ := output[int(outputIndex)].(map[string]any)
+			if term["id"] != itemID || term["call_id"] != callID || term["arguments"] != arguments {
+				t.Fatalf("terminal item = %v", term)
+			}
+		}
+	}
+	if !argsDone || !itemDone || !completed {
+		t.Fatalf("missing close events for %s: args=%v item=%v completed=%v", callID, argsDone, itemDone, completed)
+	}
 }

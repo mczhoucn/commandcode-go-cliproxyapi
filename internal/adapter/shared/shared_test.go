@@ -984,7 +984,7 @@ func TestOutputAssembler(t *testing.T) {
 			},
 			want: []any{
 				msgItem("m", ""),
-				RespItem{Type: "function_call", CallID: "c1", Name: "f", Arguments: "{}"},
+				RespItem{Type: "function_call", ID: "fc_c1", CallID: "c1", Name: "f", Arguments: "{}"},
 			},
 		},
 		{
@@ -996,9 +996,9 @@ func TestOutputAssembler(t *testing.T) {
 				a.AddText("hi")
 			},
 			want: []any{
-				RespItem{Type: "function_call", CallID: "c1", Name: "f"},
+				RespItem{Type: "function_call", ID: "fc_c1", CallID: "c1", Name: "f"},
 				msgItem("m", "hi"),
-				RespItem{Type: "function_call", CallID: "c2", Name: "g"},
+				RespItem{Type: "function_call", ID: "fc_c2", CallID: "c2", Name: "g"},
 			},
 		},
 		{
@@ -1011,7 +1011,7 @@ func TestOutputAssembler(t *testing.T) {
 			},
 			want: []any{
 				msgItem("m", "t"),
-				RespItem{Type: "function_call", CallID: "c1", Name: "f"},
+				RespItem{Type: "function_call", ID: "fc_c1", CallID: "c1", Name: "f"},
 			},
 		},
 		{
@@ -1022,7 +1022,7 @@ func TestOutputAssembler(t *testing.T) {
 			},
 			want: []any{
 				msgItem("m", "t"),
-				RespItem{Type: "function_call", CallID: "c1", Name: "f"},
+				RespItem{Type: "function_call", ID: "fc_c1", CallID: "c1", Name: "f"},
 			},
 		},
 		{

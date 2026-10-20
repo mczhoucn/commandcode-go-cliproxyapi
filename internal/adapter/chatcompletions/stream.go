@@ -58,6 +58,7 @@ type StreamConverter struct {
 type streamTool struct {
 	blockIndex int
 	id         string
+	itemID     string // fc_-prefixed Responses item id shared by deltas and done events
 	name       string
 	args       strings.Builder
 	stopped    bool // content_block_stop emitted
@@ -520,22 +521,21 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 		t := sc.tools[tc.Index]
 		if t == nil {
 			events = append(events, sc.stopReasoning()...)
-			t = &streamTool{blockIndex: sc.nextIndex, id: tc.ID, name: tc.Function.Name}
+			t = &streamTool{blockIndex: sc.nextIndex, id: tc.ID, itemID: shared.FunctionCallItemID(tc.ID), name: tc.Function.Name}
 			sc.nextIndex++
 			sc.tools[tc.Index] = t
 			sc.toolsSeen = true
 			sc.toolOrder = append(sc.toolOrder, tc.Index)
-			// Announce the item before any arguments delta references it
-			// (F18 lifecycle parity); call_id-only matches the canonical
-			// native function_call shape (no "id" key).
+			// Announce the item before any arguments delta references it.
+			// The fc_ item id is what clients use to bind the later done event.
 			events = append(events, sc.responsesEm().ItemAdded(t.blockIndex, map[string]any{
-				"type": "function_call", "call_id": t.id,
+				"type": "function_call", "id": t.itemID, "call_id": t.id,
 				"name": t.name, "arguments": "",
 			}))
 		}
 		if tc.Function.Arguments != "" {
 			t.args.WriteString(tc.Function.Arguments)
-			events = append(events, sc.responsesEm().ArgsDelta(t.id, t.blockIndex, tc.Function.Arguments))
+			events = append(events, sc.responsesEm().ArgsDelta(t.itemID, t.blockIndex, tc.Function.Arguments))
 		}
 	}
 	if choice.FinishReason != "" && !sc.finished {
@@ -627,5 +627,17 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 		}
 	}
 	usage := shared.NewResponsesUsageFrom(input, outputTokens, details)
-	return [][]byte{sc.responsesEm().Completed(status, usage, oa.Render())}
+	em := sc.responsesEm()
+	events := make([][]byte, 0, len(sc.toolOrder)*2+1)
+	for _, idx := range sc.toolOrder {
+		t := sc.tools[idx]
+		if t == nil {
+			continue
+		}
+		args := shared.DefaultArgs(t.args.String())
+		events = append(events, em.CloseFunctionCall(t.blockIndex, shared.RespItem{
+			Type: "function_call", ID: t.itemID, CallID: t.id, Name: t.name, Arguments: args,
+		})...)
+	}
+	return append(events, em.Completed(status, usage, oa.Render()))
 }
