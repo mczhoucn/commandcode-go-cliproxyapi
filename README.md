@@ -173,10 +173,10 @@ API keys are not configured in this YAML. CLIProxyAPI auth files are the only so
 
 ### Browser authorization requirements and limitations
 
-- Sign in to the **same CPA origin** with **Remember password** enabled. The guide reuses existing management authentication; it does not put the management password in URLs or create another password store.
+- **Management key for the plugin pages**: when the page cannot reuse the CPA management login, it asks for the **CPA management key** once and keeps it in this browser's localStorage for this CPA site only (`commandcode-go-cliproxyapi:management-key`); use the **更换管理密钥** button to replace it. The key never travels in URLs. On older CPA builds that still store a decodable remembered login (plain JSON or `enc::v1`), the pages keep reusing it automatically with nothing to enter; newer CPA builds encrypt the remembered login (`enc::v2`), which the pages cannot decode, so the manual entry is the supported path there.
 - The user verified the official fallback in Chrome using `http://localhost:6000/callback`, with no `mode=redirect`. Chrome blocks that port by default, triggering the fallback. Do not override the port restriction. Other browsers are unverified. No listener or port forwarding is needed.
 - **A brief callback error is an expected transition**: the official site returns credentials through HTTP POST (JSON or form), not a token/API key in a callback HTTP GET URL or address bar. The chosen Chrome-blocked callback intentionally triggers the official failed-delivery fallback. After authorization, a callback-URL or credential-delivery error may briefly appear before the official credential-copy page opens. This is by design; do not authorize again solely because of that brief message. **If no fallback page appears, the credential cannot be copied, or CPA validation/save fails, treat that as a real failure rather than ignoring it.**
-- The official flow may create a key. That API key remains the underlying credential: no independent access/refresh tokens or automatic renewal are provided. The official site's temporary storage and clipboard may contain it; the plugin adds no browser key storage, key-bearing URLs, or key logs.
+- The official flow may create a key. That API key remains the underlying credential: no independent access/refresh tokens or automatic renewal are provided. The official site's temporary storage and clipboard may contain it; the plugin never writes that API key to browser storage, key-bearing URLs, or key logs (the localStorage entry above holds only the CPA management key, which you entered yourself).
 - Login sessions last 10 minutes. Completion validates and stages; CPA polling owns the only save. The guide reports success only after CPA confirms and a matching auth file is found. The guide can keep polling after the original OAuth window closes.
 - **Cancellation before delivery stops it; after delivery, cancellation cannot guarantee that CPA will not save.** Failed or uncertain saves are not automatically redelivered. Check auth files first. Unresolved saves retain an in-memory digest claim across these two entry points, not an atomic guarantee across host uploads/edits, restart, or multiple instances.
 - **Accepted network limitation**: validation uses CPA's existing proxy/TLS/redirect policy and trusted plugin configuration, never a browser-supplied target. The host offers no plugin redirect opt-out; some redirects, such as a subdomain or another port on the same host, may retain the authorization header. This is accepted, not fixed; strict cross-origin prevention is not claimed.
@@ -214,7 +214,7 @@ go test ./... -cover # with coverage
 go vet ./...         # vetting
 ```
 
-The optional browser regression test covers adding accounts, keeping API keys out of browser storage, deleted/stale responses, disabled state, and mobile/dark layouts. It uses local mock endpoints only:
+The optional browser regression test covers adding accounts, manual management-key entry and persistence (including the encrypted `enc::v2` storage case), keeping API keys out of browser storage, deleted/stale responses, disabled state, and mobile/dark layouts. It uses local mock endpoints only:
 
 ```bash
 npx --yes playwright install chromium

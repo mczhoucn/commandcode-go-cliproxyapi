@@ -49,17 +49,22 @@ const server = http.createServer(async (req,res) => {
   try {
     browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH||undefined});
     const origin="http://127.0.0.1:"+server.address().port;
-    async function pageFor(mode="success",prefix="",encrypted=false,remember=true){
+    async function pageFor(mode="success",prefix="",encrypted=false,remember=true,v2=false){
       const context=await browser.newContext();
       const page=await context.newPage();
       page.on("pageerror",error=>errors.push(error.message));
-      await page.addInitScript(({encrypted,remember})=>{
+      await page.addInitScript(({encrypted,remember,v2})=>{
         window.__credentialSubmissions = 0;
         const fetch = window.fetch;
         window.fetch = (...args) => {
           if (String(args[0]).endsWith("/oauth/complete")) window.__credentialSubmissions++;
           return fetch(...args);
         };
+        if(v2){
+          // Newer CPA storage format: opaque to this plugin, must not decode.
+          localStorage.setItem("cli-proxy-auth","enc::v2::bm90LWRlY29kYWJsZQ");
+          return;
+        }
         if(!remember) return;
         const raw=JSON.stringify({state:{managementKey:"mock-management"}});
         let stored=raw;
@@ -69,12 +74,12 @@ const server = http.createServer(async (req,res) => {
           stored="enc::v1::"+btoa(String.fromCharCode(...bytes));
         }
         localStorage.setItem("cli-proxy-auth",stored);
-      },{encrypted,remember});
+      },{encrypted,remember,v2});
       const state=randomBytes(32).toString("hex");
       const record={phase:"pending",mode,submits:0};
       records.set(state,record);
       await page.goto(origin+prefix+"/v0/resource/plugins/commandcode-go-cliproxyapi/oauth#state="+state);
-      if(remember) await page.waitForFunction(()=>!document.querySelector("#complete").disabled);
+      if(remember && !v2) await page.waitForFunction(()=>!document.querySelector("#complete").disabled);
       return {page,context,state,record};
     }
     async function noSecretPersistence(page,key){
@@ -142,9 +147,41 @@ const server = http.createServer(async (req,res) => {
       await context.close();
     }
     {
-      const {page,context}=await pageFor("success","",false,false);
-      assert.match(await page.locator("#status").innerText(),/记住密码/);
+      // Newer CPA stores the remembered login encrypted (enc::v2), so the
+      // guide must accept a pasted management key, keep it in its own
+      // localStorage entry, and then run the normal flow.
+      const {page,context,state,record}=await pageFor("success","",false,false);
+      await page.waitForFunction(()=>!document.querySelector("#management-form").hidden);
+      assert.match(await page.locator("#status").innerText(),/管理密钥/);
       assert.equal(await page.locator("#complete").isDisabled(),true);
+      await page.locator("#management-key").fill("wrong-management");
+      await page.locator("#save-management").click();
+      await page.waitForFunction(()=>document.querySelector("#status").textContent.includes("无效"));
+      assert.equal(await page.locator("#management-form").isVisible(),true,"form stays open after a rejected key");
+      assert.equal(await page.evaluate(()=>localStorage.getItem("commandcode-go-cliproxyapi:management-key")),null,"rejected key is not stored");
+      await page.locator("#management-key").fill("mock-management");
+      await page.locator("#save-management").click();
+      await page.waitForFunction(()=>document.querySelector("#management-form").hidden && !document.querySelector("#complete").disabled);
+      assert.equal(await page.evaluate(()=>localStorage.getItem("commandcode-go-cliproxyapi:management-key")),"mock-management");
+      assert(requests.some(r=>r.auth==="Bearer mock-management"),"saved management key not used for requests");
+      const official=new URL(await page.locator("#authorization-link").getAttribute("href"));
+      assert.equal(official.searchParams.get("state"),state,"official authorization link lost login state");
+      const key="fake-browser-only-secret";
+      await page.locator("#api-key").fill(key);
+      await page.locator("#complete").click();
+      await page.waitForFunction(()=>document.querySelector("#status").textContent.includes("等待"));
+      assert.equal(record.submits,1);
+      await noSecretPersistence(page,key);
+      await context.close();
+    }
+    {
+      // An undecodable enc::v2 cli-proxy-auth value falls through to manual entry.
+      const {page,context}=await pageFor("success","",false,true,true);
+      await page.waitForFunction(()=>!document.querySelector("#management-form").hidden);
+      await page.locator("#management-key").fill("mock-management");
+      await page.locator("#save-management").click();
+      await page.waitForFunction(()=>!document.querySelector("#complete").disabled);
+      assert.equal(await page.evaluate(()=>localStorage.getItem("commandcode-go-cliproxyapi:management-key")),"mock-management");
       await context.close();
     }
     {
@@ -156,6 +193,6 @@ const server = http.createServer(async (req,res) => {
       await context.close();
     }
     assert.deepEqual(errors,[]);
-    console.log("PASS: OAuth browser fixtures: normal/encrypted management login, proxy prefix, manual credential completion, no early success/no persistence, invalid plan, uncertain request/no resend, cancel, save failure, narrow/dark UI.");
+    console.log("PASS: OAuth browser fixtures: normal/encrypted management login, manual management-key entry for enc::v2/no-remember cases, proxy prefix, manual credential completion, no early success/no persistence, invalid plan, uncertain request/no resend, cancel, save failure, narrow/dark UI.");
   } finally {if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});

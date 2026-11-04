@@ -420,6 +420,29 @@ func TestQuotaPageReadsRememberedManagementKey(t *testing.T) {
 	}
 }
 
+// Newer CPA builds encrypt the remembered login (enc::v2), which the page
+// cannot decode, so the user must be able to paste the management key once
+// and keep it in the plugin's own same-origin localStorage entry.
+func TestQuotaPageAcceptsManualManagementKey(t *testing.T) {
+	for _, marker := range []string{
+		`const managementStorageKey = "commandcode-go-cliproxyapi:management-key"`,
+		`localStorage.getItem(managementStorageKey)`,
+		`localStorage.setItem(managementStorageKey, key)`,
+		`return storedManagementKey() || rememberedManagementKey();`,
+		`id="management-form"`,
+		`id="management-key"`,
+		`id="save-management"`,
+		`id="change-management"`,
+		// The typed key is verified through the host before it is persisted.
+		`requestWithKey(key, quotaEndpoint, {})`,
+		"authFailed",
+	} {
+		if !strings.Contains(resources.QuotaPage, marker) {
+			t.Fatalf("quota page missing manual management-key marker %q", marker)
+		}
+	}
+}
+
 func TestQuotaPageDecodesCurrentCPAAuthStorage(t *testing.T) {
 	for _, marker := range []string{"enc::v1::", "cli-proxy-api-webui::secure-storage", "TextDecoder"} {
 		if !strings.Contains(resources.QuotaPage, marker) {
@@ -475,7 +498,7 @@ func TestQuotaPageIsStaticAndSecretFree(t *testing.T) {
 	if resources.QuotaPage == "" || strings.Contains(resources.QuotaPage, testKey) || strings.Contains(resources.QuotaPage, "setInterval") || strings.Contains(resources.QuotaPage, "reset button") {
 		t.Fatal("quota page contains a secret, polling, or reset action")
 	}
-	if !strings.Contains(resources.QuotaPage, "textContent") || !strings.Contains(resources.QuotaPage, "Remember password") {
+	if !strings.Contains(resources.QuotaPage, "textContent") || !strings.Contains(resources.QuotaPage, "管理密钥") {
 		t.Fatal("quota page missing safe rendering or login guidance")
 	}
 }
