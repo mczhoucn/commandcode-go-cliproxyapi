@@ -72,13 +72,14 @@ Without this plugin, a manual CommandCode GOAT / Pro / Max integration must mana
 - **CLIProxyAPI**: `v7.2.138+`
 - **Go Toolchain**: Go 1.26+ (CGO enabled for `-buildmode=c-shared`)
 
-## v0.1.3 upgrade and release notes
+## v0.1.4 upgrade and release notes
 
-- This patch fixes missing completion events for streamed Responses tool calls, preventing clients from treating tools as unfinished after the response ends; both Chat Completions and Messages upstream conversion paths are covered.
+- This release fixes the compatibility issue where the CommandCode quota and OAuth pages showed “Enable Remember password” even when Remember password was enabled in Management Center. The pages now decode both the legacy `enc::v1::` and current `enc::v2::` `cli-proxy-auth` storage formats, using the correct origin-based key derivation for v2.
 - Existing auth files remain usable. Plugin `api-keys` config is retired and is not imported. Add an existing key in **CommandCode → CommandCode accounts and quota**, or use **OAuth login → CommandCode** without manually adding keys to configuration. Auth-file uploads remain available; disable and delete stay on the host auth-file page.
-- For a manual upgrade, replace the library for the target OS/architecture, restart CLIProxyAPI, then refresh Management Center. Updating this repository's version does not update an already running installation.
-- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.1.3`. Each supported platform needs `commandcode-go-cliproxyapi_0.1.3_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
+- For a manual upgrade, replace the library for the target OS/architecture, restart CLIProxyAPI, then refresh Management Center. Updating this repository's version does not update an already running plugin.
+- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.1.4`. Each supported platform needs `commandcode-go-cliproxyapi_0.1.4_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
 - Each ZIP must contain exactly one matching library at its root: `commandcode-go-cliproxyapi.so`, `commandcode-go-cliproxyapi.dylib`, or `commandcode-go-cliproxyapi.dll`. Keep the plugin ID and repository URL unchanged; the store reads the version from the latest GitHub release.
+
 
 ## Build
 

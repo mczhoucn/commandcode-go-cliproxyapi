@@ -2,6 +2,20 @@
 
 User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **CommandCode GOAT / Pro / Max**, not CommandCode Go.
 
+## v0.1.4 — Management Center remembered-auth compatibility (2026-11-04)
+
+- Fix the quota and OAuth pages showing “Enable Remember password” when Management Center already had Remember password enabled. The plugin now decodes the current `enc::v2::` `cli-proxy-auth` storage format as well as legacy `enc::v1::` values.
+- For `enc::v2::`, derive the storage key from the current Management Center origin without adding the browser User-Agent; retain the legacy v1 derivation for existing sessions.
+- Supported plans remain **CommandCode GOAT / Pro / Max; CommandCode Go is not supported**. Existing auth files and configuration remain unchanged.
+- Upgrade: replace the platform-specific plugin library, restart CPA and refresh Management Center. Publishing a release does not update an already running plugin.
+
+**中文**
+
+- 修复管理后台已经勾选“记住密码”时，配额页和 OAuth 页仍显示“Enable Remember password”的问题。插件现在同时支持当前的 `enc::v2::` `cli-proxy-auth` 存储格式和旧的 `enc::v1::` 格式。
+- `enc::v2::` 按当前管理后台地址推导存储密钥，不再错误加入浏览器 User-Agent；旧 v1 会继续按原规则解码。
+- 仍然只支持 **CommandCode GOAT / Pro / Max，不支持 Go 套餐**；不改变已有认证文件和配置。
+- 升级时替换对应平台的插件库、重启 CPA 并刷新管理后台；发布不会自动更新正在运行的插件。
+
 ## v0.1.3 — Complete streamed Responses tool calls (2026-10-20)
 
 - Fix tools remaining unfinished in Responses clients after the stream ends when converting Chat Completions or Messages upstream responses.

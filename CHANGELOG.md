@@ -2,6 +2,18 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
+## v0.1.4 — 2026-11-04
+
+- 修复管理后台启用“记住密码”后，CommandCode 页面仍提示“Enable Remember password”的兼容性问题：管理后台新的 `enc::v2::` 认证存储格式现在可以被插件正确读取。
+- 配额页和 OAuth 页同时兼容 `enc::v1::` 与 `enc::v2::`；v2 按当前管理后台地址解码，不再错误混入浏览器 User-Agent。
+- 不改变套餐支持范围、认证文件或配置：仍支持 **CommandCode GOAT / Pro / Max，不支持 Go**。已有安装需更新插件并重启 CPA，发布新版本不会自动替换运行中的插件。
+
+### v0.1.4 English highlights — 2026-11-04
+
+- Fix the compatibility issue where the CommandCode pages still showed “Enable Remember password” even when Management Center had Remember password enabled: the plugin now reads the Management Center's newer `enc::v2::` auth-storage format.
+- Make both the quota and OAuth pages accept `enc::v1::` and `enc::v2::`; v2 is decoded using the current Management Center origin without incorrectly including the browser User-Agent.
+- No plan-support, auth-file or configuration changes: **CommandCode GOAT / Pro / Max only; Go is not supported**. Update the plugin and restart CPA; publishing does not automatically replace an installed plugin.
+
 ## v0.1.3 — 2026-10-20
 
 - 修复通过 Responses 接口接收流式工具调用时，回复已经结束、客户端却仍将工具视为未完成而不执行的问题；覆盖上游 Chat Completions 和 Messages 两条转换路径。
