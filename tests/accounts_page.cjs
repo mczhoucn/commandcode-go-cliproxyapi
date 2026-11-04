@@ -57,7 +57,13 @@ const server = http.createServer(async (req, res) => {
     const page = await browser.newPage({viewport: {width: 1100, height: 850}});
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
-    await page.addInitScript(() => localStorage.setItem("cli-proxy-auth", JSON.stringify({state: {managementKey: "browser-test-management"}})));
+    await page.addInitScript(() => {
+      const raw = JSON.stringify({state: {managementKey: "browser-test-management"}});
+      const bytes = new TextEncoder().encode(raw);
+      const seed = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + location.host);
+      for (let i = 0; i < bytes.length; i++) bytes[i] ^= seed[i % seed.length];
+      localStorage.setItem("cli-proxy-auth", "enc::v2::" + btoa(String.fromCharCode(...bytes)));
+    });
     // Mark consumption on the next task, after the page's JSON/Promise handlers.
     await page.addInitScript(() => {
       window.__processedQuotaIDs = [];

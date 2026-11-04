@@ -58,9 +58,11 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
       const raw = localStorage.getItem("cli-proxy-auth");
       if (!raw) return "";
       let decoded = raw;
-      if (raw.startsWith("enc::v1::")) {
+      if (raw.startsWith("enc::v1::") || raw.startsWith("enc::v2::")) {
+        const legacy = raw.startsWith("enc::v1::");
         const bytes = Uint8Array.from(atob(raw.slice(9)), char => char.charCodeAt(0));
-        const seed = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + location.host + "|" + navigator.userAgent);
+        const suffix = legacy ? "|" + navigator.userAgent : "";
+        const seed = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + location.host + suffix);
         for (let i = 0; i < bytes.length; i++) bytes[i] ^= seed[i % seed.length];
         decoded = new TextDecoder().decode(bytes);
       }

@@ -421,9 +421,17 @@ func TestQuotaPageReadsRememberedManagementKey(t *testing.T) {
 }
 
 func TestQuotaPageDecodesCurrentCPAAuthStorage(t *testing.T) {
-	for _, marker := range []string{"enc::v1::", "cli-proxy-api-webui::secure-storage", "TextDecoder"} {
+	for _, marker := range []string{"enc::v1::", "enc::v2::", "cli-proxy-api-webui::secure-storage", "TextDecoder"} {
 		if !strings.Contains(resources.QuotaPage, marker) {
 			t.Fatalf("quota page does not decode current CPA auth storage: missing %q", marker)
+		}
+	}
+}
+
+func TestOAuthPageDecodesCurrentCPAAuthStorage(t *testing.T) {
+	for _, marker := range []string{"enc::v1::", "enc::v2::", "cli-proxy-api-webui::secure-storage", "TextDecoder"} {
+		if !strings.Contains(resources.OAuthPage, marker) {
+			t.Fatalf("OAuth page does not decode current CPA auth storage: missing %q", marker)
 		}
 	}
 }
