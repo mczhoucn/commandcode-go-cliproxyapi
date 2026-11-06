@@ -86,6 +86,7 @@ const server = http.createServer(async (req, res) => {
     await page.waitForFunction(() => document.querySelectorAll(".quota-card").length === 2);
     assert.equal(await page.title(), "CommandCode 账户与额度");
     assert.equal(await page.locator("#api-key").getAttribute("type"), "password");
+    assert.equal(await page.locator("#management-form").isVisible(), false, "legacy remembered key keeps the manual form hidden");
     assert.match(await page.locator("#app").innerText(), /personal\.json/);
     assert.match(await page.locator("#app").innerText(), /已禁用/);
     assert.match(await page.locator("#legacy-status").innerText(), /不会导入/);
@@ -135,6 +136,38 @@ const server = http.createServer(async (req, res) => {
     await page.waitForFunction(() => !document.querySelector("#app").textContent.includes("Refreshing..."));
     assert.equal(await page.locator(".quota-account .quota-warning").count(), 2, "stale quota response reverted disabled state");
 
+    // Newer CPA stores the remembered login encrypted (enc::v2); the page
+    // must fall back to a user-pasted management key kept in its own
+    // same-origin localStorage entry.
+    const manualContext = await browser.newContext({viewport: {width: 1100, height: 850}});
+    const manualPage = await manualContext.newPage();
+    manualPage.on("pageerror", error => errors.push(error.message));
+    await manualPage.goto("http://127.0.0.1:" + server.address().port);
+    await manualPage.waitForFunction(() => !document.querySelector("#management-form").hidden);
+    assert.match(await manualPage.locator("#management-status").innerText(), /未找到可用的管理密钥/);
+    assert.equal(await manualPage.locator("#api-key").isDisabled(), true);
+    assert.equal(await manualPage.locator("#reload-accounts").isDisabled(), true);
+    assert.match(await manualPage.locator("#app").innerText(), /输入并保存/);
+    await manualPage.locator("#management-key").fill("wrong-management");
+    await manualPage.locator("#save-management").click();
+    await manualPage.waitForFunction(() => document.querySelector("#management-status").textContent.includes("无效"));
+    assert.equal(await manualPage.locator("#management-form").isVisible(), true, "form stays open after a rejected key");
+    assert.equal(await manualPage.evaluate(() => localStorage.getItem("commandcode-go-cliproxyapi:management-key")), null, "rejected key is not stored");
+    await manualPage.locator("#management-key").fill("browser-test-management");
+    await manualPage.locator("#save-management").click();
+    await manualPage.waitForFunction(() => document.querySelectorAll(".quota-card").length === 2);
+    assert.equal(await manualPage.locator("#management-form").isVisible(), false);
+    assert.equal(await manualPage.locator("#change-management").isVisible(), true);
+    assert.match(await manualPage.locator("#management-status").innerText(), /已保存/);
+    assert.equal(await manualPage.locator("#api-key").isDisabled(), false);
+    assert.equal(await manualPage.evaluate(() => localStorage.getItem("commandcode-go-cliproxyapi:management-key")), "browser-test-management");
+    await manualPage.reload();
+    await manualPage.waitForFunction(() => document.querySelectorAll(".quota-card").length === 2);
+    assert.equal(await manualPage.locator("#management-form").isVisible(), false, "saved key survives reload");
+    await manualPage.locator("#change-management").click();
+    assert.equal(await manualPage.locator("#management-form").isVisible(), true);
+    await manualContext.close();
+
     // Narrow layouts must not require horizontal scrolling, including filenames.
     await page.setViewportSize({width: 375, height: 812});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "mobile layout overflows");
@@ -147,7 +180,7 @@ const server = http.createServer(async (req, res) => {
     await page.waitForFunction(() => document.querySelector("#list-status").textContent.includes("无法读取"));
     assert.match(await page.locator("#list-status").innerText(), /无法读取/);
     assert.deepEqual(errors, []);
-    console.log("PASS: browser form, password masking, duplicate/error states, no key storage, no automatic refresh for known accounts, deleted/stale response protection, disabled status, mobile/dark theme.");
+    console.log("PASS: browser form, password masking, duplicate/error states, no key storage, manual management-key entry and persistence, no automatic refresh for known accounts, deleted/stale response protection, disabled status, mobile/dark theme.");
   } finally {
     if (browser) await browser.close();
     server.closeAllConnections();

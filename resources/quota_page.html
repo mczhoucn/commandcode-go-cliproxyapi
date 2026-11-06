@@ -50,6 +50,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 .quota-title { margin: 0; font-size: 28px; font-weight: 700; line-height: 1.2; }
 .quota-description { margin: 8px 0 0; color: var(--text-secondary); }
 .quota-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 8px; }
+.quota-form[hidden] { display: none; }
 .quota-field-label { color: var(--text-secondary); }
 .quota-input { flex: 1 1 240px; min-width: 0; border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 10px; color: var(--text-primary); background: var(--bg-primary); font: inherit; }
 .quota-input:disabled { cursor: not-allowed; opacity: .6; }
@@ -87,6 +88,13 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 <body>
 <div class="quota-page">
   <header class="quota-header"><h1 class="quota-title">CommandCode 账户与额度</h1><p class="quota-description">支持 GOAT / Pro / Max，不支持 Go。新 key 联网核验身份和有效订阅后才保存。也可从 CPA 的 OAuth 登录项进行浏览器授权。仅没有邮箱的账户会自动查询一次额度。启用、禁用和删除请到认证文件页操作。</p></header>
+  <form id="management-form" class="quota-form" autocomplete="off" hidden>
+    <label class="quota-field-label" for="management-key">管理密钥</label>
+    <input id="management-key" class="quota-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="CPA 管理密钥">
+    <button id="save-management" class="quota-refresh" type="submit">保存管理密钥</button>
+  </form>
+  <p id="management-status" class="quota-status" role="status"></p>
+  <div class="quota-toolbar"><button id="change-management" class="quota-refresh" type="button" hidden>更换管理密钥</button></div>
   <form id="save-form" class="quota-form" autocomplete="off">
     <label class="quota-field-label" for="api-key">API key</label>
     <input id="api-key" class="quota-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="off">
@@ -124,6 +132,12 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 <script>
 (() => {
   const app = document.getElementById("app");
+  const managementForm = document.getElementById("management-form");
+  const managementKeyInput = document.getElementById("management-key");
+  const saveManagementButton = document.getElementById("save-management");
+  const managementChangeButton = document.getElementById("change-management");
+  const managementStatus = document.getElementById("management-status");
+  const managementStorageKey = "commandcode-go-cliproxyapi:management-key";
   const saveForm = document.getElementById("save-form");
   const apiKeyInput = document.getElementById("api-key");
   const saveButton = document.getElementById("save-account");
@@ -201,11 +215,23 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     }).catch(err => {
       inFlight.delete(keyID);
       if (!currentCard(keyID)) return;
+      if (err && err.authFailed) revealManagementForm("管理密钥无效或已失效，请重新输入。");
       errors.set(keyID, err.message || "Refresh failed");
       render();
     });
   }
-  function auth() {
+  // Management-key sources, preferred order: the key the user saved on this
+  // page (works on every CPA build, including enc::v2 storage), then the CPA
+  // management UI's own remembered login (legacy plain JSON or enc::v1 only).
+  function storedManagementKey() {
+    try {
+      const value = localStorage.getItem(managementStorageKey);
+      if (typeof value !== "string") return "";
+      const trimmed = value.trim();
+      return trimmed && trimmed.length <= 1024 ? trimmed : "";
+    } catch (_) { return ""; }
+  }
+  function rememberedManagementKey() {
     const raw = localStorage.getItem("cli-proxy-auth");
     if (!raw) return "";
     try {
@@ -223,15 +249,79 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       return "";
     } catch (_) { return ""; }
   }
-  function request(url, body) {
+  function auth() {
+    return storedManagementKey() || rememberedManagementKey();
+  }
+  function requestWithKey(key, url, body) {
     const headers = {"Content-Type": "application/json"};
-    const key = auth();
     if (key) headers.Authorization = "Bearer " + key;
     return fetch(url, {method: "POST", headers, body: JSON.stringify(body)}).then(async response => {
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || "Request failed");
+      if (!response.ok) {
+        const error = new Error(data.error || "Request failed");
+        if (response.status === 401 || response.status === 403) {
+          error.authFailed = true;
+          error.message = "管理密钥无效或已失效。";
+        }
+        throw error;
+      }
       return data;
     });
+  }
+  function request(url, body) {
+    return requestWithKey(auth(), url, body);
+  }
+  function setManagementStatus(message, isError) {
+    managementStatus.className = message ? (isError ? "quota-status quota-error" : "quota-status quota-success") : "quota-status";
+    managementStatus.textContent = message || "";
+  }
+  function revealManagementForm(message) {
+    managementForm.hidden = false;
+    managementChangeButton.hidden = true;
+    managementKeyInput.value = "";
+    setManagementStatus(message || "", Boolean(message));
+  }
+  function hideManagementForm(message) {
+    managementForm.hidden = true;
+    managementChangeButton.hidden = false;
+    managementKeyInput.value = "";
+    setManagementStatus(message || "", false);
+  }
+  function enablePageControls() {
+    apiKeyInput.disabled = false;
+    saveButton.disabled = false;
+    reloadButton.disabled = false;
+  }
+  function persistManagementKey(key) {
+    try { localStorage.setItem(managementStorageKey, key); } catch (_) {}
+  }
+  function afterManagementVerified() {
+    hideManagementForm("管理密钥已保存。");
+    enablePageControls();
+    loadList();
+  }
+  function onManagementSave(event) {
+    event.preventDefault();
+    const key = managementKeyInput.value.trim();
+    if (!key) {
+      setManagementStatus("请输入管理密钥。", true);
+      return;
+    }
+    saveManagementButton.disabled = true;
+    setManagementStatus("正在验证管理密钥…");
+    // Verify the typed key itself before persisting it; any non-401/403
+    // response means the host accepted this key.
+    requestWithKey(key, quotaEndpoint, {}).then(() => {
+      persistManagementKey(key);
+      afterManagementVerified();
+    }).catch(err => {
+      if (err && err.authFailed) {
+        revealManagementForm("管理密钥无效或已失效，请重新输入。");
+      } else {
+        persistManagementKey(key);
+        afterManagementVerified();
+      }
+    }).then(() => { saveManagementButton.disabled = false; });
   }
   function setSaveStatus(message, isError) {
     saveStatus.className = message ? (isError ? "quota-status quota-error" : "quota-status quota-success") : "quota-status";
@@ -348,6 +438,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       missing.forEach(card => refreshCard(card, true));
     }).catch(err => {
       if (generation !== listGeneration) return;
+      if (err && err.authFailed) revealManagementForm("管理密钥无效或已失效，请重新输入。");
       setListStatus(err.message && err.message !== "Request failed" ? err.message : "无法加载账户列表。");
       render();
     }).then(() => {
@@ -374,6 +465,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       setSaveStatus(fileName ? "已保存为文件 " + fileName + "。随后的额度查询失败不会影响这次保存。" : "已保存。随后的额度查询失败不会影响这次保存。", false);
       return loadList().catch(() => {});
     }).catch(err => {
+      if (err && err.authFailed) revealManagementForm("管理密钥无效或已失效，请重新输入。");
       setSaveStatus(err.message && err.message !== "Request failed" ? err.message : "保存失败。", true);
     }).then(() => {
       saving = false;
@@ -381,17 +473,22 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       saveButton.disabled = false;
     });
   }
-  if (!auth()) {
+  managementForm.addEventListener("submit", onManagementSave);
+  managementChangeButton.addEventListener("click", () => revealManagementForm("输入新的 CPA 管理密钥并保存，即可替换本页保存的密钥。"));
+  saveForm.addEventListener("submit", onSave);
+  reloadButton.addEventListener("click", () => { if (!listLoading) loadList(); });
+  if (auth()) {
+    hideManagementForm("");
+    loadList();
+  } else {
     apiKeyInput.disabled = true;
     saveButton.disabled = true;
     reloadButton.disabled = true;
     app.textContent = "";
-    const p = document.createElement("p"); p.className = "quota-error"; p.setAttribute("role", "status"); p.textContent = "Enable Remember password in Management Center to use this page."; app.appendChild(p);
+    const p = document.createElement("p"); p.className = "quota-muted"; p.setAttribute("role", "status"); p.textContent = "输入并保存 CPA 管理密钥后，即可加载账户列表。"; app.appendChild(p);
+    revealManagementForm("未找到可用的管理密钥：新版 CPA 已改为加密保存“记住密码”。请输入 CPA 管理密钥，它只保存在本浏览器的本站本地存储中；旧版 CPA 也可在管理页启用“记住密码”后重新打开本页。");
     return;
   }
-  saveForm.addEventListener("submit", onSave);
-  reloadButton.addEventListener("click", () => { if (!listLoading) loadList(); });
-  loadList();
 })();
 </script>
 </body>

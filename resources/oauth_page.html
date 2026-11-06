@@ -29,6 +29,11 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
 <p class="note">这是“浏览器授权、复制凭据完成”，不是自动回调。授权仍使用 API key，不提供自动续期。只在已验证的 Chrome 默认设置下使用；不要解除浏览器对端口 6000 的限制。</p>
 <a id="authorization-link" class="link-button" target="_blank" rel="noopener noreferrer" hidden>打开官方授权页</a>
 <p><a id="authorization-url" target="_blank" rel="noopener noreferrer"></a></p>
+<form id="management-form" hidden>
+<label for="management-key">CPA 管理密钥</label>
+<input id="management-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off">
+<button id="save-management" type="submit">保存并继续</button>
+</form>
 <form id="complete-form">
 <label for="api-key">官方备用页提供的 API key</label>
 <input id="api-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" disabled>
@@ -53,7 +58,20 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
   $("accounts-link").href = prefix + "/v0/resource/plugins/commandcode-go-cliproxyapi/quota";
   let timer, submitting = false, checking = false, terminal = false, uncertain = false, submissionUncertain = false;
   let phase = "pending";
-  function auth() {
+  let managementPending = false;
+  const managementStorageKey = "commandcode-go-cliproxyapi:management-key";
+  // Management-key sources, preferred order: the key the user saved on the
+  // plugin pages (works on every CPA build, including enc::v2 storage), then
+  // the CPA management UI's own remembered login (plain JSON or enc::v1 only).
+  function storedManagementKey() {
+    try {
+      const value = localStorage.getItem(managementStorageKey);
+      if (typeof value !== "string") return "";
+      const trimmed = value.trim();
+      return trimmed && trimmed.length <= 1024 ? trimmed : "";
+    } catch (_) { return ""; }
+  }
+  function rememberedManagementKey() {
     try {
       const raw = localStorage.getItem("cli-proxy-auth");
       if (!raw) return "";
@@ -70,20 +88,30 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
       return typeof key === "string" ? key : "";
     } catch (_) { return ""; }
   }
+  function auth() {
+    return storedManagementKey() || rememberedManagementKey();
+  }
   function message(text, error = false, success = false) {
     $("status").textContent = text;
     $("status").className = error ? "error" : success ? "success" : "";
   }
   function controls() {
-    const pending = !terminal && !submitting && !uncertain && phase === "pending";
+    const pending = !terminal && !submitting && !uncertain && !managementPending && phase === "pending";
     $("api-key").disabled = !pending;
     $("complete").disabled = !pending;
-    $("cancel").disabled = terminal || submitting || phase === "delivered" || phase === "present";
-    $("check").disabled = checking || submitting || terminal;
+    $("cancel").disabled = managementPending || terminal || submitting || phase === "delivered" || phase === "present";
+    $("check").disabled = managementPending || checking || submitting || terminal;
   }
-  async function request(url, method, body) {
-    const key = auth();
-    if (!key) throw new Error("请先在同一地址的 CPA 管理页面登录并勾选“记住密码”，然后重新打开本页。管理密码不会通过网址传递。");
+  function revealManagementKeyForm(text) {
+    managementPending = true;
+    clearTimeout(timer);
+    $("management-form").hidden = false;
+    $("management-key").value = "";
+    controls();
+    if (text) message(text, true);
+  }
+  async function requestWithKey(key, url, method, body) {
+    if (!key) throw new Error("请先在下方输入并保存 CPA 管理密钥。管理密钥不会通过网址传递。");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 40000);
     try {
@@ -91,12 +119,17 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
         body: body === undefined ? undefined : JSON.stringify(body), signal:controller.signal, redirect:"error"});
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const error = new Error(response.status === 401 || response.status === 403 ? "管理登录已失效，请重新登录 CPA。" : data.error || "请求失败，请确认状态");
+        const denied = response.status === 401 || response.status === 403;
+        const error = new Error(denied ? "管理密钥无效或已失效，请重新输入。" : data.error || "请求失败，请确认状态");
         error.definitive = true;
+        if (denied) error.authFailed = true;
         throw error;
       }
       return data;
     } finally { clearTimeout(timeout); }
+  }
+  async function request(url, method, body) {
+    return requestWithKey(auth(), url, method, body);
   }
   const session = action => request(endpoint + action, "POST", {state});
   async function inspect() {
@@ -148,12 +181,15 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
       }
     } catch (error) {
       if (!terminal) {
-        uncertain = true;
-        message((error.name === "AbortError" ? "请求超时。" : error.message + "。") + "先重新确认状态或查看认证文件，不要重复提交。", true);
+        if (error.authFailed || !auth()) revealManagementKeyForm(error.authFailed ? "管理密钥无效或已失效，请重新输入并保存。" : "请先在下方输入并保存 CPA 管理密钥。");
+        else {
+          uncertain = true;
+          message((error.name === "AbortError" ? "请求超时。" : error.message + "。") + "先重新确认状态或查看认证文件，不要重复提交。", true);
+        }
       }
     } finally {
       checking = false; controls();
-      if (!terminal && !uncertain) timer = setTimeout(inspect, 2000);
+      if (!terminal && !uncertain && !managementPending) timer = setTimeout(inspect, 2000);
     }
   }
   $("complete-form").addEventListener("submit", async event => {
@@ -168,9 +204,12 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
       phase = "ready";
       message("已验证，等待 CPA 保存；尚不能认定认证文件已保存。");
     } catch (error) {
-      uncertain = true;
-      submissionUncertain = !error.definitive;
-      message((error.name === "AbortError" ? "请求超时" : error.message) + "。请先重新确认状态，不要重复提交。", true);
+      if (error.authFailed) revealManagementKeyForm("管理密钥无效或已失效，请重新输入并保存。");
+      else {
+        uncertain = true;
+        submissionUncertain = !error.definitive;
+        message((error.name === "AbortError" ? "请求超时" : error.message) + "。请先重新确认状态，不要重复提交。", true);
+      }
     } finally {
       $("api-key").value = "";
       submitting = false; controls();
@@ -187,16 +226,46 @@ button.secondary{color:inherit;background:transparent;border-color:#adb8c6}butto
       try { await request(management + "/oauth-session?state=" + encodeURIComponent(state), "DELETE"); }
       catch (_) { message("插件已阻止交付，但未能确认 CPA 会话取消。请关闭本页；不会自动重试。", true); }
     } catch (error) {
-      uncertain = true;
-      message(error.message + "。不能认定取消成功，请先查看认证文件。", true);
+      if (error.authFailed) revealManagementKeyForm("管理密钥无效或已失效，请重新输入并保存。");
+      else {
+        uncertain = true;
+        message(error.message + "。不能认定取消成功，请先查看认证文件。", true);
+      }
     } finally { submitting = false; controls(); }
   });
   $("check").addEventListener("click", inspect);
   window.addEventListener("pagehide", () => { clearTimeout(timer); $("api-key").value = ""; });
+  $("management-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    if (!managementPending) return;
+    const key = $("management-key").value.trim();
+    if (!key) { message("请输入 CPA 管理密钥。", true); return; }
+    const button = $("save-management");
+    button.disabled = true;
+    message("正在验证管理密钥…");
+    try {
+      // Verify the typed key itself before persisting it; any non-401/403
+      // response means the host accepted this key.
+      await requestWithKey(key, management + "/get-auth-status?state=" + encodeURIComponent(state), "GET");
+      try { localStorage.setItem(managementStorageKey, key); } catch (_) {}
+      managementPending = false;
+      $("management-form").hidden = true;
+      message("管理密钥已保存，正在确认登录会话…");
+      inspect();
+    } catch (error) {
+      if (error.authFailed) message("管理密钥无效或已失效，请重新输入。", true);
+      else {
+        try { localStorage.setItem(managementStorageKey, key); } catch (_) {}
+        managementPending = false;
+        $("management-form").hidden = true;
+        message("管理密钥已保存，但状态查询失败，请点击“重新确认状态”。", true);
+      }
+    } finally { button.disabled = false; controls(); }
+  });
   if (!/^[a-f0-9]{64}$/.test(state)) {
     terminal = true; message("缺少有效登录会话，请从 CPA 的 CommandCode OAuth 登录项重新开始。", true); controls();
   } else if (!auth()) {
-    terminal = true; message("请先在同一地址的 CPA 管理页面登录并勾选“记住密码”，然后重新打开本页。", true); controls();
+    revealManagementKeyForm("未找到可用的管理密钥：新版 CPA 已改为加密保存“记住密码”。请输入 CPA 管理密钥，它只保存在本浏览器的本站本地存储中；也可先在“CommandCode 账户与额度”页保存。");
   } else { inspect(); }
 })();
 </script>
