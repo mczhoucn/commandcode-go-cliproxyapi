@@ -9,6 +9,7 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 - Reset is not advertised — CommandCode has no quota reset endpoint.
 - **Cooldowns now follow CPA's configuration.** The plugin reports CommandCode's real error shape and CPA decides the cooling from its own settings: a usage-window or credit exhaustion cools the whole credential for the upstream reset time, a plain 429 cools only the reporting model, a plan-entitlement failure cools only that model, client-caused request defects cool nothing, post-first-byte truncation and client disconnects cool nothing and are never replayed, and transport failures stay retryable without cooling. An upstream `Retry-After` header is forwarded as the duration.
 - Minimum CLIProxyAPI rises to `v8.0.43`, the first release with both the quota provider and the cooldown error fields; the SDK dependency is now `v8.0.67`. The plugin declares schema 6 — the contract it actually uses — so hosts are not rejected for newer SDK features it never calls.
+- **DeepSeek-documented client capabilities are complete on all three protocols.** Historical thinking is replayed as `reasoning_content` (required by tool-carrying multi-turn requests, which the upstream otherwise rejects), Anthropic `output_config.effort` is honoured, image `detail` survives translation, and Responses reasoning events are emitted under both the OpenAI-standard `response.reasoning_summary_text.*` and DeepSeek-documented `response.reasoning_text.*` families. A decoder bug that emptied every replayed Claude thinking block is fixed.
 - The plugin's own **CommandCode accounts and quota** page is unchanged and still provides key entry and per-card refresh.
 - Supported plans remain **CommandCode GOAT / Pro / Max; CommandCode Go is not supported**. Existing auth files and configuration are unchanged.
 - Upgrade: replace the platform-specific plugin library, restart CPA and refresh Management Center. Publishing a release does not update an already running plugin.
@@ -20,6 +21,7 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 - 不声明支持重置：CommandCode 没有重置额度的接口。
 - **冷却完全跟随 CPA 配置。** 插件按 CommandCode 真实的错误形态上报，由 CPA 自己的冷却设置决定行为：用量窗口或 credit 耗尽冷却整条凭据并使用上游给的 reset 时长；普通 429 只冷却当前模型；模型不在套餐内只冷却该模型；客户端引起的请求缺陷不冷却；首字节后流中断和客户端断连不冷却、不重放；传输失败可重试但不冷却。上游 `Retry-After` 头会作为冷却时长透传。
 - 最低 CLIProxyAPI 版本提高到 `v8.0.43`（首个同时具备配额提供者和冷却错误字段的版本），SDK 依赖升级到 `v8.0.67`。插件只声明 schema 6（自身实际用到的契约），不会因为未使用的新 SDK 特性而被更老的宿主误拒。
+- **DeepSeek 文档定义的三种客户端协议能力已补齐。** 历史思考内容回传为 `reasoning_content`（带 tools 的多轮请求必需，否则上游拒绝）、Anthropic `output_config.effort` 生效、图片 `detail` 保留、Responses 思考事件同时以 OpenAI 标准的 `response.reasoning_summary_text.*` 和 DeepSeek 文档的 `response.reasoning_text.*` 两族发出。同时修复了导致历史思考块文本为空解码器缺陷。
 - 插件自己的 **CommandCode账户与额度** 页面保持不变，仍然提供 key 录入和按卡片刷新。
 - 仍然只支持 **CommandCode GOAT / Pro / Max，不支持 Go 套餐**；不改变已有认证文件和配置。
 - 升级时替换对应平台的插件库、重启 CPA 并刷新管理后台；发布不会自动更新正在运行的插件。
