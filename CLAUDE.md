@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **native dynamic plugin for CLIProxyAPI (CPA)**, not a standalone server. It exposes the CommandCode Provider API (`https://api.commandcode.ai/provider/v1`) as one CPA provider, `commandcode`, so OpenAI, Anthropic Messages, and OpenAI Responses clients can all use the same upstream accounts. Build output is a C-shared library (`.so`/`.dylib`/`.dll`) that CPA loads; `main.go` is the only file importing `"C"`.
 
-Supported plans are GOAT / Pro / Max. The plugin was renamed from `commandcode-go-cliproxyapi`; the old `go` was inherited naming from `opencode-go-cliproxyapi`, never a Go-plan support claim. **The plugin ID is part of the host-facing contract** — auth files, `plugins.configs.<id>`, management routes and the `commandcode-key-<hash>.json` naming all key off it, so a rename is a breaking change for existing installs.
+Supported plans are GOAT / Pro / Max. The plugin was renamed from `commandcode-go-cliproxyapi`; the old `go` was inherited naming from `opencode-go-cliproxyapi`, never a Go-plan support claim. **The plugin ID is part of the host-facing contract**, so a rename touches more than the package name: `pluginName` and `githubRepoURL` in `internal/plugin/plugin.go`, the `go.mod` module path, `PLUGIN_ID` in `.github/workflows/build.yml`, the route strings embedded in `resources/quota_page.html` and `oauth_page.html`, and the C-shared output filename. Auth files need no migration — their `type` is the provider key `commandcode`, which does not change. Historical CHANGELOG/RELEASE_NOTES entries keep the old name on purpose; rewriting them would falsify the release record.
 
 ## Commands
 
@@ -114,6 +114,7 @@ All outbound HTTP must go through `HostBridge` (`host.http.do`, `host.http.do_st
 - Upstream sends thinking text under `reasoning` / `reasoning_details[].text`, never `reasoning_content`. `shared.BackfillReasoningContent` mirrors it for OpenAI clients; Claude targets get `thinking` blocks; Responses targets get reasoning summary items.
 - `internal/thinking` maps budget↔effort using tables copied from the host SDK (`internal/thinking/convert.go`). They were taken at v7.2.138 and are unchanged in v8.0.67; re-check on any further SDK bump. When a model declares no thinking capability (all CommandCode models today), client efforts are forwarded verbatim rather than locally rejected.
 - Adapters share kernels in `shared` deliberately: identically shaped requests must produce identical policies on all routes (e.g. empty content dropped, tool results text-only, `fc_`-prefixed Responses item IDs, `total_tokens = input + output`). `responses_parity_test.go` and the many `F5`/parity comments pin these cross-route invariants.
+- `errclass` classes are the envelope error codes; all messages pass through `Redact` (bearer, `x-api-key`, query-string keys), and post-first-byte network failures are never retryable. Do not add a code path that forwards an upstream body without redaction.
 
 ### Downstream protocol coverage (DeepSeek-documented surface)
 
@@ -125,7 +126,6 @@ The plugin speaks the full surface described by DeepSeek's public guides, becaus
 - **Responses reasoning events are emitted under two families** — `response.reasoning_summary_text.*` (OpenAI spec) and `response.reasoning_text.*` (DeepSeek docs). They are distinct event types rather than aliases, so both must be sent for either client to work. `ReasoningSummaryDelta`/`ReasoningSummaryDone` return `[][]byte`.
 
 Upstream remains CommandCode's OpenAI-compatible Provider API (`provider/v1`), matching both reference implementations. The vendor CLI's private `/alpha/generate` protocol (a `config`/`permissionMode`/`threadId` envelope with `tool-call`/`tool-result`/`reasoning` message blocks) is deliberately **not** implemented: it is undocumented, and using it would imply CommandCode Go plan support, which this plugin does not claim.
-- `errclass` classes are the envelope error codes; all messages pass through `Redact` (bearer, `x-api-key`, query-string keys), and post-first-byte network failures are never retryable. Do not add a code path that forwards an upstream body without redaction.
 
 ### Management UI
 
@@ -139,6 +139,10 @@ Two surfaces read the same upstream account API through `fetchQuota` (`quota.go`
 - **Standard `QuotaProvider`** (`quota_provider.go`): registration advertises `quota_provider`, and `quota.identifier` / `quota.describe` / `quota.fetch` serve Management Center's auth-file cards. The host-supplied shape is **remainingFraction in [0,1]** — the inverse of the page's percentage — and `window` values (`five_hour`, `weekly`) must stay in the host's known set or the UI loses its ordering/period labels. `QuotaBucket` has no display-name field, so the row label is packed into `description`. State flags beat the arithmetic: `unlimited` renders full and `exceeded` renders empty regardless of used/cap. `quota.reset` answers unsupported because CommandCode has no reset endpoint.
 
 Changing either surface means keeping both consistent; the plugin page never fetches through the host's quota route.
+
+**Window hierarchy.** The three windows nest (`month` > `weekly` > `five_hour`): the shorter is carved out of the longer, so a spent longer window forces the shorter ones to zero even when upstream reports headroom (`applyWindowHierarchy` in `quota.go`, applied inside `fetchQuota` so both surfaces agree). Propagation is downward only. `exhausted()` treats `unlimited` and zero-cap windows as never exhausted, and counts `used >= cap` as spent even without an upstream flag. A spent credential makes `quota.fetch` return an error naming the window (`exhaustedWindow` picks the longest spent one) rather than a 0% card that reads as idle.
+
+That error only marks the *management fetch* as failed. `FetchCredentialQuota` is a read-only management endpoint and **does not affect routing** — CPA stops routing to a credential through executor cooldown reporting (see below), not through the quota surface. The plugin API exposes no RPC to set a cooldown or mark a credential unavailable; only `scheduler.pick` could influence selection, and that is a global scheduler, too invasive for this provider.
 
 ### Host SDK compatibility floor
 
@@ -173,8 +177,15 @@ Verified end-to-end against a real v8.0.67 host: a window-exhausted 429 produced
 ## Versioning and release
 
 - `pluginVersion` in `internal/plugin/plugin.go` is reported to the host and asserted exactly in `internal/plugin/plugin_test.go`; bump both together.
-- A release also updates `README.md` / `README.zh-CN.md`, `CHANGELOG.md` (user-facing, bilingual), and `RELEASE_NOTES.md` (used as GitHub release body).
-- Pushing a `v*` tag runs `.github/workflows/build.yml`: tests and vet first, then a build matrix (linux amd64/arm64, darwin amd64/arm64, windows amd64, windows arm64 via cross-cgo, freebsd amd64 non-blocking), then publishes zips plus `checksums.txt`. Each zip must contain exactly one library at its root; the plugin ID and repository URL must stay unchanged for plugin-store compatibility.
+- A release also updates `README.md` / `README.zh-CN.md`, `CHANGELOG.md` (user-facing, bilingual), and `RELEASE_NOTES.md` (used as the GitHub release body).
+- Pushing a `v*` tag runs `.github/workflows/build.yml` (also triggered on `pull_request` and manually via `workflow_dispatch`). The test job runs `go test ./...` then `go vet ./...`; the build matrix covers linux amd64/arm64, darwin amd64/arm64, windows amd64, windows arm64 (cross-cgo), and freebsd amd64 (`continue-on-error`, so its failure does not block a release). Each zip must contain exactly one library at its root, plus a release-wide `checksums.txt`.
+
+**The `release` job is gated on `refs/tags/v*`**, so a `workflow_dispatch` run builds artifacts but publishes nothing. Two consequences observed in practice:
+
+- A tag push sometimes does not surface in `gh run list` immediately, and run/job `status` can lag behind reality — an artifact endpoint can show finished zips while the run still reads `queued`. Check `gh api .../runs/<id>/artifacts` before concluding a build is stuck.
+- If the dispatched run does reach its matrix, the artifacts are still usable: `gh release create` can publish them manually, but the release job (when it does run) overwrites `checksums.txt` with the full platform set.
+
+Cross-compiling `-buildmode=c-shared` requires CGO and a matching C toolchain, so a Windows-only machine cannot produce the Linux library; CI is the supported path.
 
 ## Conventions in this codebase
 

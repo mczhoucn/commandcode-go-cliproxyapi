@@ -68,7 +68,29 @@ func (m *Manager) quotaFetch(ctx context.Context, req pluginapi.QuotaFetchReques
 	if err != nil {
 		return pluginapi.QuotaFetchResponse{}, err
 	}
+	// An exhausted window means this credential cannot serve requests right
+	// now. Returning the error (rather than a 0% card) marks the fetch as
+	// failed, which is the only signal this read-only management endpoint can
+	// carry; routing itself is governed by the executor's cooldown reporting.
+	if window := usage.exhaustedWindow(); window != "" {
+		return pluginapi.QuotaFetchResponse{}, quotaExhaustedError(window)
+	}
 	return quotaResponseFromUsage(usage), nil
+}
+
+// quotaExhaustedError names the window that has no allowance left. The message
+// is what an operator sees on the auth-file card, so it says which limit
+// applies rather than a bare "quota exceeded".
+func quotaExhaustedError(window string) error {
+	switch window {
+	case "month":
+		return fmt.Errorf("monthly plan credits exhausted")
+	case "weekly":
+		return fmt.Errorf("weekly usage window exhausted")
+	case "five_hour":
+		return fmt.Errorf("5-hour usage window exhausted")
+	}
+	return fmt.Errorf("quota exhausted")
 }
 
 // authEntryByIndex finds one plugin-owned auth file entry by runtime index.

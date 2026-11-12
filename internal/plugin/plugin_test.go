@@ -476,7 +476,7 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	if reg.SchemaVersion > pluginabi.SchemaVersion {
 		t.Fatalf("declared schema %d exceeds the SDK's %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
-	if reg.Metadata.Name != "commandcode-or-or-cliproxyapi" || reg.Metadata.Version != "0.2.0" ||
+	if reg.Metadata.Name != "commandcode-or-or-cliproxyapi" || reg.Metadata.Version != "0.2.1" ||
 		len(reg.Metadata.ConfigFields) != 0 {
 		t.Fatalf("metadata wrong: %+v", reg.Metadata)
 	}

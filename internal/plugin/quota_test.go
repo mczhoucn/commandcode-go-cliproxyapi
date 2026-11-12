@@ -241,8 +241,15 @@ func TestQuotaRefreshExhaustedAccount(t *testing.T) {
 	if got.Usage.Weekly.Status != "exceeded" || got.Usage.Weekly.Percent != 100 {
 		t.Errorf("weekly window = %+v, want exceeded at 100%%", got.Usage.Weekly)
 	}
-	if got.Usage.FiveHour.Status != "ok" || got.Usage.FiveHour.Percent != 0 {
-		t.Errorf("five-hour window = %+v, want an idle ok window", got.Usage.FiveHour)
+	// The upstream reported an idle five-hour window beside the spent week,
+	// but the shorter window is carved out of the longer one: once the week is
+	// spent there is nothing left to spend, so it must render as exhausted
+	// instead of inviting the user into upstream refusals.
+	if got.Usage.FiveHour.Status != "exceeded" || got.Usage.FiveHour.Percent != 100 {
+		t.Errorf("five-hour window = %+v, want it folded to exhausted by the spent week", got.Usage.FiveHour)
+	}
+	if got.Usage.FiveHour.Used != got.Usage.FiveHour.Cap || got.Usage.FiveHour.Cap != 14 {
+		t.Errorf("five-hour usage = %+v, want used==cap with the cap preserved", got.Usage.FiveHour)
 	}
 	if got.Usage.CreditsLeft != 34.9998441415 || got.Usage.PlanCredits != 70 {
 		t.Errorf("credits = %v/%v", got.Usage.CreditsLeft, got.Usage.PlanCredits)

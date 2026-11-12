@@ -2,6 +2,22 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
+## v0.2.1 — 2026-11-12
+
+- **额度窗口按层级联动**：月度、每周、5 小时三条窗口是嵌套关系，短窗口从长窗口划出。长窗口耗尽时，短窗口强制显示为已用完，即使上游仍报告有余量——否则界面会误导用户继续请求，而实际只会收到拒绝。
+- 归零只向下传染：每周用完会把 5 小时窗口归零；5 小时用完不影响每周和每月。
+- 任意窗口耗尽时，标准额度查询直接返回失败并说明是哪个窗口耗尽（月度 / 每周 / 5 小时），而不是返回一张 0% 的空闲卡片。
+- 判定口径：`status` 为 `exceeded`、或 `used >= cap` 都算耗尽；`unlimited` 和 cap 为 0 的窗口永不视为耗尽。
+- 不改变套餐支持范围或上游协议。
+
+### v0.2.1 English highlights — 2026-11-12
+
+- **Quota windows now cascade by hierarchy.** The monthly, weekly and 5-hour windows nest, so a spent longer window forces the shorter ones to render as exhausted even when the upstream still reports headroom — otherwise the UI invites requests the account cannot serve.
+- Propagation is downward only: a spent week zeroes the 5-hour window; a spent 5-hour window leaves the week and month untouched.
+- When any window is spent, the standard quota fetch fails with the exhausted window named (monthly / weekly / 5-hour) instead of returning a 0%-remaining card that reads as idle.
+- Exhaustion counts an `exceeded` status or `used >= cap`; `unlimited` and zero-cap windows are never exhausted.
+- No plan-support or upstream-protocol changes.
+
 ## v0.2.0 — 2026-11-12
 
 - **插件改名为 `commandcode-or-or-cliproxyapi`**（原 `commandcode-go-cliproxyapi`）。新名字不再含 `go`，避免与 CommandCode Go 套餐混淆。

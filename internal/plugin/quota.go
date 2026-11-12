@@ -368,6 +368,10 @@ func fetchQuota(ctx context.Context, bridge *HostBridge, baseURL string, timeout
 	if usage.Month != nil {
 		usage.Month.ResetsAt = periodEndRFC3339(periodEnd)
 	}
+	// Fold the shorter windows under an exhausted longer one before anyone
+	// reads the snapshot, so the plugin page, the stdlib quota provider and
+	// availability decisions all see the same numbers.
+	applyWindowHierarchy(&usage)
 	if raw, errWho := get(accountWhoamiPath); errWho == nil {
 		var who accountWhoami
 		if json.Unmarshal(raw, &who) == nil {
@@ -461,4 +465,72 @@ func windowFromAccount(w accountWindow, limited bool) quotaWindow {
 		out.ResetsAt = time.UnixMilli(w.ResetAt).UTC().Format(time.RFC3339)
 	}
 	return out
+}
+
+// exhausted reports whether a window has no remaining allowance. "unlimited"
+// windows never count as exhausted even at 100% used, because a cap of zero
+// means the window imposes no limit.
+func (w quotaWindow) exhausted() bool {
+	if w.Status == "unlimited" {
+		return false
+	}
+	if w.Status == "exceeded" {
+		return true
+	}
+	return w.Cap > 0 && w.Used >= w.Cap
+}
+
+// zeroWindow renders one window as fully consumed, keeping its cap so the bar
+// still has a denominator and its reset instant so the user knows when the
+// underlying limit lifts.
+func zeroWindow(w quotaWindow) quotaWindow {
+	out := w
+	out.Used = w.Cap
+	out.Percent = 100
+	out.Status = "exceeded"
+	return out
+}
+
+// applyWindowHierarchy enforces the nesting order month > weekly > five_hour.
+//
+// The upstream reports each window independently, so an exhausted weekly
+// window can arrive beside a five-hour window that still shows headroom. That
+// reading is misleading: the shorter window is carved out of the longer one,
+// so once the week is spent there is no five-hour allowance left to spend.
+// Rendering the shorter windows as full would tell the user to keep going, and
+// they would only meet upstream refusals.
+//
+// Only downward propagation applies — a spent 5-hour window says nothing about
+// the week, so the longer windows keep their own values.
+func applyWindowHierarchy(u *quotaUsage) {
+	if u == nil {
+		return
+	}
+	// Month is nil for unknown plans (no denominator), which imposes nothing.
+	if u.Month != nil && u.Month.exhausted() {
+		u.Weekly = zeroWindow(u.Weekly)
+		u.FiveHour = zeroWindow(u.FiveHour)
+		return
+	}
+	if u.Weekly.exhausted() {
+		u.FiveHour = zeroWindow(u.FiveHour)
+	}
+}
+
+// exhaustedWindow names the longest window that has no allowance left, or ""
+// when the credential still has quota. Month wins over weekly over five-hour
+// so the reported reason names the limit that actually blocks the account.
+func (u *quotaUsage) exhaustedWindow() string {
+	if u == nil {
+		return ""
+	}
+	switch {
+	case u.Month != nil && u.Month.exhausted():
+		return "month"
+	case u.Weekly.exhausted():
+		return "weekly"
+	case u.FiveHour.exhausted():
+		return "five_hour"
+	}
+	return ""
 }
