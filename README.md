@@ -70,7 +70,7 @@ Without this plugin, a manual CommandCode GOAT / Pro / Max integration must mana
 
 ## Requirements
 
-- **CLIProxyAPI**: `v7.2.159+` (the standard quota-provider capability this release registers first appears there)
+- **CLIProxyAPI**: `v8.0.43+` (first release with the quota provider and the cooldown error fields this plugin reports)
 - **Go Toolchain**: Go 1.26+ (CGO enabled for `-buildmode=c-shared`)
 
 ## v0.1.4 upgrade and release notes

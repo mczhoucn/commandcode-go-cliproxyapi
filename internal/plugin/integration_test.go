@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"commandcode-go-cliproxyapi/internal/config"
 )
@@ -203,6 +203,28 @@ func writeSSE(w http.ResponseWriter, frames []string) {
 	}
 }
 
+// writeSSEThenDrain sends the frames, then aborts the connection without a
+// terminating chunk. The client observes the frames followed by an unexpected
+// EOF, which is what a mid-stream upstream death looks like after the first
+// byte reached the client.
+func writeSSEThenDrain(w http.ResponseWriter, frames []string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	for _, f := range frames {
+		_, _ = io.WriteString(w, f)
+		fl.Flush()
+	}
+	if hj, ok := w.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			_ = conn.Close()
+		}
+	}
+}
+
 // mockCommandCode is a stand-in CommandCode server with mutable outage state,
 // swappable catalog / messages payloads, and a scriptable chat endpoint.
 type mockCommandCode struct {
@@ -226,6 +248,7 @@ type mockCommandCode struct {
 	chatHits             int
 	chatPlan             func(hit int) (status int, retryAfter string, body string)
 	chatFrames           []string
+	chatTruncate         bool
 	chatBody             string
 	authSeen             []string
 }
@@ -269,9 +292,14 @@ func newMockCommandCode(t *testing.T) *mockCommandCode {
 		if stream, _ := parsed["stream"].(bool); stream {
 			st.mu.Lock()
 			frames := st.chatFrames
+			truncate := st.chatTruncate
 			st.mu.Unlock()
 			if len(frames) == 0 {
 				frames = chatSSEFrames
+			}
+			if truncate {
+				writeSSEThenDrain(w, frames)
+				return
 			}
 			writeSSE(w, frames)
 			return
@@ -363,6 +391,14 @@ func (st *mockCommandCode) setMessagesBody(body string) {
 func (st *mockCommandCode) setChatFrames(frames []string) {
 	st.mu.Lock()
 	st.chatFrames = frames
+	st.mu.Unlock()
+}
+
+// setChatTruncate makes the chat stream abort after its frames, simulating an
+// upstream that dies mid-response.
+func (st *mockCommandCode) setChatTruncate(truncate bool) {
+	st.mu.Lock()
+	st.chatTruncate = truncate
 	st.mu.Unlock()
 }
 
@@ -467,8 +503,8 @@ func TestRegisterAndDiscover(t *testing.T) {
 
 	var reg registrationResult
 	decodeResult(t, mustHandle(t, m, "plugin.register", lifecycleRequestBody(integrationYAML("http://unused.invalid"))), &reg)
-	if reg.SchemaVersion != pluginabi.SchemaVersion {
-		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	if reg.SchemaVersion != declaredSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, declaredSchemaVersion)
 	}
 	if !reg.Capabilities.ModelProvider || !reg.Capabilities.AuthProvider || !reg.Capabilities.Executor {
 		t.Fatalf("capabilities = %+v", reg.Capabilities)

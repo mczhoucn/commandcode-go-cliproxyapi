@@ -70,7 +70,7 @@ CommandCode GOAT / Pro / Max 通过它的 OpenAI 兼容入口访问：
 
 ## 环境要求
 
-- **CLIProxyAPI**：`v7.2.159+`（本版本注册的标准配额提供者能力从该版本开始支持）
+- **CLIProxyAPI**：`v8.0.43+`（首个同时支持配额提供者和本插件上报的冷却错误字段的版本）
 - **Go**：1.26+（`-buildmode=c-shared` 需要启用 CGO）
 
 ## v0.1.4 升级与发布说明

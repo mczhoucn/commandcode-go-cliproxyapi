@@ -70,7 +70,7 @@ internal/adapter/chatcompletions|messages|responses
 internal/adapter/shared      shared wire kernels (model rewrite, content parts,
                              reasoning normalization, SSE framers/emitters, usage)
 internal/thinking            budget <-> effort mapping with capability clamping
-internal/errclass            error classes, status classification, secret redaction
+internal/errclass            error classes, upstream parsing, cooldown scope, redaction
 internal/config              YAML load/validate/defaults
 resources                    embedded quota_page.html / oauth_page.html
 ```
@@ -112,7 +112,7 @@ All outbound HTTP must go through `HostBridge` (`host.http.do`, `host.http.do_st
 ### Reasoning, adapters, and errors
 
 - Upstream sends thinking text under `reasoning` / `reasoning_details[].text`, never `reasoning_content`. `shared.BackfillReasoningContent` mirrors it for OpenAI clients; Claude targets get `thinking` blocks; Responses targets get reasoning summary items.
-- `internal/thinking` maps budget↔effort using tables copied from the host SDK (`internal/thinking/convert.go`). They were taken at v7.2.138 and are unchanged in v7.3.20; re-check on any further SDK bump. When a model declares no thinking capability (all CommandCode models today), client efforts are forwarded verbatim rather than locally rejected.
+- `internal/thinking` maps budget↔effort using tables copied from the host SDK (`internal/thinking/convert.go`). They were taken at v7.2.138 and are unchanged in v8.0.67; re-check on any further SDK bump. When a model declares no thinking capability (all CommandCode models today), client efforts are forwarded verbatim rather than locally rejected.
 - Adapters share kernels in `shared` deliberately: identically shaped requests must produce identical policies on all routes (e.g. empty content dropped, tool results text-only, `fc_`-prefixed Responses item IDs, `total_tokens = input + output`). `responses_parity_test.go` and the many `F5`/parity comments pin these cross-route invariants.
 - `errclass` classes are the envelope error codes; all messages pass through `Redact` (bearer, `x-api-key`, query-string keys), and post-first-byte network failures are never retryable. Do not add a code path that forwards an upstream body without redaction.
 
@@ -131,15 +131,33 @@ Changing either surface means keeping both consistent; the plugin page never fet
 
 ### Host SDK compatibility floor
 
-The registration response echoes `pluginabi.SchemaVersion`, which is **6** from SDK v7.2.155 onward. Hosts reject a plugin whose schema is higher than their own, so:
+The plugin pins `declaredSchemaVersion = 6` (`internal/plugin/plugin.go`) instead of echoing `pluginabi.SchemaVersion` (10 in v8.0.67). Hosts reject a plugin whose schema **exceeds** their own, so declaring the newest SDK value would reject every host older than v8.0.50 for features this plugin never calls. Schema 6 is what the plugin actually uses: raw management JSON bodies, plus the cooldown error fields.
 
 | Host version | Behavior |
 |---|---|
-| `< v7.2.155` (schema ≤ 5) | Rejects registration: "plugin schema version 6 is not supported" |
-| `v7.2.155`–`v7.2.158` | Loads and serves traffic; `quota_provider` is an unknown field, so auth-file cards show no quota |
-| `v7.2.159+` | Full standard quota surface |
+| `< v8.0.43` | No cooldown error fields / no quota provider; unsupported |
+| `v8.0.43+` | Full quota surface and cooldown reporting |
 
-The declared minimum in the README is `v7.2.159` because that is where the quota capability first appears, not because earlier hosts cannot load the library. Bumping the SDK dependency changes this floor — verify `pluginabi.SchemaVersion` before assuming compatibility, and check that host-side APIs the plugin calls still exist.
+Verify against the SDK before changing: check that `RetryAfterSeconds`, `CredentialScoped`, and the `ErrorCode*` constants still exist, and that the declared schema does not exceed what older hosts accept. The SDK module path is now `github.com/router-for-me/CLIProxyAPI/v8`.
+
+### Cooldown semantics (why error classification matters)
+
+CPA decides cooldown scope and duration from four envelope fields, so the plugin's job is to report the vendor's error faithfully — never to invent cooling policy. `errclass/upstream.go` encodes this; the shapes were recovered from the vendor CLI (`command-code 1.88.5`, `dist/cli.mjs`: `parseWindowLimitError`, `classifyKind`, `parseSpendCapError`), not guessed.
+
+| Upstream condition | Reported as | CPA effect |
+|---|---|---|
+| `RATE_LIMITED` + `error.rateLimit.window` | `credential_quota`, `CredentialScoped`, `RetryAfterSeconds` from `rateLimit.reset` | Cool the whole credential until upstream reset |
+| `USAGE_EXCEEDED` / credit exhaustion | `credential_quota`, `CredentialScoped` | Cool the whole credential |
+| Plain 429 | `transient_rate_limit` | Cool only the model, no quota record |
+| `model_not_in_plan` / not on endpoint | `model_not_found` | Cool only that model |
+| Request defect (prompt too long) | `request_scoped` | No cooldown, stop rotation |
+| Post-first-byte truncation | `stream_truncated` (via `error_detail` on stream close) | No cooldown, no replay |
+| Client disconnect on emit | `connection_lifecycle` | No cooldown |
+| Dial/TLS/DNS failure | `transient_transport` | Retryable, no cooldown |
+
+Non-JSON upstream bodies fall back to the historical status-only classification, so proxy errors and plain-text failures keep their previous wording. `Retry-After` (delta-seconds or HTTP-date) is admitted only within `(0, 24h]`.
+
+Verified end-to-end against a real v8.0.67 host: a window-exhausted 429 produced `scope: credential, reason: credential_quota, remaining_seconds: 3541` (matching the mock's reset instant), while a plain 429 produced `scope: model, reason: transient_rate_limit`.
 
 ## Versioning and release
 

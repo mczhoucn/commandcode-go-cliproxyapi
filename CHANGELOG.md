@@ -7,7 +7,17 @@
 - 插件现在注册 CPA 的标准配额提供者能力（`QuotaProvider`）：CommandCode 认证文件在管理后台的认证文件列表里可以直接看到套餐与剩余额度进度条，和内置 provider 一致，不再只存在于插件自己的页面。
 - 标准卡片显示 5 小时、每周和每月三个窗口的剩余比例、已用/上限与重置时间；CommandCode 只上报剩余月度额度，套餐未知时不显示月度窗口，避免出现没有分母的假进度条。
 - CommandCode 没有重置额度的接口，因此不声明支持重置。
-- 最低支持的 CLIProxyAPI 版本提高到 `v7.2.159`（配额能力从该版本开始提供），插件依赖的 SDK 升级到 `v7.3.20`。低于 `v7.2.155` 的宿主会因注册 schema 版本过高而拒绝加载；`v7.2.155`–`v7.2.158` 可以加载，但只显示插件自己的页面，认证文件卡片没有额度。
+- **模型与凭据冷却改为完全跟随 CPA 配置**：插件现在按 CommandCode 真实的错误形态上报冷却范围与时长，由 CPA 的冷却配置（`routing.cooldown.*`、`disable-cooling`、`transient-error-cooldown-seconds` 等）决定实际行为。
+  - 用量窗口耗尽（`RATE_LIMITED` + `rateLimit.window`）→ 整条凭据冷却，时长取上游给的 reset 时间；
+  - 套餐额度/credit 耗尽 → 整条凭据冷却；
+  - 普通 429 → 只冷却当前模型，不记额度耗尽；
+  - 模型不在套餐内 → 只冷却该模型；
+  - 请求本身的缺陷（提示词过长等）→ 不冷却，也不轮换凭据；
+  - 首字节后流中断 / 客户端断连 → 不冷却、不重放；
+  - 连接、TLS、DNS 失败 → 可重试但不冷却凭据。
+- 上游 `Retry-After` 响应头（秒数或 HTTP 日期）会被透传为冷却时长，异常值（0、负数、超过 24 小时）一律丢弃。
+- 错误分类依据是从官方 CLI `command-code 1.88.5` 中提取的真实处理逻辑，不是推测。
+- 最低支持的 CLIProxyAPI 版本提高到 `v8.0.43`（首个同时具备配额提供者与冷却错误字段的版本），插件依赖的 SDK 升级到 `v8.0.67`。插件只声明 schema 6（自身实际用到的契约），因此更老的宿主不会因为 SDK 新特性而被误拒。
 - 不改变套餐支持范围、认证文件或配置：仍支持 **CommandCode GOAT / Pro / Max，不支持 Go**。已有安装需替换插件库并重启 CPA。
 
 ### v0.1.5 English highlights — 2026-11-12
@@ -15,7 +25,17 @@
 - The plugin now registers CPA's standard `QuotaProvider` capability, so CommandCode credentials render their plan and remaining usage directly on the host's auth-file cards instead of only on the plugin's own page.
 - The standard card shows the 5-hour, weekly, and monthly windows with remaining ratio, used/cap, and reset time. CommandCode reports only remaining monthly credits, so the monthly window is omitted when the plan is unknown rather than drawing a meter with no denominator.
 - Reset is not advertised: CommandCode exposes no quota reset endpoint.
-- Minimum CLIProxyAPI is now `v7.2.159` (the quota capability first appears there) and the SDK dependency moves to `v7.3.20`. Hosts older than `v7.2.155` reject the plugin's schema version at registration; `v7.2.155`–`v7.2.158` load it but show only the plugin's own page, with no quota on auth-file cards.
+- **Model and credential cooldowns now follow CPA's configuration entirely.** The plugin reports the real CommandCode error shape, and CPA's own cooling settings (`routing.cooldown.*`, `disable-cooling`, `transient-error-cooldown-seconds`) decide what actually happens:
+  - usage-window exhaustion (`RATE_LIMITED` + `rateLimit.window`) → cool the whole credential for the upstream reset time;
+  - plan credit exhaustion → cool the whole credential;
+  - a plain 429 → cool only the reporting model, recording no quota exhaustion;
+  - model outside the plan → cool only that model;
+  - request defects (prompt too long, etc.) → no cooldown and no credential rotation;
+  - post-first-byte stream truncation or client disconnect → no cooldown, never replay;
+  - dial/TLS/DNS failures → retryable without cooling the credential.
+- An upstream `Retry-After` header (delta-seconds or HTTP-date) is forwarded as the cooldown duration; bogus values (0, negative, over 24h) are discarded.
+- Classification is derived from the vendor CLI's own logic (`command-code 1.88.5`), not inference.
+- Minimum CLIProxyAPI is now `v8.0.43`, the first release with both the quota provider and these cooldown error fields; the SDK dependency moves to `v8.0.67`. The plugin deliberately declares schema 6 — the contract it actually uses — so older hosts are not rejected for unrelated newer SDK features.
 - No plan-support, auth-file or configuration changes: **CommandCode GOAT / Pro / Max only; Go is not supported**. Replace the plugin library and restart CPA.
 
 ## v0.1.4 — 2026-11-04

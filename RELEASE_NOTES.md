@@ -7,7 +7,8 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 - CommandCode usage now appears on the host's auth-file cards. The plugin registers CPA's `QuotaProvider` capability, so Management Center marks each CommandCode credential as quota-capable and fetches its usage through `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota`.
 - Each card shows the plan plus the 5-hour, weekly, and monthly windows: remaining ratio, used/cap, and reset time. The monthly window is omitted when the plan is unknown, because CommandCode reports only remaining monthly credits.
 - Reset is not advertised — CommandCode has no quota reset endpoint.
-- Minimum CLIProxyAPI rises to `v7.2.159`, the first release with the quota capability; the SDK dependency is now `v7.3.20`. Hosts older than `v7.2.155` reject this release's schema version at registration; `v7.2.155`–`v7.2.158` load it but render no quota on auth-file cards.
+- **Cooldowns now follow CPA's configuration.** The plugin reports CommandCode's real error shape and CPA decides the cooling from its own settings: a usage-window or credit exhaustion cools the whole credential for the upstream reset time, a plain 429 cools only the reporting model, a plan-entitlement failure cools only that model, client-caused request defects cool nothing, post-first-byte truncation and client disconnects cool nothing and are never replayed, and transport failures stay retryable without cooling. An upstream `Retry-After` header is forwarded as the duration.
+- Minimum CLIProxyAPI rises to `v8.0.43`, the first release with both the quota provider and the cooldown error fields; the SDK dependency is now `v8.0.67`. The plugin declares schema 6 — the contract it actually uses — so hosts are not rejected for newer SDK features it never calls.
 - The plugin's own **CommandCode accounts and quota** page is unchanged and still provides key entry and per-card refresh.
 - Supported plans remain **CommandCode GOAT / Pro / Max; CommandCode Go is not supported**. Existing auth files and configuration are unchanged.
 - Upgrade: replace the platform-specific plugin library, restart CPA and refresh Management Center. Publishing a release does not update an already running plugin.
@@ -17,7 +18,8 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 - CommandCode 额度现在会显示在宿主的认证文件卡片上。插件注册 CPA 的 `QuotaProvider` 能力后，管理后台会把每个 CommandCode 认证文件标记为支持额度，并通过 `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota` 获取用量。
 - 每张卡片显示套餐，以及 5 小时、每周、每月三个窗口的剩余比例、已用/上限和重置时间。套餐未知时不显示月度窗口，因为 CommandCode 只上报剩余月度额度。
 - 不声明支持重置：CommandCode 没有重置额度的接口。
-- 最低 CLIProxyAPI 版本提高到 `v7.2.159`（首个提供配额能力的版本），SDK 依赖升级到 `v7.3.20`。低于 `v7.2.155` 的宿主会在注册时因 schema 版本过高而拒绝本插件；`v7.2.155`–`v7.2.158` 可以加载，但认证文件卡片不显示额度。
+- **冷却完全跟随 CPA 配置。** 插件按 CommandCode 真实的错误形态上报，由 CPA 自己的冷却设置决定行为：用量窗口或 credit 耗尽冷却整条凭据并使用上游给的 reset 时长；普通 429 只冷却当前模型；模型不在套餐内只冷却该模型；客户端引起的请求缺陷不冷却；首字节后流中断和客户端断连不冷却、不重放；传输失败可重试但不冷却。上游 `Retry-After` 头会作为冷却时长透传。
+- 最低 CLIProxyAPI 版本提高到 `v8.0.43`（首个同时具备配额提供者和冷却错误字段的版本），SDK 依赖升级到 `v8.0.67`。插件只声明 schema 6（自身实际用到的契约），不会因为未使用的新 SDK 特性而被更老的宿主误拒。
 - 插件自己的 **CommandCode账户与额度** 页面保持不变，仍然提供 key 录入和按卡片刷新。
 - 仍然只支持 **CommandCode GOAT / Pro / Max，不支持 Go 套餐**；不改变已有认证文件和配置。
 - 升级时替换对应平台的插件库、重启 CPA 并刷新管理后台；发布不会自动更新正在运行的插件。

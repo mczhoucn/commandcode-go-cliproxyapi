@@ -1,9 +1,9 @@
 module commandcode-go-cliproxyapi
 
-go 1.26.7
+go 1.26.10
 
 require (
-	github.com/router-for-me/CLIProxyAPI/v7 v7.3.20
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.67
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
 	gopkg.in/yaml.v3 v3.0.1

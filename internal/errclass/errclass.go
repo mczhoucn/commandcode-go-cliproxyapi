@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 // Class is a stable error-category identifier (FR-009) used as the
@@ -26,15 +26,37 @@ const (
 )
 
 // Error describes classified request errors and retryability for CPA execution.
+//
+// The three trailing fields drive CPA's cooldown pipeline (pluginabi.Error):
+// Code, RetryAfterSeconds, and CredentialScoped. Leaving them zero makes the
+// host fall back to its own defaults, which is what produced wrong cooldowns
+// before they were populated — see errclass_cooldown.go.
 type Error struct {
 	Class      Class
 	Message    string
 	StatusCode int
 	Retryable  bool
+	// WireCode overrides Class on the envelope when the host recognizes a
+	// machine-readable code (pluginabi.ErrorCode*). Empty means Class is used.
+	WireCode string
+	// RetryAfterSeconds is upstream retry guidance. Admitted only when the
+	// response carried it; a fabricated value would be worse than none.
+	RetryAfterSeconds int
+	// CredentialScoped marks failures that condemn the whole credential
+	// (account-wide quota/window exhaustion) rather than one model.
+	CredentialScoped bool
 }
 
 func (e *Error) Error() string {
 	return string(e.Class) + ": " + e.Message
+}
+
+// EnvelopeCode is the Code written to the wire: WireCode when set, else Class.
+func (e *Error) EnvelopeCode() string {
+	if e.WireCode != "" {
+		return e.WireCode
+	}
+	return string(e.Class)
 }
 
 // FromStatus classifies an upstream HTTP status per resolved §7.
@@ -73,12 +95,21 @@ func FromStatus(status int, message string) *Error {
 // FromNetwork classifies a PRE-first-byte network/timeout failure; always
 // retryable (§7). Failures observed after the first upstream byte must use
 // PostFirstByteNetwork instead.
+//
+// The transient_transport code keeps CPA from cooling the credential: a
+// dial/TLS/DNS/reset failure says nothing about the account's health, so the
+// request stays eligible for another attempt without benching the account.
 func FromNetwork(err error) *Error {
 	msg := ""
 	if err != nil {
 		msg = Redact(err.Error())
 	}
-	return &Error{Class: ClassNetwork, Message: msg, Retryable: true}
+	return &Error{
+		Class:     ClassNetwork,
+		Message:   msg,
+		Retryable: true,
+		WireCode:  pluginabi.ErrorCodeTransientTransport,
+	}
 }
 
 // PostFirstByteNetwork classifies a network/timeout failure seen AFTER the
@@ -106,12 +137,17 @@ func UpstreamFallback(msg string) *Error {
 // message. Re-redacting at the envelope edge is INTENTIONAL defense-in-depth:
 // constructors already redact (so non-envelope consumers — logs, executor
 // fail paths reading .Message directly) are safe, and Redact is idempotent.
+//
+// The cooldown fields are forwarded verbatim so CPA applies its configured
+// cooling policy to this provider exactly as it does to built-in ones.
 func ToEnvelopeError(e *Error) pluginabi.Error {
 	return pluginabi.Error{
-		Code:       string(e.Class),
-		Message:    Redact(e.Message),
-		Retryable:  e.Retryable,
-		HTTPStatus: e.StatusCode,
+		Code:              e.EnvelopeCode(),
+		Message:           Redact(e.Message),
+		Retryable:         e.Retryable,
+		HTTPStatus:        e.StatusCode,
+		RetryAfterSeconds: e.RetryAfterSeconds,
+		CredentialScoped:  e.CredentialScoped,
 	}
 }
 

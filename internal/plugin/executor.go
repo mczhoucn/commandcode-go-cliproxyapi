@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"commandcode-go-cliproxyapi/internal/adapter/chatcompletions"
 	"commandcode-go-cliproxyapi/internal/adapter/messages"
@@ -119,7 +119,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	}
 	debugTrace("executor received non-stream status=%d body_len=%d", resp.StatusCode, len(resp.Body))
 	if resp.StatusCode >= 400 {
-		return classEnvelope(shared.UpstreamStatusError(resp.StatusCode, resp.Body)), nil
+		return classEnvelope(shared.UpstreamStatusErrorWithHeaders(resp.StatusCode, resp.Body, resp.Headers)), nil
 	}
 	// Parse/envelope guard only; true OOM prevention belongs to the host transport's byte cap.
 	if int64(len(resp.Body)) > res.cfg.MaxResponseBytes {
@@ -370,7 +370,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
-	st, _, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
+	st, respHeaders, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
 		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
@@ -393,7 +393,9 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 			}
 			_ = m.bridge.StreamClose(id)
 		}
-		return classEnvelope(shared.UpstreamStatusError(st, body)), nil
+		// Headers carry the upstream Retry-After hint, which CPA turns into the
+		// cooldown deadline for this credential or model.
+		return classEnvelope(shared.UpstreamStatusErrorWithHeaders(st, body, respHeaders)), nil
 	}
 
 	downID := req.StreamID
@@ -411,13 +413,25 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 
 func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string) {
 	var closeOnce sync.Once
-	closeStreams := func(downErrMsg string) {
+	// closeStreams ends both streams. A structured detail is passed through so
+	// CPA can apply its configured cooldown policy to a post-first-byte failure
+	// instead of falling back to host defaults; nil keeps the plain-message path.
+	closeStreams := func(downErrMsg string, eErr *errclass.Error) {
 		closeOnce.Do(func() {
 			_ = m.bridge.StreamClose(upstreamID)
+			if eErr != nil {
+				wire := errclass.ToEnvelopeError(eErr)
+				label := downErrMsg
+				if label == "" {
+					label = wire.Message
+				}
+				_ = m.bridge.StreamCloseDownstreamError(downID, label, &wire)
+				return
+			}
 			_ = m.bridge.StreamCloseDownstream(downID, downErrMsg)
 		})
 	}
-	defer closeStreams("")
+	defer closeStreams("", nil)
 
 	var aborted atomic.Bool
 	watchdog := time.AfterFunc(res.cfg.RequestTimeout, func() {
@@ -442,29 +456,32 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		debugTrace("executor stream read chunk_len=%d closed=%t readErrMsg=%q err=%v", len(payload), closed, readErrMsg, err)
 		upstreamClosed = closed
 		if aborted.Load() {
-			closeStreams(errclass.Redact("stream exceeded request-timeout"))
+			closeStreams(errclass.Redact("stream exceeded request-timeout"), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
 		if err != nil {
-			closeStreams(errclass.Redact(err.Error()))
+			closeStreams(errclass.Redact(err.Error()), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
 		if readErrMsg != "" {
-			closeStreams(errclass.Redact(readErrMsg))
+			closeStreams(errclass.Redact(readErrMsg), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
 		total += int64(len(payload))
 		if total > res.cfg.MaxResponseBytes {
-			closeStreams(errclass.Redact("stream exceeded max-response-bytes"))
+			closeStreams(errclass.Redact("stream exceeded max-response-bytes"), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
 		events, done, convErr := conv.Feed(payload)
 		if convErr != nil {
-			closeStreams(errclass.Redact(convErr.Message))
+			closeStreams(errclass.Redact(convErr.Message), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
 		if emitErr := m.emitAll(downID, events); emitErr != nil {
-			closeStreams(errclass.Redact(emitErr.Error()))
+			// A downstream write failure is the client going away, not an
+			// upstream health signal: the connection-lifecycle code keeps CPA
+			// from cooling a perfectly good credential for it.
+			closeStreams(errclass.Redact(emitErr.Error()), errclass.PostFirstByteConnectionLifecycle("downstream consumer closed"))
 			return
 		}
 		convDone = done
@@ -477,7 +494,7 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		if flusher, ok := conv.(interface{ Flush() [][]byte }); ok {
 			flushed := flusher.Flush()
 			if emitErr := m.emitAll(downID, flushed); emitErr != nil {
-				closeStreams(errclass.Redact(emitErr.Error()))
+				closeStreams(errclass.Redact(emitErr.Error()), errclass.PostFirstByteConnectionLifecycle("downstream consumer closed"))
 				return
 			}
 		}

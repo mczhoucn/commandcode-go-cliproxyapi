@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"commandcode-go-cliproxyapi/internal/catalog"
 	"commandcode-go-cliproxyapi/internal/config"
@@ -41,6 +41,20 @@ const githubRepoURL = "https://github.com/mczhoucn/commandcode-go-cliproxyapi"
 // FR-002 empty/stale semantics; the ticker retries at refresh-interval with
 // the full request-timeout.
 const registerRefreshTimeout = 10 * time.Second
+
+// declaredSchemaVersion is the RPC schema this plugin actually uses, NOT the
+// highest schema the pinned SDK knows.
+//
+// pluginabi.SchemaVersion tracks the newest SDK feature (10 as of v8.0.67) and
+// declaring it would reject every host older than v8.0.50 for features this
+// plugin never calls. Everything here needs at most:
+//   - 6: raw management JSON bodies (quota/OAuth pages are served unescaped)
+//   - the cooldown fields (RetryAfterSeconds, CredentialScoped) and the
+//     ErrorCode* vocabulary, present since v8.0.43
+//
+// Hosts reject a plugin whose schema EXCEEDS their own, so pinning the floor
+// here keeps v8.0.43+ working. Raise it only when adopting a newer capability.
+const declaredSchemaVersion uint32 = 6
 
 // Manager owns dispatcher state (config snapshot, catalog manager, refresh
 // loop) and routes every RPC method. Safe for concurrent HandleCall use.
@@ -197,7 +211,7 @@ type registrationResult struct {
 func registrationEnvelope() []byte {
 	formats := []string{"openai", "claude", "openai-response"}
 	return okEnvelope(registrationResult{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: declaredSchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
