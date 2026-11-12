@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -989,16 +990,54 @@ func RedactedSnippet(s string) string {
 // truncates to this size before scanning (FR-011).
 const snippetBound = 4096
 
-// UpstreamStatusError classifies an upstream >=400 response body into one
-// kernel used by every adapter and the executor: the body is truncated to
-// its head before redacted-snippet extraction, then classified per §7 via
-// errclass.FromStatus. One kernel keeps bounding and redaction from
-// diverging across call sites.
+// UpstreamStatusError classifies an upstream >=400 response into one kernel
+// used by every adapter and the executor. The body is truncated to its head
+// before parsing, then errclass.FromUpstream reads CommandCode's own error
+// vocabulary (RATE_LIMITED windows, USAGE_EXCEEDED, credit exhaustion,
+// plan-entitlement) to set cooldown scope and Retry-After for CPA.
+//
+// Keeping one kernel means bounding, redaction, and cooldown classification
+// cannot diverge between the streaming and non-streaming paths.
 func UpstreamStatusError(status int, body []byte) *errclass.Error {
+	return UpstreamStatusErrorWithHeaders(status, body, nil)
+}
+
+// UpstreamStatusErrorWithHeaders is UpstreamStatusError plus the upstream
+// response headers, so a standard Retry-After hint is admitted when present.
+//
+// A body that is not the vendor's JSON error object keeps the historical
+// snippet treatment (redact + 80-char truncation); a structured error carries
+// the vendor's own message instead of a truncated JSON blob.
+func UpstreamStatusErrorWithHeaders(status int, body []byte, headers http.Header) *errclass.Error {
 	if len(body) > snippetBound {
 		body = body[:snippetBound]
 	}
-	return errclass.FromStatus(status, RedactedSnippet(string(body)))
+	if !looksLikeStructuredError(body) {
+		return errclass.FromUpstreamHeaders(status, []byte(RedactedSnippet(string(body))), headers)
+	}
+	return errclass.FromUpstreamHeaders(status, body, headers)
+}
+
+// looksLikeStructuredError reports whether the body is a JSON object that
+// carries a vendor error code or message, i.e. a shape FromUpstream can read
+// without falling back to the raw-body snippet path.
+func looksLikeStructuredError(body []byte) bool {
+	var probe struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Error   *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return false
+	}
+	if strings.TrimSpace(probe.Code) != "" || strings.TrimSpace(probe.Message) != "" {
+		return true
+	}
+	return probe.Error != nil &&
+		(strings.TrimSpace(probe.Error.Code) != "" || strings.TrimSpace(probe.Error.Message) != "")
 }
 
 // ResponsesUsage is the token-usage block of synthesized Responses

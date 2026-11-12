@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"commandcode-go-cliproxyapi/internal/adapter/shared"
 	"commandcode-go-cliproxyapi/internal/catalog"
@@ -819,7 +819,9 @@ func TestExecuteStreamOpenTransportError(t *testing.T) {
 		t.Fatalf("execute_stream: %v", err)
 	}
 	env := decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassNetwork) || !env.Error.Retryable {
+	// A pre-first-byte transport failure is retryable and must NOT cool the
+	// credential, so it carries CPA's transient_transport code.
+	if env.OK || env.Error == nil || env.Error.Code != pluginabi.ErrorCodeTransientTransport || !env.Error.Retryable {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostStreamEmit)); got != 0 {
@@ -1318,7 +1320,8 @@ func TestExecuteTransportErrorClassified(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	env := mustExecute(t, m, "commandcode/glm-5.3", "openai", []byte(ccRequestBody))
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassNetwork) {
+	// Transport failures stay retryable without cooling the credential.
+	if env.OK || env.Error == nil || env.Error.Code != pluginabi.ErrorCodeTransientTransport {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 }

@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"commandcode-go-cliproxyapi/internal/catalog"
 	"commandcode-go-cliproxyapi/internal/config"
@@ -25,7 +25,7 @@ const ProviderID = "commandcode"
 // pluginName / pluginVersion are reported in registration metadata.
 const (
 	pluginName    = "commandcode-go-cliproxyapi"
-	pluginVersion = "0.1.4"
+	pluginVersion = "0.1.5"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
@@ -41,6 +41,20 @@ const githubRepoURL = "https://github.com/mczhoucn/commandcode-go-cliproxyapi"
 // FR-002 empty/stale semantics; the ticker retries at refresh-interval with
 // the full request-timeout.
 const registerRefreshTimeout = 10 * time.Second
+
+// declaredSchemaVersion is the RPC schema this plugin actually uses, NOT the
+// highest schema the pinned SDK knows.
+//
+// pluginabi.SchemaVersion tracks the newest SDK feature (10 as of v8.0.67) and
+// declaring it would reject every host older than v8.0.50 for features this
+// plugin never calls. Everything here needs at most:
+//   - 6: raw management JSON bodies (quota/OAuth pages are served unescaped)
+//   - the cooldown fields (RetryAfterSeconds, CredentialScoped) and the
+//     ErrorCode* vocabulary, present since v8.0.43
+//
+// Hosts reject a plugin whose schema EXCEEDS their own, so pinning the floor
+// here keeps v8.0.43+ working. Raise it only when adopting a newer capability.
+const declaredSchemaVersion uint32 = 6
 
 // Manager owns dispatcher state (config snapshot, catalog manager, refresh
 // loop) and routes every RPC method. Safe for concurrent HandleCall use.
@@ -88,6 +102,15 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 		return m.handleModels()
 	case pluginabi.MethodModelForAuth:
 		return m.handleModelsForAuth(request)
+	case pluginabi.MethodQuotaIdentifier, pluginabi.MethodQuotaDescribe,
+		pluginabi.MethodQuotaFetch, pluginabi.MethodQuotaReset:
+		// The QuotaProvider capability is advertised at registration, so these
+		// methods are always routed here: a host that speaks them gets the
+		// normalized shape; one that does not never calls them.
+		if resp, handled, err := m.handleQuotaMethod(method, request); handled {
+			return resp, err
+		}
+		return ErrEnvelope("unknown_method", "unknown method: "+method), nil
 	case pluginabi.MethodPluginShutdown:
 		return m.handleShutdown()
 	case pluginabi.MethodExecutorExecute:
@@ -173,6 +196,10 @@ type capabilities struct {
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	ManagementAPI         bool                         `json:"management_api"`
+	// QuotaProvider advertises the standard CPA quota surface so auth-file
+	// cards can render CommandCode usage next to built-in providers. Hosts
+	// older than the capability simply ignore the field.
+	QuotaProvider bool `json:"quota_provider,omitempty"`
 }
 
 type registrationResult struct {
@@ -184,7 +211,7 @@ type registrationResult struct {
 func registrationEnvelope() []byte {
 	formats := []string{"openai", "claude", "openai-response"}
 	return okEnvelope(registrationResult{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: declaredSchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
@@ -200,6 +227,7 @@ func registrationEnvelope() []byte {
 			ExecutorInputFormats:  formats,
 			ExecutorOutputFormats: formats,
 			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	})
 }

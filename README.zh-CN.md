@@ -64,12 +64,13 @@ CommandCode GOAT / Pro / Max 通过它的 OpenAI 兼容入口访问：
   - OpenAI 客户端：每个 chunk 回填 `reasoning_content`，厂商原始字段保持不变。
 - **能力感知的思考控制**：有效的目录 `thinking` 元数据为相关转换分支提供能力校验和预算边界。`route-overrides` 只选择协议与端点，不能声明思考能力；缺少声明时以上游是否接受为准。`auto`/`none` 并非所有路径都会自动省略，详见下方思考强度说明。
 - **动态目录发现**：远程目录 + 本地兜底、去重，并对被排除的模型给出诊断。至少有一个启用的账户时才会发现目录。
+- **标准配额提供者**：插件注册 CPA 的 `QuotaProvider` 能力，CommandCode 认证文件卡片可以直接显示套餐和 5 小时/每周/每月剩余用量，与内置 provider 一致。
 - **CommandCode账户与额度**：管理后台菜单是 **CommandCode**，页面是 **CommandCode账户与额度**。粘贴 API key 并保存为认证文件后，可查看每个账户的邮箱、套餐、剩余套餐额度，以及滚动 5 小时/每周窗口（已用、上限、重置时间）；每张卡片按需独立刷新。没有账户也可以启动。
 - **宿主认证调度**：启用的认证文件账户经 CLIProxyAPI 调度器跨协议共享。插件配置里没有密钥池，旧的 `api-keys` 也不会被导入进去。
 
 ## 环境要求
 
-- **CLIProxyAPI**：`v7.2.138+`
+- **CLIProxyAPI**：`v8.0.43+`（首个同时支持配额提供者和本插件上报的冷却错误字段的版本）
 - **Go**：1.26+（`-buildmode=c-shared` 需要启用 CGO）
 
 ## v0.1.4 升级与发布说明
@@ -184,8 +185,9 @@ API key 不写在这份 YAML 里。CLIProxyAPI 认证文件是唯一来源。
 
 ### 配额页面
 
-额度显示在插件自己的页面。当前尚未接入 CPA 认证文件卡片使用的标准额度查询能力（`QuotaProvider`），通过 OAuth 新增也不会自动让该卡片显示额度。
-管理后台 → **CommandCode** 里的 **CommandCode账户与额度** 页面读取与 `base-url` 同源的账号接口：
+额度现在有两处入口。插件注册了标准的 `QuotaProvider` 能力，管理后台认证文件列表中每个 CommandCode 认证文件会像内置 provider 一样直接显示用量和进度条（宿主会标记 `supports_quota`，并用该凭据调用 `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota`）。插件自己的 **CommandCode账户与额度** 页面（管理后台 → **CommandCode**）另外提供 key 录入、按卡片刷新和账户列表。
+
+两处读取同一套账号接口，与 `base-url` 同源：
 
 | 接口 | 用途 |
 |---|---|
@@ -193,7 +195,7 @@ API key 不写在这份 YAML 里。CLIProxyAPI 认证文件是唯一来源。
 | `GET {authority}/alpha/billing/subscriptions` | 套餐 id/状态 |
 | `GET {authority}/alpha/whoami?limits=1` | 卡片标题用的账号邮箱 |
 
-`{authority}` 由 `base-url` 去掉 provider 路径（`/provider/v1`）得到。卡片对应宿主认证文件，而不是 `api-keys` 条目。加载列表时，缺少邮箱的账户可能会自动查询一次以补全信息；其余由用户按卡片手动刷新。页面没有定时额度轮询，配额数值也不参与路由决策。
+`{authority}` 由 `base-url` 去掉 provider 路径（`/provider/v1`）得到。卡片对应宿主认证文件，而不是 `api-keys` 条目。加载列表时，缺少邮箱的账户可能会自动查询一次以补全信息；其余由用户按卡片手动刷新。页面没有定时额度轮询，配额数值也不参与路由决策。标准接口只上报剩余比例，且不声明支持重置，因为 CommandCode 没有重置额度的接口。
 
 **邮箱同步的已知限制**：查到邮箱后，插件会尽量写回原认证文件，让插件页和宿主认证文件页都能显示邮箱。写回前会检查文件是否已删除或更改，但最后一次检查与替换文件之间仍存在竞争窗口；同时删除、禁用或修改备注，可能被旧内容覆盖，删除的文件也可能被重新创建。当前选择保留两处显示邮箱的行为，未消除这一风险。建议等额度刷新结束后再修改认证文件，操作后刷新列表确认结果。
 

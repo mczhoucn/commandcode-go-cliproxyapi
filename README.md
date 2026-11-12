@@ -64,12 +64,13 @@ Without this plugin, a manual CommandCode GOAT / Pro / Max integration must mana
   - OpenAI clients get `reasoning_content` backfilled onto each chunk while the vendor fields stay intact.
 - **Capability-aware Reasoning Controls**: valid catalog `thinking` metadata supplies capability checks and budget bounds to the relevant conversion paths. `route-overrides` only selects a protocol and endpoint; it cannot declare thinking capabilities. Without a declaration, upstream acceptance is authoritative. `auto`/`none` are not universally omitted; see Reasoning effort below.
 - **Dynamic Catalog Discovery**: remote catalog with local fallback, deduplication, and diagnostics for what was excluded. Discovery runs only when at least one account is enabled.
+- **Standard quota provider**: the plugin registers CPA's `QuotaProvider` capability, so CommandCode credentials show their plan and remaining 5-hour/weekly/monthly usage directly on the host's auth-file cards, alongside built-in providers.
 - **CommandCode accounts and quota**: Management Center menu **CommandCode**, page **CommandCode accounts and quota** (CommandCode账户与额度). Paste an API key and save it as an auth file, then see each account's email, plan, remaining plan credits, and the rolling 5-hour/weekly windows (used, cap, reset time). Each card refreshes on demand. The plugin can start with no accounts.
 - **Host auth scheduling**: enabled auth-file accounts are shared across protocols by CLIProxyAPI's scheduler. Plugin config does not hold a key pool, and a retired `api-keys` block is not imported into one.
 
 ## Requirements
 
-- **CLIProxyAPI**: `v7.2.138+`
+- **CLIProxyAPI**: `v8.0.43+` (first release with the quota provider and the cooldown error fields this plugin reports)
 - **Go Toolchain**: Go 1.26+ (CGO enabled for `-buildmode=c-shared`)
 
 ## v0.1.4 upgrade and release notes
@@ -184,8 +185,9 @@ API keys are not configured in this YAML. CLIProxyAPI auth files are the only so
 
 ### Quota page
 
-Quota is displayed on the plugin's own page. The standard quota capability used by CPA auth-file cards (`QuotaProvider`) is not registered; adding an account through OAuth does not automatically add quota information to those cards.
-The **CommandCode accounts and quota** page (Management Center → **CommandCode**) reads the account surface on the same authority as `base-url`:
+Quota is available in two places. The plugin registers the standard `QuotaProvider` capability, so each CommandCode auth file in Management Center's auth-file list renders its usage inline like a built-in provider (the host advertises `supports_quota` and calls `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota` with that credential). The plugin's own **CommandCode accounts and quota** page (Management Center → **CommandCode**) additionally offers key entry, per-card refresh, and account listing.
+
+Both surfaces read the same account API on the same authority as `base-url`:
 
 | Endpoint | Purpose |
 |---|---|
@@ -193,7 +195,7 @@ The **CommandCode accounts and quota** page (Management Center → **CommandCode
 | `GET {authority}/alpha/billing/subscriptions` | Plan id/status |
 | `GET {authority}/alpha/whoami?limits=1` | Account email for the card label |
 
-`{authority}` is derived from `base-url` by trimming its provider path (`/provider/v1`). Cards are host auth files, not `api-keys` entries. Loading the list may automatically query accounts missing an email to fill that information; otherwise refresh is manual and per card. There is no periodic quota polling, and quota values never influence routing.
+`{authority}` is derived from `base-url` by trimming its provider path (`/provider/v1`). Cards are host auth files, not `api-keys` entries. Loading the list may automatically query accounts missing an email to fill that information; otherwise refresh is manual and per card. There is no periodic quota polling, and quota values never influence routing. The standard surface reports remaining ratios only and does not advertise reset, because CommandCode exposes no reset endpoint.
 
 **Known email-sync limitation**: after discovering an email, the plugin attempts to update the original auth file so both pages can display it. It checks for prior deletion or changes, but the final check and file replacement are not atomic with host edits. Concurrent deletion, disabling, or metadata edits can be overwritten, and a deleted file can be recreated. Keeping email on both pages retains this risk. Wait for quota refreshes to finish before editing auth files, then reload the list to confirm the result.
 

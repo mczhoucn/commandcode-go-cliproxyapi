@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"commandcode-go-cliproxyapi/internal/catalog"
 	"commandcode-go-cliproxyapi/internal/config"
@@ -468,10 +468,15 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	}
 	var reg registrationResult
 	decodeResult(t, resp, &reg)
-	if reg.SchemaVersion != pluginabi.SchemaVersion {
-		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	// The plugin declares the schema it actually uses, not the SDK's newest, so
+	// it stays loadable on older hosts. It must never exceed the SDK's own.
+	if reg.SchemaVersion != declaredSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, declaredSchemaVersion)
 	}
-	if reg.Metadata.Name != "commandcode-go-cliproxyapi" || reg.Metadata.Version != "0.1.4" ||
+	if reg.SchemaVersion > pluginabi.SchemaVersion {
+		t.Fatalf("declared schema %d exceeds the SDK's %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	}
+	if reg.Metadata.Name != "commandcode-go-cliproxyapi" || reg.Metadata.Version != "0.1.5" ||
 		len(reg.Metadata.ConfigFields) != 0 {
 		t.Fatalf("metadata wrong: %+v", reg.Metadata)
 	}
@@ -874,7 +879,7 @@ func TestRegisterSurvivesNilHostBridge(t *testing.T) {
 		t.Fatalf("registration must survive unavailable host client: %s", resp)
 	}
 	var reg registrationResult
-	if err := json.Unmarshal(env.Result, &reg); err != nil || reg.SchemaVersion != pluginabi.SchemaVersion {
+	if err := json.Unmarshal(env.Result, &reg); err != nil || reg.SchemaVersion != declaredSchemaVersion {
 		t.Fatalf("degraded registration malformed: %s", resp)
 	}
 }
