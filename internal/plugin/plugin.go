@@ -25,7 +25,7 @@ const ProviderID = "commandcode"
 // pluginName / pluginVersion are reported in registration metadata.
 const (
 	pluginName    = "commandcode-go-cliproxyapi"
-	pluginVersion = "0.1.4"
+	pluginVersion = "0.1.5"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
@@ -88,6 +88,15 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 		return m.handleModels()
 	case pluginabi.MethodModelForAuth:
 		return m.handleModelsForAuth(request)
+	case pluginabi.MethodQuotaIdentifier, pluginabi.MethodQuotaDescribe,
+		pluginabi.MethodQuotaFetch, pluginabi.MethodQuotaReset:
+		// The QuotaProvider capability is advertised at registration, so these
+		// methods are always routed here: a host that speaks them gets the
+		// normalized shape; one that does not never calls them.
+		if resp, handled, err := m.handleQuotaMethod(method, request); handled {
+			return resp, err
+		}
+		return ErrEnvelope("unknown_method", "unknown method: "+method), nil
 	case pluginabi.MethodPluginShutdown:
 		return m.handleShutdown()
 	case pluginabi.MethodExecutorExecute:
@@ -173,6 +182,10 @@ type capabilities struct {
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	ManagementAPI         bool                         `json:"management_api"`
+	// QuotaProvider advertises the standard CPA quota surface so auth-file
+	// cards can render CommandCode usage next to built-in providers. Hosts
+	// older than the capability simply ignore the field.
+	QuotaProvider bool `json:"quota_provider,omitempty"`
 }
 
 type registrationResult struct {
@@ -200,6 +213,7 @@ func registrationEnvelope() []byte {
 			ExecutorInputFormats:  formats,
 			ExecutorOutputFormats: formats,
 			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	})
 }

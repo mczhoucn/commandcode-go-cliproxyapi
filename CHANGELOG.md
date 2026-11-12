@@ -2,6 +2,22 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
+## v0.1.5 — 2026-11-12
+
+- 插件现在注册 CPA 的标准配额提供者能力（`QuotaProvider`）：CommandCode 认证文件在管理后台的认证文件列表里可以直接看到套餐与剩余额度进度条，和内置 provider 一致，不再只存在于插件自己的页面。
+- 标准卡片显示 5 小时、每周和每月三个窗口的剩余比例、已用/上限与重置时间；CommandCode 只上报剩余月度额度，套餐未知时不显示月度窗口，避免出现没有分母的假进度条。
+- CommandCode 没有重置额度的接口，因此不声明支持重置。
+- 最低支持的 CLIProxyAPI 版本提高到 `v7.2.159`（配额能力从该版本开始提供），插件依赖的 SDK 升级到 `v7.3.20`。低于 `v7.2.155` 的宿主会因注册 schema 版本过高而拒绝加载；`v7.2.155`–`v7.2.158` 可以加载，但只显示插件自己的页面，认证文件卡片没有额度。
+- 不改变套餐支持范围、认证文件或配置：仍支持 **CommandCode GOAT / Pro / Max，不支持 Go**。已有安装需替换插件库并重启 CPA。
+
+### v0.1.5 English highlights — 2026-11-12
+
+- The plugin now registers CPA's standard `QuotaProvider` capability, so CommandCode credentials render their plan and remaining usage directly on the host's auth-file cards instead of only on the plugin's own page.
+- The standard card shows the 5-hour, weekly, and monthly windows with remaining ratio, used/cap, and reset time. CommandCode reports only remaining monthly credits, so the monthly window is omitted when the plan is unknown rather than drawing a meter with no denominator.
+- Reset is not advertised: CommandCode exposes no quota reset endpoint.
+- Minimum CLIProxyAPI is now `v7.2.159` (the quota capability first appears there) and the SDK dependency moves to `v7.3.20`. Hosts older than `v7.2.155` reject the plugin's schema version at registration; `v7.2.155`–`v7.2.158` load it but show only the plugin's own page, with no quota on auth-file cards.
+- No plan-support, auth-file or configuration changes: **CommandCode GOAT / Pro / Max only; Go is not supported**. Replace the plugin library and restart CPA.
+
 ## v0.1.4 — 2026-11-04
 
 - 修复管理后台启用“记住密码”后，CommandCode 页面仍提示“Enable Remember password”的兼容性问题：管理后台新的 `enc::v2::` 认证存储格式现在可以被插件正确读取。

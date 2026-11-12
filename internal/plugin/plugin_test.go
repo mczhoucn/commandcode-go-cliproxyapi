@@ -471,7 +471,7 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	if reg.SchemaVersion != pluginabi.SchemaVersion {
 		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
-	if reg.Metadata.Name != "commandcode-go-cliproxyapi" || reg.Metadata.Version != "0.1.4" ||
+	if reg.Metadata.Name != "commandcode-go-cliproxyapi" || reg.Metadata.Version != "0.1.5" ||
 		len(reg.Metadata.ConfigFields) != 0 {
 		t.Fatalf("metadata wrong: %+v", reg.Metadata)
 	}
