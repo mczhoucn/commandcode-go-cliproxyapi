@@ -1,18 +1,18 @@
 # CommandCode 双入口认证设计
 
-> 状态：已完成实现、隔离验收与审查，并于 2026-10-19 经另行授权更新到 Kubernetes 中的 CPA；目标公共版本为 [v0.1.2](https://github.com/mczhoucn/commandcode-go-cliproxyapi/releases/tag/v0.1.2)，安装包以该版本发布成功后的附件为准。线上引导页与授权链接已检查，真实账号经新插件核验及保存仍待本人验证。
+> 状态：已完成实现、隔离验收与审查，并于 2026-10-19 经另行授权更新到 Kubernetes 中的 CPA；目标公共版本为 [v0.1.2](https://github.com/mczhoucn/commandcode-or-or-cliproxyapi/releases/tag/v0.1.2)，安装包以该版本发布成功后的附件为准。线上引导页与授权链接已检查，真实账号经新插件核验及保存仍待本人验证。
 > 用户已按 Chrome 指引真实确认 localhost:6000 可进入官方备用页；127.0.0.1:1 和 localhost:1 被拒绝。模拟验证及线上页面检查不替代真实订阅返回值确认。
 
 ## 1. 目标与范围
 
-在现有 `commandcode-go-cliproxyapi` 插件中提供两种新增认证文件的方式：
+在现有 `commandcode-or-or-cliproxyapi` 插件中提供两种新增认证文件的方式：
 
 | 入口 | 用户提供什么 | 最终凭据 |
 | --- | --- | --- |
 | CPA 的 OAuth 登录项 | 在官方网页授权，再复制官方生成的 key 回 CPA 完成 | CommandCode API key |
 | 插件账户页的 API key 表单 | 手动粘贴已有 key | CommandCode API key |
 
-只支持 **CommandCode GOAT / Pro / Max** 有效订阅，**不支持 CommandCode Go**。Go 使用官方 CLI 专用的私有接口与协议，并无本插件所用 Provider API 的访问权限；CPA 当前的 CommandCode 接入没有实现这套私有协议，换用 OAuth 也不能支持 Go。Provider、Team、Ultra 等不在本插件新增支持范围。插件名 `commandcode-go-cliproxyapi` 中的 `go` 继承自 `opencode-go-cliproxyapi`，不代表支持 Go 套餐。
+只支持 **CommandCode GOAT / Pro / Max** 有效订阅，**不支持 CommandCode Go**。Go 使用官方 CLI 专用的私有接口与协议，并无本插件所用 Provider API 的访问权限；CPA 当前的 CommandCode 接入没有实现这套私有协议，换用 OAuth 也不能支持 Go。Provider、Team、Ultra 等不在本插件新增支持范围。插件名 `commandcode-or-or-cliproxyapi` 中的 `go` 继承自 `opencode-go-cliproxyapi`，不代表支持 Go 套餐。
 
 这里的 OAuth 是“官方浏览器授权引导，复制凭据完成”，不是独立的 `access_token` / `refresh_token` 接入。不要宣称自动回调、自动续期或已取得标准第三方 OAuth 客户端资格。
 

@@ -7,7 +7,7 @@ through the official Provider API. **Go is not supported**: it uses an official
 CLI-specific private interface, not an OpenAI-compatible API, and this plugin
 does not implement that private protocol. Independently, Go has **no Provider
 API access**. Whether an account has an API key is therefore not a support test.
-The name `commandcode-go-cliproxyapi` is inherited from `opencode-go-cliproxyapi`;
+The name `commandcode-or-or-cliproxyapi` is inherited from `opencode-go-cliproxyapi`;
 its `go` component does not indicate Go-plan support.
 
 The [official Provider documentation][provider] says every plan except Go has

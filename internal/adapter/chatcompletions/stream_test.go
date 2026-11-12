@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 type sseEvt struct {

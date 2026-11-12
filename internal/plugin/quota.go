@@ -12,7 +12,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/resources"
+	"commandcode-or-or-cliproxyapi/resources"
 )
 
 // Account endpoints (CommandCode account surface). They live on the provider

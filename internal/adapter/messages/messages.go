@@ -10,7 +10,7 @@ package messages
 import (
 	"net/http"
 
-	"commandcode-go-cliproxyapi/internal/catalog"
+	"commandcode-or-or-cliproxyapi/internal/catalog"
 )
 
 // EndpointPath is the upstream endpoint path for the Messages route (FR-004).

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 func feed(t *testing.T, sc *StreamConverter, chunks ...string) ([][]byte, bool, *errclass.Error) {

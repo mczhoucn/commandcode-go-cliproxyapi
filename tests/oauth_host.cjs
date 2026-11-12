@@ -9,7 +9,7 @@ const {createHash} = require("node:crypto");
 const binary=process.env.CPA_HOST_BINARY,library=process.env.CPA_PLUGIN_LIBRARY;
 if(!binary||!library) throw new Error("Set CPA_HOST_BINARY and CPA_PLUGIN_LIBRARY to native binaries");
 const root=fs.mkdtempSync(path.join(os.tmpdir(),"commandcode-oauth-host-"));
-const id="commandcode-go-cliproxyapi", mgmt="/v0/management", plugin=mgmt+"/plugins/"+id;
+const id="commandcode-or-or-cliproxyapi", mgmt="/v0/management", plugin=mgmt+"/plugins/"+id;
 let child,log="",lastKey="";
 const upstream=http.createServer(async(req,res)=>{
   for await(const _ of req) {}

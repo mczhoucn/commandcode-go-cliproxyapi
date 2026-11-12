@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"commandcode-go-cliproxyapi/internal/adapter/shared"
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/adapter/shared"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 // ---- upstream Anthropic Messages response shapes (decode-only) ----

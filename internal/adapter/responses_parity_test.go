@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"commandcode-go-cliproxyapi/internal/adapter/chatcompletions"
-	"commandcode-go-cliproxyapi/internal/adapter/messages"
-	"commandcode-go-cliproxyapi/internal/adapter/responses"
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/adapter/chatcompletions"
+	"commandcode-or-or-cliproxyapi/internal/adapter/messages"
+	"commandcode-or-or-cliproxyapi/internal/adapter/responses"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 type feeder interface {

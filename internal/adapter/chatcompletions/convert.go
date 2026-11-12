@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"commandcode-go-cliproxyapi/internal/adapter/shared"
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/adapter/shared"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 // ---- upstream Chat Completions response shapes (FR-006) ----

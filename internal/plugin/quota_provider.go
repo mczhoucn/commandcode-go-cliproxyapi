@@ -16,8 +16,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/config"
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 // quotaProviderIdentifier is the provider key this quota provider answers for.

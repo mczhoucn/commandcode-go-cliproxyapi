@@ -12,7 +12,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/internal/config"
 )
 
 const testKey = "sk-test-key-123"

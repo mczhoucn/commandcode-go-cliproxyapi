@@ -2,9 +2,33 @@
 
 User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **CommandCode GOAT / Pro / Max**, not CommandCode Go.
 
+## v0.2.0 — Renamed to `commandcode-or-or-cliproxyapi` (2026-11-12)
+
+- The plugin is now **`commandcode-or-or-cliproxyapi`** (formerly `commandcode-go-cliproxyapi`). The new name drops the misleading `go`, which never meant CommandCode Go plan support.
+- **Breaking change** — the plugin ID is part of the host contract:
+  - move the `plugins.configs.commandcode-go-cliproxyapi` entry to the new ID; the old key will not apply;
+  - replace the library with `commandcode-or-or-cliproxyapi.so` / `.dylib` / `.dll` and delete the old file;
+  - management routes are now `/v0/resource/plugins/commandcode-or-or-cliproxyapi/*` and `/v0/management/plugins/commandcode-or-or-cliproxyapi/*`.
+- Existing auth files keep working: the provider key is still `commandcode`, so accounts, models and quota are unaffected. Only the plugin-side ID changed.
+- Behaviour is otherwise identical to v0.1.5.
+- Supported plans remain **CommandCode GOAT / Pro / Max; CommandCode Go is not supported**.
+- Upgrade: replace the library, update the `plugins.configs` key, restart CPA and refresh Management Center.
+
+**中文**
+
+- 插件改名为 **`commandcode-or-or-cliproxyapi`**（原 `commandcode-go-cliproxyapi`）。新名字去掉了容易误解的 `go`，它从来不代表支持 Go 套餐。
+- **不兼容变更** —— 插件 ID 是宿主接口的一部分：
+  - 配置里的 `plugins.configs.commandcode-go-cliproxyapi` 需要改成新 ID，旧键不会生效；
+  - 插件库改名为 `commandcode-or-or-cliproxyapi.so` / `.dylib` / `.dll`，并删除旧文件；
+  - 管理接口路由变为 `/v0/resource/plugins/commandcode-or-or-cliproxyapi/*` 与 `/v0/management/plugins/commandcode-or-or-cliproxyapi/*`。
+- 已有认证文件继续可用：provider 键仍是 `commandcode`，账户、模型和额度都不受影响，改的只是插件侧 ID。
+- 其余行为与 v0.1.5 完全相同。
+- 仍然只支持 **CommandCode GOAT / Pro / Max，不支持 Go 套餐**。
+- 升级时替换插件库、修改 `plugins.configs` 的键、重启 CPA 并刷新管理后台。
+
 ## v0.1.5 — Quota on the standard Management Center cards (2026-11-12)
 
-- CommandCode usage now appears on the host's auth-file cards. The plugin registers CPA's `QuotaProvider` capability, so Management Center marks each CommandCode credential as quota-capable and fetches its usage through `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota`.
+- CommandCode usage now appears on the host's auth-file cards. The plugin registers CPA's `QuotaProvider` capability, so Management Center marks each CommandCode credential as quota-capable and fetches its usage through `POST /v0/management/plugins/commandcode-or-or-cliproxyapi/quota`.
 - Each card shows the plan plus the 5-hour, weekly, and monthly windows: remaining ratio, used/cap, and reset time. The monthly window is omitted when the plan is unknown, because CommandCode reports only remaining monthly credits.
 - Reset is not advertised — CommandCode has no quota reset endpoint.
 - **Cooldowns now follow CPA's configuration.** The plugin reports CommandCode's real error shape and CPA decides the cooling from its own settings: a usage-window or credit exhaustion cools the whole credential for the upstream reset time, a plain 429 cools only the reporting model, a plan-entitlement failure cools only that model, client-caused request defects cool nothing, post-first-byte truncation and client disconnects cool nothing and are never replayed, and transport failures stay retryable without cooling. An upstream `Retry-After` header is forwarded as the duration.
@@ -16,7 +40,7 @@ User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **Comman
 
 **中文**
 
-- CommandCode 额度现在会显示在宿主的认证文件卡片上。插件注册 CPA 的 `QuotaProvider` 能力后，管理后台会把每个 CommandCode 认证文件标记为支持额度，并通过 `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota` 获取用量。
+- CommandCode 额度现在会显示在宿主的认证文件卡片上。插件注册 CPA 的 `QuotaProvider` 能力后，管理后台会把每个 CommandCode 认证文件标记为支持额度，并通过 `POST /v0/management/plugins/commandcode-or-or-cliproxyapi/quota` 获取用量。
 - 每张卡片显示套餐，以及 5 小时、每周、每月三个窗口的剩余比例、已用/上限和重置时间。套餐未知时不显示月度窗口，因为 CommandCode 只上报剩余月度额度。
 - 不声明支持重置：CommandCode 没有重置额度的接口。
 - **冷却完全跟随 CPA 配置。** 插件按 CommandCode 真实的错误形态上报，由 CPA 自己的冷却设置决定行为：用量窗口或 credit 耗尽冷却整条凭据并使用上游给的 reset 时长；普通 429 只冷却当前模型；模型不在套餐内只冷却该模型；客户端引起的请求缺陷不冷却；首字节后流中断和客户端断连不冷却、不重放；传输失败可重试但不冷却。上游 `Retry-After` 头会作为冷却时长透传。

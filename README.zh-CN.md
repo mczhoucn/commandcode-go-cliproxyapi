@@ -8,7 +8,7 @@
 
 > **支持 CommandCode GOAT / Pro / Max，不支持 CommandCode Go 套餐。** Go 使用官方 CLI 专用的私有接口与协议，不是本插件接入的 OpenAI 兼容 Provider API；Go 也没有 Provider API 权限。CPA 当前的 CommandCode 接入未实现这套私有协议，因此不能通过换一种登录方式来使用 Go 套餐。
 >
-> **名称里的 `go` 不代表 Go 套餐。** 当前插件名为 `commandcode-go-cliproxyapi`，沿用自前身 [`opencode-go-cliproxyapi`](https://github.com/massiveits/opencode-go-cliproxyapi) 的命名；不因套餐支持范围而更改插件 ID。
+> **插件名不再带 `go`，也不表示支持 Go 套餐。** 当前插件名为 `commandcode-or-or-cliproxyapi`；旧名 `commandcode-go-cliproxyapi` 沿用自前身 [`opencode-go-cliproxyapi`](https://github.com/massiveits/opencode-go-cliproxyapi)，从来不代表 Go 套餐支持。改名会改变插件 ID，已有安装需要替换插件库，并把 `plugins.configs` 的键改成新 ID。
 
 更新摘要见 [ChangeLog](CHANGELOG.md)，详细历史见 [发布说明](RELEASE_NOTES.md)。
 
@@ -73,27 +73,28 @@ CommandCode GOAT / Pro / Max 通过它的 OpenAI 兼容入口访问：
 - **CLIProxyAPI**：`v8.0.43+`（首个同时支持配额提供者和本插件上报的冷却错误字段的版本）
 - **Go**：1.26+（`-buildmode=c-shared` 需要启用 CGO）
 
-## v0.1.5 升级与发布说明
+## v0.2.0 升级与发布说明
 
-- 本版本注册 CPA 的标准配额提供者能力，CommandCode 认证文件卡片可以直接显示套餐与剩余额度；模型与凭据冷却改为完全跟随 CPA 的冷却配置。
-- 同时补齐 DeepSeek 文档定义的三种客户端协议能力：历史思考内容回传（带 tools 的多轮请求必需）、Anthropic `output_config.effort`、图片 `detail`，以及 Responses 思考事件的双族发送。
-- **不兼容变更**：最低 CLIProxyAPI 版本提高到 `v8.0.43`；插件声明 schema 6，更老的宿主将无法加载。请替换插件库、重启 CPA 并刷新管理后台。
+- **插件改名为 `commandcode-or-or-cliproxyapi`**（原 `commandcode-go-cliproxyapi`）。新名字去掉了容易误解为支持 Go 套餐的 `go`。
+- **不兼容变更**：插件 ID 是宿主接口的一部分。请把 `plugins.configs` 的键改成新 ID，用 `commandcode-or-or-cliproxyapi.<ext>` 替换插件库，并删除旧库。管理接口路由变为 `/v0/{resource,management}/plugins/commandcode-or-or-cliproxyapi/*`。
+- 已有认证文件无需迁移：provider 键仍是 `commandcode`，账户、模型和额度继续可用。
+- 其余行为与 v0.1.5 完全相同。
 - 手动升级时，替换与目标操作系统、处理器架构对应的插件库，重启 CLIProxyAPI，再刷新管理后台。只修改本仓库的版本号，不会更新已经运行的插件。
-- 向 [CPA 插件仓库](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements)提交前，需要发布 GitHub 标签 `v0.1.5`。每个受支持平台应提供 `commandcode-go-cliproxyapi_0.1.5_<goos>_<goarch>.zip`，并提供汇总的 SHA-256 校验文件 `checksums.txt`。推送版本标签后，现有构建流程会生成这些文件。
-- 每个 ZIP 的根目录只能包含一个对应的插件库：`commandcode-go-cliproxyapi.so`、`commandcode-go-cliproxyapi.dylib` 或 `commandcode-go-cliproxyapi.dll`。插件 ID 和仓库地址保持不变；插件仓库通过最新 GitHub Release 获取版本。
+- 向 [CPA 插件仓库](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements)提交前，需要发布 GitHub 标签 `v0.2.0`。每个受支持平台应提供 `commandcode-or-or-cliproxyapi_0.2.0_<goos>_<goarch>.zip`，并提供汇总的 SHA-256 校验文件 `checksums.txt`。推送版本标签后，现有构建流程会生成这些文件。
+- 每个 ZIP 的根目录只能包含一个对应的插件库：`commandcode-or-or-cliproxyapi.so`、`commandcode-or-or-cliproxyapi.dylib` 或 `commandcode-or-or-cliproxyapi.dll`。插件 ID 和仓库地址保持不变；插件仓库通过最新 GitHub Release 获取版本。
 
 
 ## 构建
 
 ```bash
 # Linux (AMD64)
-go build -buildmode=c-shared -o plugins/linux/amd64/commandcode-go-cliproxyapi.so .
+go build -buildmode=c-shared -o plugins/linux/amd64/commandcode-or-or-cliproxyapi.so .
 
 # macOS (ARM64)
-go build -buildmode=c-shared -o plugins/darwin/arm64/commandcode-go-cliproxyapi.dylib .
+go build -buildmode=c-shared -o plugins/darwin/arm64/commandcode-or-or-cliproxyapi.dylib .
 
 # Windows (AMD64)
-go build -buildmode=c-shared -o plugins/windows/amd64/commandcode-go-cliproxyapi.dll .
+go build -buildmode=c-shared -o plugins/windows/amd64/commandcode-or-or-cliproxyapi.dll .
 ```
 
 把产物放到宿主的插件目录（例如 `<cliproxyapi_root>/plugins/<os>/<arch>/`）。
@@ -105,7 +106,7 @@ plugins:
   enabled: true
   dir: /data/plugins
   configs:
-    commandcode-go-cliproxyapi:
+    commandcode-or-or-cliproxyapi:
       # 上游地址（默认 "https://api.commandcode.ai/provider/v1"）
       base-url: "https://api.commandcode.ai/provider/v1"
 
@@ -186,7 +187,7 @@ API key 不写在这份 YAML 里。CLIProxyAPI 认证文件是唯一来源。
 
 ### 配额页面
 
-额度现在有两处入口。插件注册了标准的 `QuotaProvider` 能力，管理后台认证文件列表中每个 CommandCode 认证文件会像内置 provider 一样直接显示用量和进度条（宿主会标记 `supports_quota`，并用该凭据调用 `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota`）。插件自己的 **CommandCode账户与额度** 页面（管理后台 → **CommandCode**）另外提供 key 录入、按卡片刷新和账户列表。
+额度现在有两处入口。插件注册了标准的 `QuotaProvider` 能力，管理后台认证文件列表中每个 CommandCode 认证文件会像内置 provider 一样直接显示用量和进度条（宿主会标记 `supports_quota`，并用该凭据调用 `POST /v0/management/plugins/commandcode-or-or-cliproxyapi/quota`）。插件自己的 **CommandCode账户与额度** 页面（管理后台 → **CommandCode**）另外提供 key 录入、按卡片刷新和账户列表。
 
 两处读取同一套账号接口，与 `base-url` 同源：
 
@@ -235,7 +236,7 @@ npx --yes -p playwright -c 'NODE_PATH=$(dirname $(dirname $(command -v playwrigh
 
 ```bash
 CPA_HOST_BINARY=/绝对路径/cli-proxy-api \
-CPA_PLUGIN_LIBRARY=/绝对路径/commandcode-go-cliproxyapi.dylib \
+CPA_PLUGIN_LIBRARY=/绝对路径/commandcode-or-or-cliproxyapi.dylib \
 node tests/oauth_host.cjs
 ```
 
@@ -249,7 +250,7 @@ node tests/oauth_host.cjs
 - [opencode-go-cliproxyapi](https://github.com/massiveits/opencode-go-cliproxyapi)（v0.1.7）是直接的前身：adapter 内核、catalog、config、auth 和配额页骨架都来自那里；CommandCode 相关的改动——思考内容保真、无能力声明时的 effort 透传、chat-completions 单一默认路由、配额页改用真实账号接口——在其之上适配。
 - [cpa-plugin-commandcode](https://github.com/ahoo/cpa-plugin-commandcode)（ahoo）是更早的一个独立 CommandCode 插件，它的文档最先记录了本插件必须复现的厂商行为：思考文本出现在 `reasoning` / `reasoning_details[].text` 而从不使用标准的 `reasoning_content`；因此必须在 CLIProxyAPI 的 openai→claude 翻译器读取之前回填 `reasoning_content`；流式 `/v1/messages` 要求每个分块带 SSE `data: ` 前缀；上游只接受完整厂商名（`deepseek/deepseek-v4.1-flash`）。
 
-本仓库：<https://github.com/mczhoucn/commandcode-go-cliproxyapi>
+本仓库：<https://github.com/OpenRealmCn/commandcode-or-or-cliproxyapi>
 
 ## 许可证
 

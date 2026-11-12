@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode"
 
-	"commandcode-go-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 

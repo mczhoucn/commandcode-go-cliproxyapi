@@ -121,7 +121,7 @@ const server = http.createServer(async (req, res) => {
     releaseQuota();
     await page.waitForFunction(() => window.__processedQuotaIDs.includes("c"));
     await page.waitForFunction(() => !document.querySelector("#app").textContent.includes("new.json"));
-    assert.equal(await page.evaluate(() => sessionStorage.getItem("commandcode-go-cliproxyapi:quota")?.includes('"c"') || false), false);
+    assert.equal(await page.evaluate(() => sessionStorage.getItem("commandcode-or-or-cliproxyapi:quota")?.includes('"c"') || false), false);
 
     // A slow quota response must not undo a newer enabled/disabled list snapshot.
     holdQuota = true;

@@ -14,9 +14,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/catalog"
-	"commandcode-go-cliproxyapi/internal/config"
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/catalog"
+	"commandcode-or-or-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 // ProviderID is the single provider key served by this plugin (FR-001).
@@ -24,8 +24,8 @@ const ProviderID = "commandcode"
 
 // pluginName / pluginVersion are reported in registration metadata.
 const (
-	pluginName    = "commandcode-go-cliproxyapi"
-	pluginVersion = "0.1.5"
+	pluginName    = "commandcode-or-or-cliproxyapi"
+	pluginVersion = "0.2.0"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
@@ -33,7 +33,7 @@ const (
 // plugin store polls for updates, so it must be the repository this build is
 // published from. The project it was derived from is
 // https://github.com/massiveits/opencode-go-cliproxyapi.
-const githubRepoURL = "https://github.com/mczhoucn/commandcode-go-cliproxyapi"
+const githubRepoURL = "https://github.com/OpenRealmCn/commandcode-or-or-cliproxyapi"
 
 // registerRefreshTimeout bounds ONLY the synchronous initial/reconfigure
 // refreshOnce so a slow catalog cannot block host startup/reconfigure for a

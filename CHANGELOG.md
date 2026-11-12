@@ -2,6 +2,28 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
+## v0.2.0 — 2026-11-12
+
+- **插件改名为 `commandcode-or-or-cliproxyapi`**（原 `commandcode-go-cliproxyapi`）。新名字不再含 `go`，避免与 CommandCode Go 套餐混淆。
+- **这是不兼容变更**，因为插件 ID 是宿主接口的一部分：
+  - 配置里的 `plugins.configs.commandcode-go-cliproxyapi` 需要改成新 ID，否则配置不会生效；
+  - 插件库文件名改为 `commandcode-or-or-cliproxyapi.<ext>`，旧的同名库需要删除；
+  - 管理接口路由变为 `/v0/resource/plugins/commandcode-or-or-cliproxyapi/*` 与 `/v0/management/plugins/commandcode-or-or-cliproxyapi/*`；
+  - 已保存的认证文件（`commandcode-key-<hash>.json`）内容不受影响，其中的 `type` 仍是 `commandcode`；provider 键没有变，账户和额度会继续显示。
+- 功能与 v0.1.5 相同，没有其他行为变化。
+- 仍支持 **CommandCode GOAT / Pro / Max，不支持 Go**。
+
+### v0.2.0 English highlights — 2026-11-12
+
+- **Renamed to `commandcode-or-or-cliproxyapi`** (was `commandcode-go-cliproxyapi`). The name no longer carries a `go` that could be mistaken for CommandCode Go plan support.
+- **Breaking**, because the plugin ID is part of the host contract:
+  - the `plugins.configs.commandcode-go-cliproxyapi` entry must move to the new ID or the configuration will not apply;
+  - the library is now `commandcode-or-or-cliproxyapi.<ext>`; remove the old library;
+  - management routes move to `/v0/resource/plugins/commandcode-or-or-cliproxyapi/*` and `/v0/management/plugins/commandcode-or-or-cliproxyapi/*`;
+  - existing auth files (`commandcode-key-<hash>.json`) need no change: their `type` is still `commandcode`, so accounts and quota keep working.
+- Behaviour is identical to v0.1.5; nothing else changed.
+- Still **CommandCode GOAT / Pro / Max only; Go is not supported**.
+
 ## v0.1.5 — 2026-11-12
 
 - **补齐 DeepSeek 文档所定义的下游能力**（三种客户端协议均已覆盖）：

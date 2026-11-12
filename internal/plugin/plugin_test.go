@@ -17,8 +17,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/catalog"
-	"commandcode-go-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/internal/catalog"
+	"commandcode-or-or-cliproxyapi/internal/config"
 )
 
 // ---- test doubles -------------------------------------------------------
@@ -476,7 +476,7 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	if reg.SchemaVersion > pluginabi.SchemaVersion {
 		t.Fatalf("declared schema %d exceeds the SDK's %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
-	if reg.Metadata.Name != "commandcode-go-cliproxyapi" || reg.Metadata.Version != "0.1.5" ||
+	if reg.Metadata.Name != "commandcode-or-or-cliproxyapi" || reg.Metadata.Version != "0.2.0" ||
 		len(reg.Metadata.ConfigFields) != 0 {
 		t.Fatalf("metadata wrong: %+v", reg.Metadata)
 	}

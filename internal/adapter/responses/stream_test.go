@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 // chunked splits a raw stream into small pieces so every test also

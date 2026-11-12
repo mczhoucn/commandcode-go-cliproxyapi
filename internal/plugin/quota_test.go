@@ -11,8 +11,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/config"
-	"commandcode-go-cliproxyapi/resources"
+	"commandcode-or-or-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/resources"
 )
 
 func TestManagementRegistration(t *testing.T) {
@@ -491,7 +491,7 @@ func TestQuotaPageIsStaticAndSecretFree(t *testing.T) {
 func TestQuotaPageUsesManualSessionCache(t *testing.T) {
 	page := resources.QuotaPage
 	for _, marker := range []string{
-		`const storageKey = "commandcode-go-cliproxyapi:quota"`,
+		`const storageKey = "commandcode-or-or-cliproxyapi:quota"`,
 		"sessionStorage.getItem(storageKey)",
 		"sessionStorage.setItem(storageKey, JSON.stringify(cache))",
 		"JSON.parse(stored)",

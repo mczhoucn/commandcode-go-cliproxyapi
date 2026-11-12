@@ -6,7 +6,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 func TestCanonicalLevelsOrder(t *testing.T) {

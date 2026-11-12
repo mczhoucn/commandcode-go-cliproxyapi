@@ -131,11 +131,11 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
   const reloadButton = document.getElementById("reload-accounts");
   const listStatus = document.getElementById("list-status");
   const legacyStatus = document.getElementById("legacy-status");
-  const marker = "/v0/resource/plugins/commandcode-go-cliproxyapi/quota";
+  const marker = "/v0/resource/plugins/commandcode-or-or-cliproxyapi/quota";
   const prefix = location.pathname.endsWith(marker) ? location.pathname.slice(0, -marker.length) : "";
-  const quotaEndpoint = prefix + "/v0/management/plugins/commandcode-go-cliproxyapi/quota-usage";
-  const accountsEndpoint = prefix + "/v0/management/plugins/commandcode-go-cliproxyapi/accounts";
-  const storageKey = "commandcode-go-cliproxyapi:quota";
+  const quotaEndpoint = prefix + "/v0/management/plugins/commandcode-or-or-cliproxyapi/quota-usage";
+  const accountsEndpoint = prefix + "/v0/management/plugins/commandcode-or-or-cliproxyapi/accounts";
+  const storageKey = "commandcode-or-or-cliproxyapi:quota";
   const values = new Map();
   const labels = new Map();
   const fetchedAt = new Map();

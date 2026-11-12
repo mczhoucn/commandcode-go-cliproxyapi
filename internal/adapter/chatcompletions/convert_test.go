@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 func wantErr(t *testing.T, eErr *errclass.Error, class errclass.Class) {

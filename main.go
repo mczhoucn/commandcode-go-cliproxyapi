@@ -1,4 +1,4 @@
-// Command commandcode-go-cliproxyapi builds the CLIProxyAPI native plugin DLL
+// Command commandcode-or-or-cliproxyapi builds the CLIProxyAPI native plugin DLL
 // exposing the CommandCode provider. This file is CGO glue only: every RPC
 // method is forwarded verbatim into internal/plugin.HandleCall.
 package main
@@ -64,7 +64,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 
-	"commandcode-go-cliproxyapi/internal/plugin"
+	"commandcode-or-or-cliproxyapi/internal/plugin"
 )
 
 func main() {}

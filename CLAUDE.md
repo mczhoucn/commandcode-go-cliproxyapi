@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **native dynamic plugin for CLIProxyAPI (CPA)**, not a standalone server. It exposes the CommandCode Provider API (`https://api.commandcode.ai/provider/v1`) as one CPA provider, `commandcode`, so OpenAI, Anthropic Messages, and OpenAI Responses clients can all use the same upstream accounts. Build output is a C-shared library (`.so`/`.dylib`/`.dll`) that CPA loads; `main.go` is the only file importing `"C"`.
 
-Supported plans are GOAT / Pro / Max. The `go` in `commandcode-go-cliproxyapi` is inherited naming and does **not** mean CommandCode Go support.
+Supported plans are GOAT / Pro / Max. The plugin was renamed from `commandcode-go-cliproxyapi`; the old `go` was inherited naming from `opencode-go-cliproxyapi`, never a Go-plan support claim. **The plugin ID is part of the host-facing contract** — auth files, `plugins.configs.<id>`, management routes and the `commandcode-key-<hash>.json` naming all key off it, so a rename is a breaking change for existing installs.
 
 ## Commands
 
@@ -21,7 +21,7 @@ go test ./internal/plugin -run TestQuota -v                            # quota s
 go vet ./...
 
 # Shared-library build (requires CGO and a C compiler; the README lists per-OS outputs)
-CGO_ENABLED=1 go build -buildmode=c-shared -o plugins/<os>/<arch>/commandcode-go-cliproxyapi.<ext> .
+CGO_ENABLED=1 go build -buildmode=c-shared -o plugins/<os>/<arch>/commandcode-or-or-cliproxyapi.<ext> .
 
 # Release packaging used by CI (zip contains exactly one library at its root, plus checksums)
 go run ./.github/scripts/package-release.go -library <lib> -archive <zip> -checksum <sha256-file>

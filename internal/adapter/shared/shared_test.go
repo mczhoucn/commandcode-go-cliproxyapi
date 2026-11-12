@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"commandcode-go-cliproxyapi/internal/errclass"
+	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
 func TestRewriteModelID(t *testing.T) {

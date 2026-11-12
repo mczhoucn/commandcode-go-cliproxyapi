@@ -11,7 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"commandcode-go-cliproxyapi/internal/config"
+	"commandcode-or-or-cliproxyapi/internal/config"
 )
 
 // quotaProviderResponder serves the three account endpoints for one key and

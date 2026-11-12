@@ -8,7 +8,7 @@ The plugin owns model discovery, protocol translation, execution, and the Comman
 
 > **Supports CommandCode GOAT / Pro / Max, not the CommandCode Go plan.** Go uses the official CLI's private, non-OpenAI-compatible interface and protocol rather than the Provider API used by this plugin, and has no Provider API access. CPA's current CommandCode integration does not implement that private protocol; choosing a different login method does not enable Go.
 >
-> **The `go` in the name does not mean Go-plan support.** The actual plugin name is `commandcode-go-cliproxyapi`, inherited from [`opencode-go-cliproxyapi`](https://github.com/massiveits/opencode-go-cliproxyapi). The plugin ID is unchanged.
+> **The plugin name no longer carries a `go` claim.** The plugin is `commandcode-or-or-cliproxyapi`; its former name `commandcode-go-cliproxyapi` was inherited from [`opencode-go-cliproxyapi`](https://github.com/massiveits/opencode-go-cliproxyapi) and never meant Go-plan support. The rename changes the plugin ID, so existing installs must replace the library and re-add the `plugins.configs` entry under the new key.
 
 See the [ChangeLog](CHANGELOG.md) for this update and [release notes](RELEASE_NOTES.md) for detailed history.
 
@@ -73,27 +73,28 @@ Without this plugin, a manual CommandCode GOAT / Pro / Max integration must mana
 - **CLIProxyAPI**: `v8.0.43+` (first release with the quota provider and the cooldown error fields this plugin reports)
 - **Go Toolchain**: Go 1.26+ (CGO enabled for `-buildmode=c-shared`)
 
-## v0.1.5 upgrade and release notes
+## v0.2.0 upgrade and release notes
 
-- This release adds the standard CPA `QuotaProvider` capability, so CommandCode credentials show plan and remaining usage directly on the host's auth-file cards, and makes model/credential cooldowns follow CPA's own configuration instead of host defaults.
-- It also completes the DeepSeek-documented client surface on all three protocols: historical thinking is replayed (required by tool-carrying multi-turn requests), Anthropic `output_config.effort` is honoured, image `detail` survives translation, and Responses reasoning events are emitted under both the OpenAI and DeepSeek event families.
-- **Breaking**: minimum CLIProxyAPI is now `v8.0.43`; the plugin declares schema 6 and no longer loads on older hosts. Replace the library, restart CPA and refresh Management Center.
+- **The plugin is renamed to `commandcode-or-or-cliproxyapi`** (from `commandcode-go-cliproxyapi`). The name no longer carries a `go` that could be read as CommandCode Go plan support.
+- **Breaking**: the plugin ID is part of the host contract. Move the `plugins.configs` entry to the new ID, replace the library with `commandcode-or-or-cliproxyapi.<ext>`, and delete the old library. Management routes move to `/v0/{resource,management}/plugins/commandcode-or-or-cliproxyapi/*`.
+- Existing auth files need no migration: the provider key is still `commandcode`, so accounts, models and quota keep working.
+- Behaviour is otherwise identical to v0.1.5.
 - For a manual upgrade, replace the library for the target OS/architecture, restart CLIProxyAPI, then refresh Management Center. Updating this repository's version does not update an already running plugin.
-- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.1.5`. Each supported platform needs `commandcode-go-cliproxyapi_0.1.5_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
-- Each ZIP must contain exactly one matching library at its root: `commandcode-go-cliproxyapi.so`, `commandcode-go-cliproxyapi.dylib`, or `commandcode-go-cliproxyapi.dll`. Keep the plugin ID and repository URL unchanged; the store reads the version from the latest GitHub release.
+- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.2.0`. Each supported platform needs `commandcode-or-or-cliproxyapi_0.2.0_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
+- Each ZIP must contain exactly one matching library at its root: `commandcode-or-or-cliproxyapi.so`, `commandcode-or-or-cliproxyapi.dylib`, or `commandcode-or-or-cliproxyapi.dll`.
 
 
 ## Build
 
 ```bash
 # Linux (AMD64)
-go build -buildmode=c-shared -o plugins/linux/amd64/commandcode-go-cliproxyapi.so .
+go build -buildmode=c-shared -o plugins/linux/amd64/commandcode-or-or-cliproxyapi.so .
 
 # macOS (ARM64)
-go build -buildmode=c-shared -o plugins/darwin/arm64/commandcode-go-cliproxyapi.dylib .
+go build -buildmode=c-shared -o plugins/darwin/arm64/commandcode-or-or-cliproxyapi.dylib .
 
 # Windows (AMD64)
-go build -buildmode=c-shared -o plugins/windows/amd64/commandcode-go-cliproxyapi.dll .
+go build -buildmode=c-shared -o plugins/windows/amd64/commandcode-or-or-cliproxyapi.dll .
 ```
 
 Place the artifact into the host's plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
@@ -105,7 +106,7 @@ plugins:
   enabled: true
   dir: /data/plugins
   configs:
-    commandcode-go-cliproxyapi:
+    commandcode-or-or-cliproxyapi:
       # Upstream base URL (default: "https://api.commandcode.ai/provider/v1")
       base-url: "https://api.commandcode.ai/provider/v1"
 
@@ -186,7 +187,7 @@ API keys are not configured in this YAML. CLIProxyAPI auth files are the only so
 
 ### Quota page
 
-Quota is available in two places. The plugin registers the standard `QuotaProvider` capability, so each CommandCode auth file in Management Center's auth-file list renders its usage inline like a built-in provider (the host advertises `supports_quota` and calls `POST /v0/management/plugins/commandcode-go-cliproxyapi/quota` with that credential). The plugin's own **CommandCode accounts and quota** page (Management Center → **CommandCode**) additionally offers key entry, per-card refresh, and account listing.
+Quota is available in two places. The plugin registers the standard `QuotaProvider` capability, so each CommandCode auth file in Management Center's auth-file list renders its usage inline like a built-in provider (the host advertises `supports_quota` and calls `POST /v0/management/plugins/commandcode-or-or-cliproxyapi/quota` with that credential). The plugin's own **CommandCode accounts and quota** page (Management Center → **CommandCode**) additionally offers key entry, per-card refresh, and account listing.
 
 Both surfaces read the same account API on the same authority as `base-url`:
 
@@ -235,7 +236,7 @@ Native host integration creates its own temporary config, mock upstream and auth
 
 ```bash
 CPA_HOST_BINARY=/absolute/path/to/cli-proxy-api \
-CPA_PLUGIN_LIBRARY=/absolute/path/to/commandcode-go-cliproxyapi.dylib \
+CPA_PLUGIN_LIBRARY=/absolute/path/to/commandcode-or-or-cliproxyapi.dylib \
 node tests/oauth_host.cjs
 ```
 
@@ -250,7 +251,7 @@ This plugin was built with reference to two prior CommandCode plugins:
 - [opencode-go-cliproxyapi](https://github.com/massiveits/opencode-go-cliproxyapi) (v0.1.7) is the direct ancestor: the adapter kernel, catalog, config, auth, and quota scaffolding come from there, and the CommandCode-specific behaviour — reasoning preservation, unattributed-capability effort passthrough, the chat-completions-only route default, and the account API used by the quota page — was adapted on top.
 - [cpa-plugin-commandcode](https://github.com/ahoo/cpa-plugin-commandcode) (ahoo) is an independent earlier CommandCode plugin whose write-up established the vendor behaviours this plugin had to reproduce: thinking text arriving under `reasoning` / `reasoning_details[].text` and never `reasoning_content`, the resulting need to backfill `reasoning_content` before CLIProxyAPI's openai→claude translator sees it, the SSE `data: ` prefix that streaming `/v1/messages` requires, and the fact that only fully-qualified vendor names (`deepseek/deepseek-v4.1-flash`) are accepted upstream.
 
-Repository: <https://github.com/mczhoucn/commandcode-go-cliproxyapi>
+Repository: <https://github.com/OpenRealmCn/commandcode-or-or-cliproxyapi>
 
 ## License
 

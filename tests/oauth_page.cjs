@@ -73,7 +73,7 @@ const server = http.createServer(async (req,res) => {
       const state=randomBytes(32).toString("hex");
       const record={phase:"pending",mode,submits:0};
       records.set(state,record);
-      await page.goto(origin+prefix+"/v0/resource/plugins/commandcode-go-cliproxyapi/oauth#state="+state);
+      await page.goto(origin+prefix+"/v0/resource/plugins/commandcode-or-or-cliproxyapi/oauth#state="+state);
       if(remember) await page.waitForFunction(()=>!document.querySelector("#complete").disabled);
       return {page,context,state,record};
     }
