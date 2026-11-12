@@ -523,25 +523,55 @@ func TestExecuteResponsesRouteNativePassesThrough(t *testing.T) {
 }
 
 func TestExecuteStreamRoutedFromBothMethods(t *testing.T) {
-	t.Run("from execute with stream flag", func(t *testing.T) {
-		m, f := newStreamManager(t, streamScript{startStatus: http.StatusTooManyRequests})
-		resp, err := m.HandleCall("executor.execute", execReqBody("commandcode/glm-5.3", "openai", []byte(ccRequestBody), true))
+	t.Run("from execute with stream flag collapses to non-stream", func(t *testing.T) {
+		// executor.execute is the NON-stream RPC: the host allocated no
+		// downstream stream id. A stream-flagged body must be served as a
+		// single non-stream round-trip with the client's "stream" dropped, not
+		// pumped into a non-existent downstream stream.
+		var upstreamBody []byte
+		f := &fakeCaller{}
+		m := NewManager(NewHostBridge(f.call))
+		t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+		f.responder = wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
+			switch method {
+			case pluginabi.MethodHostHTTPDoStream:
+				t.Errorf("stream-flagged execute must not open a stream")
+				return hostOK(hostStreamStartResp{StatusCode: http.StatusTooManyRequests}), nil
+			case pluginabi.MethodHostHTTPDo:
+				var req hostHTTPReq
+				_ = json.Unmarshal(payload, &req)
+				upstreamBody = req.Body
+				return hostOK(pluginapi.HTTPResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"Content-Type": []string{"application/json"}},
+					Body:       []byte(ccResponseBody),
+				}), nil
+			default:
+				return hostOK(map[string]any{}), nil
+			}
+		})
+		if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		clientBody := []byte(`{"model":"whatever","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		resp, err := m.HandleCall("executor.execute", execReqBody("commandcode/glm-5.3", "openai", clientBody, true))
 		if err != nil {
 			t.Fatalf("execute(stream flag): %v", err)
 		}
 		env := decodeEnv(t, resp)
-		if env.OK || env.Error == nil || env.Error.Code != "rate_limit" || env.Error.HTTPStatus != http.StatusTooManyRequests {
-			t.Fatalf("execute(stream flag) envelope = %+v", env.Error)
+		if !env.OK || env.Error != nil {
+			t.Fatalf("execute(stream flag) must succeed as non-stream, got %+v", env.Error)
 		}
-		// Pre-first-byte failure: nothing opened, nothing emitted, nothing closed.
+		// The "stream" field must have been stripped from the upstream body so
+		// CommandCode answers with a unary completion.
+		if bytes.Contains(upstreamBody, []byte(`"stream"`)) {
+			t.Fatalf("upstream body still carries stream flag: %s", upstreamBody)
+		}
+		if got := len(f.callsOf(pluginabi.MethodHostHTTPDoStream)); got != 0 {
+			t.Fatalf("stream opens = %d, want 0", got)
+		}
 		if got := len(f.callsOf(pluginabi.MethodHostStreamEmit)); got != 0 {
-			t.Fatalf("emits before status known good = %d", got)
-		}
-		if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamRead)); got != 0 {
-			t.Fatalf("reads after failed start = %d", got)
-		}
-		if got := len(f.callsOf(pluginabi.MethodHostStreamClose)); got != 0 {
-			t.Fatalf("downstream closes without open = %d", got)
+			t.Fatalf("emits on non-stream path = %d", got)
 		}
 	})
 	t.Run("from execute_stream", func(t *testing.T) {
@@ -551,7 +581,7 @@ func TestExecuteStreamRoutedFromBothMethods(t *testing.T) {
 			t.Fatalf("execute_stream: %v", err)
 		}
 		env := decodeEnv(t, resp)
-		if env.OK || env.Error == nil || env.Error.Code != "rate_limit" {
+		if env.OK || env.Error == nil || env.Error.Code != "transient_rate_limit" {
 			t.Fatalf("execute_stream envelope = %+v", env.Error)
 		}
 	})
@@ -599,14 +629,52 @@ func TestExecuteStreamForwardsUpstreamErrorBody(t *testing.T) {
 	if !strings.Contains(env.Error.Message, "type object") {
 		t.Fatalf("message = %q", env.Error.Message)
 	}
-	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamRead)); got != 1 {
-		t.Fatalf("reads = %d, want 1", got)
+	// The error-body drain reads until the host reports done: the single
+	// frame comes back on the first read, the second read surfaces done.
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamRead)); got != 2 {
+		t.Fatalf("reads = %d, want 2", got)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamClose)); got != 1 {
 		t.Fatalf("upstream closes = %d, want 1", got)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostStreamClose)); got != 0 {
 		t.Fatalf("downstream closes without open = %d", got)
+	}
+}
+
+// TestExecuteStreamErrorBodyConcatenatesChunks verifies the pre-first-byte
+// error-body drain stitches a body split across multiple host chunks back
+// together before classification, instead of reading only the first chunk.
+func TestExecuteStreamErrorBodyConcatenatesChunks(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{
+		startStatus: http.StatusBadRequest,
+		upstreamID:  "up-split",
+		frames: []string{
+			`{"error":{"message":"tool parameters `,
+			`must be type object"}}`,
+		},
+	})
+	resp, err := m.HandleCall("executor.execute_stream", execStreamReqBody("commandcode/glm-5.3", "openai", []byte(ccRequestBody), "down-split"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := decodeEnv(t, resp)
+	if env.OK || env.Error == nil {
+		t.Fatalf("want error envelope, got %+v", env)
+	}
+	if env.Error.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("status = %d", env.Error.HTTPStatus)
+	}
+	// Only the concatenation of both chunks forms the complete message.
+	if !strings.Contains(env.Error.Message, "type object") {
+		t.Fatalf("message = %q; want concatenated body", env.Error.Message)
+	}
+	// Two frames plus the terminating done read.
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamRead)); got != 3 {
+		t.Fatalf("reads = %d, want 3", got)
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamClose)); got != 1 {
+		t.Fatalf("upstream closes = %d, want 1", got)
 	}
 }
 
@@ -669,9 +737,12 @@ func TestExecuteStreamHappyPathClaudeSource(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamCleanCloseWithoutTerminalFrame(t *testing.T) {
-	// Upstream ends (bridge done) without sending [DONE]: the executor must
-	// flush the converter, close both streams cleanly, and report success.
+func TestExecuteStreamCloseWithoutTerminalIsTruncation(t *testing.T) {
+	// Upstream ends (bridge done) without [DONE] AND without any logical
+	// terminal (no finish_reason / message_stop / response.completed): the
+	// connection was cut mid-response. The executor must report a truncation
+	// on the downstream close instead of synthesizing a clean end that would
+	// misreport the partial answer as complete.
 	m, f := newStreamManager(t, streamScript{
 		upstreamID: "up-5",
 		frames: []string{
@@ -692,8 +763,8 @@ func TestExecuteStreamCleanCloseWithoutTerminalFrame(t *testing.T) {
 		t.Fatalf("upstream closes = %d", got)
 	}
 	downCloses := f.callsOf(pluginabi.MethodHostStreamClose)
-	if len(downCloses) != 1 || strings.Contains(string(downCloses[0].payload), `"error"`) {
-		t.Fatalf("downstream closes = %v", downCloses)
+	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
+		t.Fatalf("downstream must close with truncation error: %v", downCloses)
 	}
 }
 
@@ -927,9 +998,114 @@ func TestExecuteStreamEmitFailsMidstream(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamPartialLineDroppedOnCleanClose(t *testing.T) {
-	// No trailing newline and no [DONE]: the buffered partial line never
-	// formed an SSE event, so the stream still ends cleanly.
+// downCloseDetail decodes the structured error_detail of the single
+// downstream close.
+func downCloseDetail(t *testing.T, f *fakeCaller) *pluginabi.Error {
+	t.Helper()
+	closes := f.callsOf(pluginabi.MethodHostStreamClose)
+	if len(closes) != 1 {
+		t.Fatalf("downstream closes = %d, want 1", len(closes))
+	}
+	var wire struct {
+		ErrorDetail *pluginabi.Error `json:"error_detail"`
+	}
+	if err := json.Unmarshal(closes[0].payload, &wire); err != nil {
+		t.Fatalf("decode close payload: %v", err)
+	}
+	if wire.ErrorDetail == nil {
+		t.Fatalf("close carried no structured error_detail: %s", closes[0].payload)
+	}
+	return wire.ErrorDetail
+}
+
+// TestExecuteStreamForwardsSignificantConverterError verifies an in-stream
+// upstream error with account-level meaning (quota) reaches CPA with its own
+// classification instead of a generic stream_truncated, and that retry is
+// forced off because bytes were already emitted downstream.
+func TestExecuteStreamForwardsSignificantConverterError(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{
+		upstreamID: "up-quota",
+		frames: []string{
+			`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}` + "\n\n",
+			`data: {"error":{"code":403,"message":"quota exhausted for this plan"}}` + "\n\n",
+		},
+	})
+	if _, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("commandcode/glm-5.3", "claude", []byte(ccRequestBody), "down-quota")); err != nil {
+		t.Fatalf("execute_stream: %v", err)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	if got := len(f.callsOf(pluginabi.MethodHostStreamEmit)); got == 0 {
+		t.Fatal("precondition: the first chunk must have been emitted")
+	}
+	detail := downCloseDetail(t, f)
+	if detail.Code != string(errclass.ClassQuota) {
+		t.Errorf("detail code = %q, want %q", detail.Code, errclass.ClassQuota)
+	}
+	if detail.Retryable {
+		t.Error("a forwarded error after the first downstream byte must not be retryable")
+	}
+	if detail.HTTPStatus != http.StatusForbidden {
+		t.Errorf("http_status = %d, want 403", detail.HTTPStatus)
+	}
+}
+
+// TestExecuteStreamMalformedChunkStaysTruncated pins the fallback: a converter
+// error with no account/model meaning still closes as stream_truncated.
+func TestExecuteStreamMalformedChunkStaysTruncated(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{
+		upstreamID: "up-bad",
+		frames: []string{
+			`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}` + "\n\n",
+			"data: {not json\n\n",
+		},
+	})
+	if _, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("commandcode/glm-5.3", "claude", []byte(ccRequestBody), "down-bad")); err != nil {
+		t.Fatalf("execute_stream: %v", err)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	detail := downCloseDetail(t, f)
+	if detail.Code != pluginabi.ErrorCodeStreamTruncated {
+		t.Errorf("detail code = %q, want %q", detail.Code, pluginabi.ErrorCodeStreamTruncated)
+	}
+	if detail.Retryable {
+		t.Error("a truncated stream must not be retryable")
+	}
+}
+
+func TestTerminalScanner(t *testing.T) {
+	cases := []struct {
+		name   string
+		chunks []string
+		want   bool
+	}{
+		{"done sentinel", []string{"data: [DONE]\n\n"}, true},
+		{"non-null finish_reason", []string{`data: {"choices":[{"finish_reason":"stop"}]}`}, true},
+		{"null finish_reason only", []string{`data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}`}, false},
+		{"message_stop", []string{`event: message_stop`}, true},
+		{"response.completed", []string{`event: response.completed`}, true},
+		{"content only", []string{`data: {"choices":[{"delta":{"content":"partial"}}]}`}, false},
+		{"marker split across chunks", []string{`data: [DO`, `NE]`}, true},
+		{"finish_reason split across chunks", []string{`"finish_rea`, `son":"stop"`}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ts terminalScanner
+			for _, c := range tc.chunks {
+				ts.feed([]byte(c))
+			}
+			if ts.seen != tc.want {
+				t.Fatalf("seen = %t, want %t", ts.seen, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecuteStreamPartialLineTruncationOnClose(t *testing.T) {
+	// No trailing newline and no terminal marker: the buffered partial line
+	// never formed an SSE event and no [DONE]/finish_reason ever arrived, so
+	// the mid-response close is a truncation, not a clean end.
 	m, f := newStreamManager(t, streamScript{
 		upstreamID: "up-9",
 		frames:     []string{"data: {truncated"},
@@ -945,8 +1121,8 @@ func TestExecuteStreamPartialLineDroppedOnCleanClose(t *testing.T) {
 	}
 	m.bridge.WaitForInFlight(5 * time.Second)
 	downCloses := f.callsOf(pluginabi.MethodHostStreamClose)
-	if len(downCloses) != 1 || strings.Contains(string(downCloses[0].payload), `"error"`) {
-		t.Fatalf("downstream must close cleanly: %v", downCloses)
+	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
+		t.Fatalf("downstream must close with truncation error: %v", downCloses)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamClose)); got != 1 {
 		t.Fatalf("upstream closes = %d", got)

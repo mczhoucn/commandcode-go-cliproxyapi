@@ -2,7 +2,29 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
-## v0.2.2 — 2026-11-12
+## v0.2.3 — 2026-11-13
+
+- **修复 Monthly/Weekly 额度耗尽时凭证未被禁用的问题**：月度或每周用量用完时，若 5-hour 窗口仍有余量，CPA 以前不会冷却该凭证并认为其仍有配额。根本原因：宿主 CPA 只有收到 HTTP 429 才会将整个凭证标为额度耗尽，而插件此前对 402/403 状态的额度错误不做改写。现在所有凭证级错误（`USAGE_EXCEEDED`、spend cap、`RATE_LIMITED`、5-hour/weekly/monthly 措辞）一律以 429 上报；`Retry-After` 上限从 24 小时提高到 32 天；reset 时间戳支持秒、毫秒、数字字符串、ISO 格式；消息正文中 "resets at…" / "Resets in Xd Yh Zm" 也会解析。
+- **流中额度错误现可冷却凭证**：SSE 流里的上游错误以前统一改写成 `stream_truncated`（无冷却），现在按原始错误分类后传给 CPA。
+- **修复：流式错误体截断导致误判**：错误响应体现在会一直读到结束（上限 3s / 64KB），避免分块传输时 JSON 被截断、导致凭证级错误降级为模型级冷却。
+- **插件崩溃防护**：流式转发的后台 goroutine 加了 `recover()`，转换器 panic 不再导致整个 CPA 进程退出。
+- **客户端取消传播**：转发 `host_callback_id`，客户端断开时上游请求随之取消，不再等待 5 分钟超时。
+- **适配器修复（messages / responses 路由）**：thinking 历史和 reasoning 输出不再被丢弃，`responses` 路由补齐了缺失的 SSE 事件序列，修复了工具调用并发块的顺序问题。
+- **认证稳定性**：单个损坏的认证文件不再挡住所有账号新增；凭证占位记录现在会在超时或确认失败后释放，不再永久泄漏；OAuth 遇到瞬时错误时会重试，不再直接失败。
+- **配置校验**：`catalog-url` 的主机必须与 `base-url` 一致（bearer key 会发到 catalog-url）。
+
+### v0.2.3 English highlights — 2026-11-13
+
+- **Fix Monthly/Weekly exhaustion not disabling the credential**: when the monthly or weekly window was spent but the 5-hour window still had quota, CPA kept routing to the credential. Root cause: the host's credential-wide cooldown is 429-gated; the plugin was not rewriting 402/403 quota errors to 429. Now all credential-scoped outcomes (USAGE_EXCEEDED, spend cap, RATE_LIMITED, 5-hour/weekly/monthly wording) are reported as 429; the RetryAfter cap is raised from 24 h to 32 days; reset hints accept seconds, milliseconds, numeric strings, ISO, and "resets at…" / "Resets in Xd Yh Zm" message text.
+- **In-stream quota errors now cool the credential**: upstream errors inside a 200 SSE stream were previously rewritten to stream_truncated (no cooldown); they now carry their original classification.
+- **Fix: truncated error body causing misclassification**: the error body is now read to completion (3 s / 64 KB cap) so chunked delivery no longer causes a credential-scoped error to be downgraded to model-scoped.
+- **Crash protection**: the pump goroutine now recovers from panics so an adapter panic no longer kills the host process.
+- **Client cancellation**: host_callback_id is forwarded so upstream requests cancel when the client disconnects.
+- **Adapter fixes (messages / responses routes)**: thinking history and reasoning output are no longer dropped; missing SSE lifecycle events added; parallel tool-call ordering fixed.
+- **Auth stability**: a corrupted auth file no longer blocks all new account additions; credential claims now expire on failure or TTL; OAuth transient errors retry instead of failing permanently.
+- **Config validation**: catalog-url host must match base-url (the bearer key is sent there).
+
+
 
 - 修复 v0.2.1 的问题：窗口耗尽时整张额度卡片显示「额度加载失败：failed to fetch quota: weekly usage window exhausted」，用户看不到任何窗口数据。
 - 现在耗尽不再当作查询失败。卡片照常显示三个窗口（进度条已是 100%），并在套餐旁多出一行说明是哪个限额已用完。

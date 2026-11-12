@@ -316,21 +316,46 @@ func TestConvertResponsesUnknownOutputItem(t *testing.T) {
 	}
 }
 
-// Reasoning output items (emitted whenever Luna reasons) are informational
-// and are omitted per the FR-005/FR-006 compatibility policy — matching
-// the stream side — instead of failing the whole conversion.
-func TestConvertResponsesReasoningItemOmitted(t *testing.T) {
-	body := strings.Replace(respTextOnly,
+// Fix #2 pin: reasoning output items carry the chain of thought to the
+// client instead of being dropped — reasoning_content for Chat Completions,
+// a leading unsigned thinking block for Messages. Content (DeepSeek's
+// plaintext field) wins over summary, and a string content decodes.
+func TestConvertResponsesReasoningItemMapped(t *testing.T) {
+	summaryOnly := strings.Replace(respTextOnly,
 		`"output":[{"type":"message"`,
 		`"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"pondering"}]},{"type":"message"`, 1)
-	for _, format := range []string{"openai", "claude"} {
-		out, eErr := ConvertNonStreamResponse(format, 200, []byte(body))
+	withContent := strings.Replace(respTextOnly,
+		`"output":[{"type":"message"`,
+		`"output":[{"type":"reasoning","content":"plain","summary":[{"type":"summary_text","text":"pondering"}]},{"type":"message"`, 1)
+	for _, tc := range []struct{ body, want string }{{summaryOnly, "pondering"}, {withContent, "plain"}} {
+		out, eErr := ConvertNonStreamResponse("openai", 200, []byte(tc.body))
 		if eErr != nil {
-			t.Fatalf("%s: reasoning item errored: %v", format, eErr)
+			t.Fatalf("openai: reasoning item errored: %v", eErr)
 		}
-		if !strings.Contains(string(out), `"hi there"`) ||
-			strings.Contains(string(out), "pondering") {
-			t.Fatalf("%s: reasoning item not omitted cleanly: %s", format, out)
+		var cc map[string]any
+		if err := json.Unmarshal(out, &cc); err != nil {
+			t.Fatalf("openai output not JSON: %v", err)
+		}
+		msg := cc["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+		if msg["reasoning_content"] != tc.want || msg["content"] != "hi there" {
+			t.Fatalf("openai: reasoning not mapped: %v", msg)
+		}
+
+		out, eErr = ConvertNonStreamResponse("claude", 200, []byte(tc.body))
+		if eErr != nil {
+			t.Fatalf("claude: reasoning item errored: %v", eErr)
+		}
+		var cl map[string]any
+		if err := json.Unmarshal(out, &cl); err != nil {
+			t.Fatalf("claude output not JSON: %v", err)
+		}
+		blocks := cl["content"].([]any)
+		first := blocks[0].(map[string]any)
+		if len(blocks) != 2 || first["type"] != "thinking" || first["thinking"] != tc.want {
+			t.Fatalf("claude: thinking block wrong: %v", blocks)
+		}
+		if _, ok := first["signature"]; ok {
+			t.Fatalf("claude: synthesized thinking must carry no signature: %v", first)
 		}
 	}
 }

@@ -151,7 +151,7 @@ plugins:
 |---|---|---|---|
 | `api-keys` | — | 忽略 | 已停用，不再作为密钥来源。见下方「账户」。 |
 | `base-url` | `string` | `https://api.commandcode.ai/provider/v1` | 上游 provider 地址。必须是合法 HTTPS（`allow-http: true` 时可用 HTTP），不能带 query、fragment 或 userinfo。 |
-| `catalog-url` | `string` | `{base-url}/models` | 目录地址；即使目录公开，也会收到启用账户的 bearer API key。只应设置为可信服务，推荐与 `base-url` 的协议、主机、端口一致；当前配置校验不会强制同源。 |
+| `catalog-url` | `string` | `{base-url}/models` | 目录地址；即使目录公开，也会收到启用账户的 bearer API key。主机（含端口）必须与 `base-url` 一致，否则配置校验会拒绝。 |
 | `model-prefix.enabled` | `bool` | `true` | `true` 时客户端用 `<prefix>/<model>`，`false` 时直接暴露上游裸 id。 |
 | `model-prefix.value` | `string` | `commandcode` | provider 前缀。 |
 | `catalog.refresh-interval` | `duration` | `15m` | 目录轮询周期（最小 `1m`）。 |

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -73,8 +75,20 @@ func (m *Manager) pruneLoginsLocked() {
 	now := time.Now()
 	for state, s := range m.logins {
 		if !now.Before(s.expires) {
+			// A delivered session keeps its claim here (releaseUndeliveredLocked
+			// skips "delivered") so an old or expired session can never release a
+			// newer save's claim for the same digest. Finding 1: the bounded
+			// release of a delivered-but-never-reconciled claim is handled by the
+			// claim-TTL sweep below, not by deleting the hash on session expiry.
 			m.releaseUndeliveredLocked(s)
 			delete(m.logins, state)
+		}
+	}
+	// Also prune expired claims: a claim whose TTL elapsed is released even if
+	// no matching file was observed, preventing permanent "API key 正在保存" rejections.
+	for hash, claim := range m.credentialClaims {
+		if claim.expired() {
+			delete(m.credentialClaims, hash)
 		}
 	}
 }
@@ -111,9 +125,16 @@ func (m *Manager) pollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequ
 	case "ready":
 		key := s.auth.Attributes["api_key"]
 		if failure := m.checkExistingCredentialLocked(ctx, key); failure != nil {
-			m.releaseUndeliveredLocked(s)
-			s.phase, s.message = "error", failure.message
-			return loginFailure(s.message)
+			// Only a real duplicate (409) should fail permanently; transient
+			// errors (502 from AuthList/AuthGet) keep phase "ready" and report
+			// pending so the next poll retries (finding 3).
+			if failure.status == http.StatusConflict {
+				m.releaseUndeliveredLocked(s)
+				s.phase, s.message = "error", failure.message
+				return loginFailure(s.message)
+			}
+			// Transient failure: keep ready, let the user retry the poll.
+			return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}
 		}
 		if !time.Now().Before(s.expires) {
 			m.releaseUndeliveredLocked(s)
@@ -138,6 +159,20 @@ func (m *Manager) handleLoginManagement(ctx context.Context, action string, body
 	if len(body) > 16*1024 || json.Unmarshal(body, &req) != nil || len(req.State) != 64 {
 		return managementError(http.StatusBadRequest, "登录请求格式无效")
 	}
+	// For "complete", perform upstream verification OUTSIDE lifeMu (finding 9).
+	var verifiedEmail, verifiedPlanID string
+	var verifyFailure *credentialError
+	if action == "complete" && req.APIKey != "" {
+		key := strings.TrimSpace(req.APIKey)
+		if len(key) == 0 || len(key) > 8192 || strings.IndexFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return managementError(http.StatusBadRequest, "请输入不含空白或控制字符的 API key")
+		}
+		verifiedEmail, verifiedPlanID, verifyFailure = m.verifyCredential(ctx, key)
+		if verifyFailure != nil {
+			return managementError(verifyFailure.status, verifyFailure.message)
+		}
+		req.APIKey = key // Use the trimmed key.
+	}
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
 	m.pruneLoginsLocked()
@@ -150,7 +185,9 @@ func (m *Manager) handleLoginManagement(ctx context.Context, action string, body
 		if s.phase != "pending" {
 			return managementError(http.StatusConflict, "此登录已提交、取消或交付，请先查看 CPA 状态和认证文件，不要重复提交")
 		}
-		auth, failure := m.prepareCredentialLocked(ctx, req.APIKey, "browser_authorization")
+		// prepareCredentialLocked now only does the claim + duplicate check,
+		// since verification happened outside the lock.
+		auth, failure := m.prepareCredentialLocked(ctx, req.APIKey, verifiedEmail, verifiedPlanID, "browser_authorization")
 		if failure != nil {
 			return managementError(failure.status, failure.message)
 		}
@@ -182,19 +219,26 @@ func (m *Manager) handleLoginManagement(ctx context.Context, action string, body
 		if s.phase == "delivered" {
 			// Independent confirmation for the page. File existence alone isn't
 			// enough; inspect the provider-owned credential and compare digests.
+			// If AuthList fails (finding 5), return the session state and treat
+			// presence as unknown/pending; the page can retry or show the state.
 			files, err := commandcodeAuthFiles(ctx, m.bridge)
 			if err != nil {
-				return managementError(http.StatusBadGateway, "无法确认保存结果，请刷新认证文件列表，不要重复提交")
-			}
-			for _, entry := range files {
-				key, err := authFileKey(ctx, m.bridge, entry)
-				if err != nil {
-					return managementError(http.StatusBadGateway, "无法核对保存结果，请刷新认证文件列表")
-				}
-				if authKeyHash(key) == s.hash {
-					result["status"] = "present"
-					delete(m.credentialClaims, s.hash)
-					break
+				// AuthList failed: return the session state (delivered) without 502.
+				// The page shows "delivered" and the user can refresh auth files.
+				debugTrace("session AuthList failed session=%s error=%v", req.State, err)
+			} else {
+				for _, entry := range files {
+					key, err := authFileKey(ctx, m.bridge, entry)
+					if err != nil {
+						// One unreadable file doesn't block the whole check; skip it.
+						debugTrace("session unreadable_file=%s auth_index=%s error=%v", entry.Name, entry.AuthIndex, err)
+						continue
+					}
+					if authKeyHash(key) == s.hash {
+						result["status"] = "present"
+						delete(m.credentialClaims, s.hash)
+						break
+					}
 				}
 			}
 		}

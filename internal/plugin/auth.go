@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -83,12 +84,29 @@ func commandcodeAuthFiles(ctx context.Context, bridge *HostBridge) ([]pluginapi.
 	return files, nil
 }
 
+// isCommandcodeAuthFile is the NARROW, file-backed predicate used for the card
+// list, catalog credentials and email rewrite: memory-only/removed records must
+// not resurface as cards or be rewritten. Finding 7 broadens only the duplicate
+// check (isCommandcodeCredential), never this one.
 func isCommandcodeAuthFile(entry pluginapi.HostAuthFileEntry) bool {
 	provider := entry.Provider
 	if provider == "" {
 		provider = entry.Type
 	}
-	return provider == ProviderID && entry.Source == "file" && !entry.RuntimeOnly && entry.AuthIndex != ""
+	return provider == ProviderID && entry.Source == "file"
+}
+
+// isCommandcodeCredential is the BROAD predicate used only for key-digest
+// duplicate detection. It includes runtime-only / non-file commandcode
+// credentials (AuthIndex set) so a duplicate of one is still rejected, while the
+// narrow isCommandcodeAuthFile keeps them out of the card list and email rewrite
+// (finding 7).
+func isCommandcodeCredential(entry pluginapi.HostAuthFileEntry) bool {
+	provider := entry.Provider
+	if provider == "" {
+		provider = entry.Type
+	}
+	return provider == ProviderID && entry.AuthIndex != ""
 }
 
 func authFileKey(ctx context.Context, bridge *HostBridge, entry pluginapi.HostAuthFileEntry) (string, error) {
@@ -121,17 +139,49 @@ func (m *Manager) addAccount(ctx context.Context, body []byte) (pluginapi.Manage
 	if len(body) > 16*1024 || json.Unmarshal(body, &req) != nil {
 		return managementError(http.StatusBadRequest, "API key 请求格式无效")
 	}
+	key := strings.TrimSpace(req.APIKey)
+	if len(key) == 0 || len(key) > 8192 || strings.IndexFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return managementError(http.StatusBadRequest, "请输入不含空白或控制字符的 API key")
+	}
+	// Fast duplicate pre-check under the lock BEFORE the slow upstream
+	// verification, so re-adding an existing key (or a foreign same-name file) is
+	// rejected without any upstream call. This only reads the host auth set and
+	// reconciles claims; it never holds the lock across the 30s verification.
 	m.lifeMu.Lock()
-	defer m.lifeMu.Unlock()
-	auth, failure := m.prepareCredentialLocked(ctx, req.APIKey, "api_key")
-	if failure != nil {
+	if failure := m.checkExistingCredentialLocked(ctx, key); failure != nil {
+		m.lifeMu.Unlock()
 		return managementError(failure.status, failure.message)
 	}
-	// A timed-out callback may still finish its save. Only observing a matching
-	// file reconciles the digest claim, even if AuthSave returned an error.
-	if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: auth.FileName, JSON: auth.StorageJSON}); err != nil {
-		return managementError(http.StatusBadGateway, "保存结果尚未确认，请先刷新认证文件列表；不会自动重新保存")
+	m.lifeMu.Unlock()
+	// Perform the upstream verification OUTSIDE lifeMu so upstream latency (up
+	// to 30s) does not block pollLogin, startLogin, reconfigure, or shutdown
+	// (finding 9).
+	email, planID, verifyFailure := m.verifyCredential(ctx, key)
+	if verifyFailure != nil {
+		return managementError(verifyFailure.status, verifyFailure.message)
 	}
+	// Now take lifeMu for the authoritative duplicate re-check + claim + save.
+	// Re-checking duplicates under the lock prevents two concurrent adds of the
+	// same key from both saving.
+	m.lifeMu.Lock()
+	auth, failure := m.prepareCredentialLocked(ctx, key, email, planID, "api_key")
+	if failure != nil {
+		m.lifeMu.Unlock()
+		return managementError(failure.status, failure.message)
+	}
+	err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: auth.FileName, JSON: auth.StorageJSON})
+	if err != nil {
+		// Finding 1: only a DEFINITIVE failure releases the claim, so the user can
+		// retry instead of being locked out. A timed-out (or undecodable) callback
+		// may still land the file, so its claim stays until the file is observed
+		// or claimTTL elapses — releasing it would let a retry write a duplicate.
+		if authSaveDefinitelyFailed(err) {
+			delete(m.credentialClaims, authKeyHash(key))
+		}
+		m.lifeMu.Unlock()
+		return managementError(http.StatusBadGateway, "保存失败，请重试")
+	}
+	m.lifeMu.Unlock()
 	resp, err := quotaJSON(map[string]string{"file_name": auth.FileName})
 	resp.StatusCode = http.StatusCreated
 	return resp, err

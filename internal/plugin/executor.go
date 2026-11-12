@@ -7,6 +7,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/tidwall/sjson"
 
 	"commandcode-or-or-cliproxyapi/internal/adapter/chatcompletions"
 	"commandcode-or-or-cliproxyapi/internal/adapter/messages"
@@ -36,7 +38,8 @@ import (
 // ids returned by DoStream are UPSTREAM and never interchangeable (§4).
 type executorRequest struct {
 	pluginapi.ExecutorRequest
-	StreamID string `json:"stream_id,omitempty"`
+	StreamID       string `json:"stream_id,omitempty"`
+	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
 // resolvedExecution carries everything both execution paths need after
@@ -86,7 +89,17 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	}
 	debugTrace("executor invoked model=%s source_format=%s stream=%t original_body_%s payload_%s", req.Model, req.SourceFormat, req.Stream, debugBodyMeta(req.OriginalRequest), debugBodyMeta(req.Payload))
 	if req.Stream {
-		return m.executeStream(req)
+		// executor.execute is the NON-stream RPC: the host allocated no
+		// downstream stream id, so the async pump (executeStream) would emit
+		// into a stream that does not exist. A stream-flagged body reaching
+		// this method must instead be collapsed to a single non-stream
+		// round-trip: drop the client's top-level "stream" so upstream
+		// answers with a unary body, and clear the flag so the rest of this
+		// path treats it as non-stream.
+		if stripped, err := sjson.DeleteBytes(req.OriginalRequest, "stream"); err == nil {
+			req.OriginalRequest = stripped
+		}
+		req.Stream = false
 	}
 	res, failEnv := m.resolveExecution(req)
 	if res == nil {
@@ -107,12 +120,12 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	debugTrace("executor sending non-stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
-	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
+	resp, err := m.bridge.doWithCallbackID(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
 		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
 		Body:    upstreamBody,
-	})
+	}, req.HostCallbackID)
 	if err != nil {
 		debugTrace("executor non-stream network error: %v", err)
 		return classEnvelope(errclass.FromNetwork(err)), nil
@@ -370,12 +383,12 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
-	st, respHeaders, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
+	st, respHeaders, id, err := m.bridge.doStreamWithCallbackID(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
 		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
 		Body:    upstreamBody,
-	})
+	}, req.HostCallbackID)
 	debugTrace("executor stream DoStream status=%d upstreamID=%s err=%v", st, id, err)
 	if err != nil {
 		return classEnvelope(errclass.FromNetwork(err)), nil
@@ -383,14 +396,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	if st >= 400 {
 		var body []byte
 		if id != "" {
-			payload, errMsg, _, readErr := m.bridge.StreamRead(id)
-			if readErr == nil {
-				if len(payload) > 0 {
-					body = payload
-				} else if errMsg != "" {
-					body = []byte(errMsg)
-				}
-			}
+			body = m.readErrorBody(ctx, id)
 			_ = m.bridge.StreamClose(id)
 		}
 		// Headers carry the upstream Retry-After hint, which CPA turns into the
@@ -403,12 +409,76 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		m.bridge.inFlight.Add(1)
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil && m.bridge != nil {
+				// A panic in the pump goroutine would kill the host process:
+				// recover, log the failure (secret-free), and ensure both
+				// streams are closed with an error. The deferred inFlight.Done
+				// below still runs after this recover.
+				_ = m.bridge.Log("error", "stream pump panicked", nil)
+				_ = m.bridge.StreamClose(id)
+				_ = m.bridge.StreamCloseDownstream(downID, "internal error")
+			}
+		}()
 		if m.bridge != nil {
 			defer m.bridge.inFlight.Done()
 		}
 		m.pumpStream(downID, id, res, req.SourceFormat)
 	}()
 	return okEnvelope(struct{}{}), nil
+}
+
+// errorBodyReadTimeout bounds the pre-first-byte error-body drain. A failing
+// upstream has already sent its status line; its error JSON is small and
+// should arrive promptly, so a stalled body must not park the executor —
+// classification proceeds with whatever arrived before the deadline.
+const errorBodyReadTimeout = 3 * time.Second
+
+// errorBodyMaxBytes caps the drained error body. Upstream error envelopes are
+// a few hundred bytes; the cap stops a hostile or buggy upstream from
+// streaming an unbounded body into the classifier's memory. The first chunk
+// that crosses the cap is kept whole (so a complete small JSON is never split)
+// and the drain then stops.
+const errorBodyMaxBytes = 64 << 10
+
+// readErrorBody drains an UPSTREAM error stream (HTTP >=400) across however
+// many chunks the host hands back, bounded by errorBodyReadTimeout (shared
+// with, but never exceeding, the request deadline carried by ctx) and
+// errorBodyMaxBytes. It returns the concatenated payload, or the first
+// upstream-reported errMsg when no payload bytes arrive. A read error or a
+// clean done both stop the drain; the caller still issues StreamClose.
+func (m *Manager) readErrorBody(ctx context.Context, upstreamID string) []byte {
+	if m.bridge == nil {
+		return nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, errorBodyReadTimeout)
+	defer cancel()
+	var body []byte
+	var firstErrMsg string
+	for {
+		payload, errMsg, done, readErr := m.bridge.StreamReadContext(readCtx, upstreamID)
+		if readErr != nil {
+			// A deadline hit or transport failure stops the drain; whatever
+			// arrived so far is still worth classifying.
+			break
+		}
+		if len(payload) > 0 {
+			body = append(body, payload...)
+		}
+		if firstErrMsg == "" && errMsg != "" {
+			firstErrMsg = errMsg
+		}
+		if len(body) >= errorBodyMaxBytes || done {
+			break
+		}
+	}
+	if len(body) > 0 {
+		return body
+	}
+	if firstErrMsg != "" {
+		return []byte(firstErrMsg)
+	}
+	return nil
 }
 
 func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string) {
@@ -433,29 +503,49 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 	}
 	defer closeStreams("", nil)
 
-	var aborted atomic.Bool
+	// The watchdog and the pump goroutine both want to close the upstream
+	// stream, and exactly one must win: a CAS on pumpState decides. The
+	// watchdog closes (to unblock a StreamRead parked past the deadline) only
+	// if it flips pumpRunning->pumpAborted first; a pump that already reached
+	// pumpCompleted makes the watchdog a no-op. watchdogDone lets the pump
+	// wait out a watchdog callback that is still running inside the host, so
+	// shutdown's inFlight drain cannot race a StreamClose mid-flight.
+	var pumpState atomic.Int32 // pumpRunning
+	watchdogDone := make(chan struct{})
 	watchdog := time.AfterFunc(res.cfg.RequestTimeout, func() {
+		defer close(watchdogDone)
 		defer func() {
 			if r := recover(); r != nil && m.bridge != nil {
 				_ = m.bridge.Log("error", "stream watchdog panicked", nil)
 			}
 		}()
-		aborted.Store(true)
-		_ = m.bridge.StreamClose(upstreamID)
+		if pumpState.CompareAndSwap(pumpRunning, pumpAborted) {
+			_ = m.bridge.StreamClose(upstreamID)
+		}
 	})
-	defer watchdog.Stop()
+	defer func() {
+		// Stop()==true: the timer never fired, so the callback never ran and
+		// watchdogDone will never close — do not wait on it. Stop()==false:
+		// the callback fired (or is running); block until it returns before
+		// the goroutine's inFlight.Done lets shutdown proceed.
+		if !watchdog.Stop() {
+			<-watchdogDone
+		}
+	}()
 
 	conv := newStreamConverter(res.rec.Protocol, sourceFormat)
+	var terminal terminalScanner
 	var (
 		total          int64
 		upstreamClosed bool
 		convDone       bool
+		emittedAny     bool
 	)
 	for {
 		payload, readErrMsg, closed, err := m.bridge.StreamRead(upstreamID)
 		debugTrace("executor stream read chunk_len=%d closed=%t readErrMsg=%q err=%v", len(payload), closed, readErrMsg, err)
 		upstreamClosed = closed
-		if aborted.Load() {
+		if pumpState.Load() == pumpAborted {
 			closeStreams(errclass.Redact("stream exceeded request-timeout"), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
@@ -472,8 +562,31 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 			closeStreams(errclass.Redact("stream exceeded max-response-bytes"), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
+		// Record whether a logical terminal marker ever crossed the wire, so a
+		// clean upstream close can be told apart from a mid-response cutoff
+		// (the converter only sets done on the [DONE] sentinel).
+		terminal.feed(payload)
 		events, done, convErr := conv.Feed(payload)
 		if convErr != nil {
+			// CommandCode can embed an error object inside the SSE stream (the
+			// converter classifies it through FromStatus/UpstreamFallback).
+			// When that classification is account- or model-level — the
+			// credential is exhausted, the model is gone, the request is
+			// defective — forward it verbatim so CPA's cooldown pipeline sees
+			// the real reason instead of a generic truncation. Everything else
+			// (a malformed chunk, a plain upstream hiccup) stays a
+			// post-first-byte truncation: no cooldown, no replay.
+			if significantStreamConvError(convErr) {
+				fwd := *convErr
+				if emittedAny {
+					// Bytes already reached the client; a replay would deliver
+					// them twice, so a forwarded classification must never
+					// re-enable retry past the first downstream byte.
+					fwd.Retryable = false
+				}
+				closeStreams(errclass.Redact(fwd.Message), &fwd)
+				return
+			}
 			closeStreams(errclass.Redact(convErr.Message), errclass.PostFirstByteTruncated("stream truncated after first byte"))
 			return
 		}
@@ -484,13 +597,33 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 			closeStreams(errclass.Redact(emitErr.Error()), errclass.PostFirstByteConnectionLifecycle("downstream consumer closed"))
 			return
 		}
+		if len(events) > 0 {
+			emittedAny = true
+		}
 		convDone = done
 		if convDone || upstreamClosed {
+			// Claim completion so a watchdog that has not yet fired becomes a
+			// no-op; if it already won the CAS the top-of-loop check caught it.
+			pumpState.CompareAndSwap(pumpRunning, pumpCompleted)
 			break
 		}
 	}
-	debugTrace("executor stream loop end convDone=%t upstreamClosed=%t", convDone, upstreamClosed)
+	debugTrace("executor stream loop end convDone=%t upstreamClosed=%t terminalSeen=%t", convDone, upstreamClosed, terminal.seen)
 	if !convDone && upstreamClosed {
+		if !terminal.seen {
+			// Upstream closed without the [DONE] sentinel AND without any
+			// logical terminal (finish_reason / message_stop /
+			// response.completed): the connection was cut mid-response.
+			// Synthesizing a clean end here would misreport a truncated answer
+			// as complete, so report a post-first-byte truncation instead. Like
+			// every post-first-byte failure it is non-retryable and carries no
+			// cooldown — the bytes already emitted stay with the client.
+			closeStreams(errclass.Redact("upstream closed before stream terminal"), errclass.PostFirstByteTruncated("stream truncated before terminal event"))
+			return
+		}
+		// A terminal arrived but [DONE] did not: the converter may be holding a
+		// deferred terminal (message_stop / response.completed) that must still
+		// reach the client before the clean close.
 		if flusher, ok := conv.(interface{ Flush() [][]byte }); ok {
 			flushed := flusher.Flush()
 			if emitErr := m.emitAll(downID, flushed); emitErr != nil {
@@ -499,6 +632,85 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 			}
 		}
 	}
+}
+
+// significantStreamConvError reports whether a mid-stream converter error
+// carries account- or model-level meaning CPA must act on (cool the
+// credential, retire the model, stop rotation) rather than a generic stream
+// fault. For these the executor forwards the converter's own classification so
+// the cooldown pipeline sees the real reason; everything else collapses to a
+// post-first-byte truncation.
+func significantStreamConvError(e *errclass.Error) bool {
+	if e == nil {
+		return false
+	}
+	if e.CredentialScoped {
+		return true
+	}
+	switch e.WireCode {
+	case pluginabi.ErrorCodeCredentialQuota,
+		pluginabi.ErrorCodeModelNotFound,
+		pluginabi.ErrorCodeRequestScoped,
+		pluginabi.ErrorCodeForceCooldown:
+		return true
+	}
+	switch e.Class {
+	case errclass.ClassAuth, errclass.ClassBilling, errclass.ClassQuota, errclass.ClassInvalidModel:
+		return true
+	}
+	return false
+}
+
+// pump goroutine lifecycle states for the watchdog CAS. Exactly one of the
+// watchdog (pumpAborted) and the pump loop (pumpCompleted) flips pumpRunning,
+// deciding who owns the upstream StreamClose.
+const (
+	pumpRunning int32 = iota
+	pumpCompleted
+	pumpAborted
+)
+
+// terminalScanner watches the raw UPSTREAM SSE bytes for any marker that ends
+// a response — the [DONE] sentinel, a non-null finish_reason, Anthropic's
+// message_stop, or Responses' response.completed. It exists so the pump can
+// distinguish a clean close that merely omitted [DONE] (terminal seen, flush
+// and close cleanly) from a connection cut mid-response (nothing seen, report
+// a truncation). A short tail is carried between chunks so a marker split
+// across two host reads is still matched.
+type terminalScanner struct {
+	seen bool
+	tail []byte
+}
+
+var terminalMarkers = [][]byte{
+	[]byte("[DONE]"),
+	[]byte(`"finish_reason":"`), // a quoted value is non-null; ":null" never matches
+	[]byte("message_stop"),
+	[]byte("response.completed"),
+}
+
+// terminalScanCarry is one byte shorter than the longest marker, enough to
+// re-join a marker straddling a chunk boundary without unbounded buffering.
+const terminalScanCarry = len("response.completed") - 1
+
+func (ts *terminalScanner) feed(chunk []byte) {
+	if ts.seen || len(chunk) == 0 {
+		return
+	}
+	buf := make([]byte, 0, len(ts.tail)+len(chunk))
+	buf = append(buf, ts.tail...)
+	buf = append(buf, chunk...)
+	for _, mk := range terminalMarkers {
+		if bytes.Contains(buf, mk) {
+			ts.seen = true
+			ts.tail = nil
+			return
+		}
+	}
+	if len(buf) > terminalScanCarry {
+		buf = buf[len(buf)-terminalScanCarry:]
+	}
+	ts.tail = append(ts.tail[:0], buf...)
 }
 
 // emitAll feeds converted events downstream in order. StreamEmit is

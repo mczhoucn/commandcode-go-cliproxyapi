@@ -81,6 +81,17 @@ func imagePart(url string) map[string]any {
 	return map[string]any{"type": "input_image", "image_url": url}
 }
 
+// imagePartWithDetail is imagePart plus the client's optional image
+// preprocessing preference (low | high | original | auto). An empty detail
+// omits the field so the upstream uses its own default.
+func imagePartWithDetail(url, detail string) map[string]any {
+	part := map[string]any{"type": "input_image", "image_url": url}
+	if detail != "" {
+		part["detail"] = detail
+	}
+	return part
+}
+
 // respToolChoice renders a shared.DecodeToolChoice kind into the Responses
 // wire value; absent yields nil so omitempty drops the field. It is
 // infallible: shared.DecodeToolChoice emits exactly the closed set below,
@@ -116,7 +127,10 @@ func contentParts(raw json.RawMessage, role string) ([]map[string]any, *errclass
 	out := make([]map[string]any, 0, len(parts))
 	for _, p := range parts {
 		if p.ImageURL != "" {
-			out = append(out, imagePart(p.ImageURL))
+			// Carry detail through so the client's image preprocessing
+			// preference survives translation (Fix #12: image_url.detail
+			// was silently dropped before).
+			out = append(out, imagePartWithDetail(p.ImageURL, p.Detail))
 			continue
 		}
 		out = append(out, textPart(role, p.Text))
@@ -211,6 +225,15 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 			if eErr != nil {
 				return nil, eErr
 			}
+			// Replay reasoning_content BEFORE text parts so the
+			// tool-carrying multi-turn round-trip the upstream requires
+			// survives (CLAUDE.md: "Historical thinking must be replayed").
+			if m.ReasoningContent != "" {
+				req.Input = append(req.Input, map[string]any{
+					"type":    "reasoning",
+					"content": m.ReasoningContent,
+				})
+			}
 			if len(parts) > 0 {
 				req.Input = append(req.Input, msgItem(m.Role, parts))
 			}
@@ -296,9 +319,11 @@ func reasoningEffortFor(effort string, ts *pluginapi.ThinkingSupport) (string, b
 // Claude-request kernel; only target-shape rendering stays local.
 //
 // Explicit omission policy (FR-005 "where compatible"): stop_sequences is
-// dropped (no Responses equivalent); thinking/redacted_thinking blocks are
-// dropped because signed Anthropic chain-of-thought has no Responses input
-// representation (the thinking *control* maps to reasoning.effort); images
+// dropped (no Responses equivalent); assistant thinking blocks replay as a
+// reasoning item with plaintext content, because DeepSeek rejects a tools
+// request whose earlier thinking was dropped; redacted_thinking stays
+// omitted since it has no plaintext to replay. The thinking *control* maps
+// to reasoning.effort, and an explicit output_config.effort wins; images
 // nested inside tool_result content are rejected descriptively, never
 // silently lost (FR-005). The tool_result is_error flag has no Responses
 // field and is preserved as an "[error] " marker in the output text rather
@@ -316,7 +341,18 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 		TopP:            src.TopP,
 	}
 	req.ToolChoice = respToolChoice(src.ToolChoiceKind, src.ToolChoiceName)
-	if shared.ThinkingEnabled(src.Thinking) {
+	// Effort precedence: explicit output_config.effort wins over a budget-derived
+	// level (CLAUDE.md: "explicit effort always wins over the budget-derived
+	// level"). The same rule the Chat Completions target applies (claudeToChat).
+	switch {
+	case src.Effort != "":
+		if eErr := thinking.ValidateEffort(src.Effort, ts); eErr != nil {
+			return nil, eErr
+		}
+		if effort, ok := reasoningEffortFor(src.Effort, ts); ok {
+			req.Reasoning = map[string]any{"effort": effort}
+		}
+	case shared.ThinkingEnabled(src.Thinking):
 		if effort, ok := reasoningEffortFor(thinking.EffortFromBudget(src.Thinking.BudgetTokens, ts), ts); ok {
 			req.Reasoning = map[string]any{"effort": effort}
 		}
@@ -368,8 +404,21 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 					"call_id": blk.CallID,
 					"output":  output,
 				})
-			case "thinking", "redacted_thinking":
-				// omitted per the FR-005 policy in the doc comment
+			case "thinking":
+				// Replay thinking as a Responses reasoning item so the
+				// tool-carrying multi-turn round-trip the upstream requires
+				// survives (CLAUDE.md: "Historical thinking must be replayed").
+				// redacted_thinking is encrypted metadata with no plaintext —
+				// it stays omitted rather than fabricating a fake replay.
+				if blk.Text != "" {
+					flush()
+					req.Input = append(req.Input, map[string]any{
+						"type":    "reasoning",
+						"content": blk.Text,
+					})
+				}
+			case "redacted_thinking":
+				// omitted: encrypted metadata with no plaintext to replay
 			default:
 				flush()
 				return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)

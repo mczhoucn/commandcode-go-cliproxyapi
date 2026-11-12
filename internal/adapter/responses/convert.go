@@ -22,11 +22,38 @@ type respTextPart struct {
 }
 
 type respOutputItem struct {
-	Type      string         `json:"type"` // message | function_call | ...
-	CallID    string         `json:"call_id"`
-	Name      string         `json:"name"`
-	Arguments string         `json:"arguments"`
-	Content   []respTextPart `json:"content"`
+	Type      string `json:"type"` // message | function_call | reasoning | ...
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	// Content stays raw: a message item carries an array of text parts, but
+	// a reasoning item's content may be a plain string (DeepSeek's shape),
+	// which would fail a typed decode of the whole result.
+	Content json.RawMessage `json:"content"`
+	Summary []struct {
+		Text string `json:"text"`
+	} `json:"summary"`
+}
+
+// messageParts decodes a message item's content array; anything else is a
+// translation failure, as it was when the field was decoded typed.
+func messageParts(item respOutputItem) ([]respTextPart, *errclass.Error) {
+	if !shared.HasContent(item.Content) {
+		return nil, nil
+	}
+	var parts []respTextPart
+	if err := json.Unmarshal(item.Content, &parts); err != nil {
+		return nil, errclass.Translation("malformed Responses message content: " + err.Error())
+	}
+	return parts, nil
+}
+
+// reasoningText extracts a reasoning item's plaintext through the shared
+// replay kernel (content first, summary fallback), so the non-stream and
+// request-replay paths agree on which field wins.
+func reasoningText(item respOutputItem) string {
+	ri := shared.RespItem{Type: item.Type, Content: item.Content, Summary: item.Summary}
+	return shared.RespReasoningItemText(ri)
 }
 
 type respUsageIn struct {
@@ -101,7 +128,7 @@ func ccFinishFromStatus(status string, sawToolCall bool) string {
 // carries real content the target protocol cannot represent; purely
 // informational items are omittable per the compatibility policy.
 func respItemCarriesPayload(item respOutputItem) bool {
-	return len(item.Content) > 0 || item.Name != "" || item.CallID != "" ||
+	return shared.HasContent(item.Content) || item.Name != "" || item.CallID != "" ||
 		strings.TrimSpace(item.Arguments) != ""
 }
 
@@ -109,22 +136,25 @@ func respItemCarriesPayload(item respOutputItem) bool {
 // response: output_text parts concatenate into message.content,
 // function_call items become indexed tool_calls with their arguments
 // verbatim, status maps to finish_reason, and input/output tokens map to
-// prompt/completion usage (FR-006, AC §D). Reasoning summaries and other
-// informational output items have no equivalent and are omitted per the
-// FR-005/FR-006 compatibility policy; only items carrying real content
-// fail descriptively.
+// prompt/completion usage (FR-006, AC §D). Reasoning items concatenate into
+// message.reasoning_content. Other informational output items are omitted;
+// only unknown items carrying real content fail descriptively.
 func responsesToChat(body []byte) ([]byte, *errclass.Error) {
 	resp, eErr := decodeResp(body)
 	if eErr != nil {
 		return nil, eErr
 	}
 	msg := shared.CCMessage{Role: "assistant"}
-	var text strings.Builder
+	var text, reasoning strings.Builder
 	sawToolCall := false
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "message":
-			for _, part := range item.Content {
+			parts, eErr := messageParts(item)
+			if eErr != nil {
+				return nil, eErr
+			}
+			for _, part := range parts {
 				if part.Type == "output_text" {
 					text.WriteString(part.Text)
 				}
@@ -136,8 +166,9 @@ func responsesToChat(body []byte) ([]byte, *errclass.Error) {
 			msg.ToolCalls = append(msg.ToolCalls, tc)
 			sawToolCall = true
 		case "reasoning":
-			// Reasoning summaries have no Chat Completions equivalent and
-			// are omitted per the FR-005/FR-006 compatibility policy.
+			// Fix #2: reasoning ships as reasoning_content, the field the
+			// stream path emits, so the client can replay it next turn.
+			reasoning.WriteString(reasoningText(item))
 		default:
 			if respItemCarriesPayload(item) {
 				return nil, errclass.Translation(fmt.Sprintf(
@@ -149,6 +180,7 @@ func responsesToChat(body []byte) ([]byte, *errclass.Error) {
 		raw, _ := json.Marshal(t)
 		msg.Content = raw
 	}
+	msg.ReasoningContent = reasoning.String()
 	// Shared kernel computes total_tokens as prompt+completion so the
 	// majority rule cannot diverge from the sibling mappers.
 	out := shared.CompletionEnvelope(resp.ID, resp.Model, time.Now().Unix(),
@@ -182,9 +214,9 @@ func responsesToChat(body []byte) ([]byte, *errclass.Error) {
 // arguments decoded as input, completed status maps to stop_reason
 // end_turn (tool_use when tools were called, max_tokens when incomplete),
 // and input/output tokens map to input/output usage (FR-006). Reasoning
-// summaries and other informational output items are omitted per the
-// FR-005/FR-006 compatibility policy; only items carrying real content
-// fail descriptively.
+// items with plaintext become thinking blocks in place. Other informational
+// output items are omitted; only unknown items carrying real content fail
+// descriptively.
 func responsesToClaude(body []byte) ([]byte, *errclass.Error) {
 	resp, eErr := decodeResp(body)
 	if eErr != nil {
@@ -195,7 +227,11 @@ func responsesToClaude(body []byte) ([]byte, *errclass.Error) {
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "message":
-			for _, part := range item.Content {
+			parts, eErr := messageParts(item)
+			if eErr != nil {
+				return nil, eErr
+			}
+			for _, part := range parts {
 				// Uniform DROP policy (route parity): empty output_text
 				// parts ship no dead text block.
 				if part.Type == "output_text" && part.Text != "" {
@@ -212,8 +248,12 @@ func responsesToClaude(body []byte) ([]byte, *errclass.Error) {
 			})
 			sawToolCall = true
 		case "reasoning":
-			// Reasoning summaries have no Messages equivalent and are
-			// omitted per the FR-005/FR-006 compatibility policy.
+			// Fix #2: plaintext reasoning becomes an unsigned thinking
+			// block in place (the shape the Chat Completions route emits);
+			// an item with no plaintext ships no empty block.
+			if t := reasoningText(item); t != "" {
+				blocks = append(blocks, map[string]any{"type": "thinking", "thinking": t})
+			}
 		default:
 			if respItemCarriesPayload(item) {
 				return nil, errclass.Translation(fmt.Sprintf(

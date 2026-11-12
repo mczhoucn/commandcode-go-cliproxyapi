@@ -151,7 +151,7 @@ plugins:
 |---|---|---|---|
 | `api-keys` | — | ignored | Retired. Not a key source. See [Accounts](#accounts). |
 | `base-url` | `string` | `https://api.commandcode.ai/provider/v1` | Upstream provider base URL. Valid HTTPS (or HTTP with `allow-http: true`), no query, fragment, or userinfo. |
-| `catalog-url` | `string` | `{base-url}/models` | Catalog URL; receives the enabled account's bearer API key even for public catalogs. Use only a trusted destination, preferably the same scheme/host/port as `base-url`; same-origin is not enforced by configuration validation. |
+| `catalog-url` | `string` | `{base-url}/models` | Catalog URL; receives the enabled account's bearer API key even for public catalogs. Its host (including port) must match `base-url`; configuration validation rejects a different host. |
 | `model-prefix.enabled` | `bool` | `true` | Client-facing ids use `<prefix>/<model>`; `false` publishes bare upstream ids. |
 | `model-prefix.value` | `string` | `commandcode` | Provider prefix. |
 | `catalog.refresh-interval` | `duration` | `15m` | Catalog polling cadence (minimum `1m`). |

@@ -536,8 +536,12 @@ func TestBuildRequestResponses(t *testing.T) {
 		t.Fatalf("envelope fields wrong: %v", m)
 	}
 	msgs := m["messages"].([]any)
-	if len(msgs) != 6 {
-		t.Fatalf("want 6 messages, got %d: %v", len(msgs), msgs)
+	// Fix #13: a Responses assistant turn split across message + function_call
+	// items collapses into ONE Chat Completions assistant message carrying both
+	// content and tool_calls (the native OpenAI shape), so the standalone "a"
+	// message and the two function_calls merge into a single message.
+	if len(msgs) != 5 {
+		t.Fatalf("want 5 messages, got %d: %v", len(msgs), msgs)
 	}
 	if m0 := msgs[0].(map[string]any); m0["role"] != "system" || m0["content"] != "be nice" {
 		t.Fatalf("instructions message wrong: %v", m0)
@@ -549,13 +553,13 @@ func TestBuildRequestResponses(t *testing.T) {
 	if len(user) != 2 || user[1].(map[string]any)["type"] != "image_url" {
 		t.Fatalf("user parts wrong: %v", user)
 	}
-	if msgs[3].(map[string]any)["content"] != "a" {
-		t.Fatalf("assistant item wrong: %v", msgs[3])
+	merged := msgs[3].(map[string]any)
+	if merged["role"] != "assistant" || merged["content"] != "a" {
+		t.Fatalf("assistant content not preserved on merge: %v", merged)
 	}
-	merged := msgs[4].(map[string]any)
 	calls := merged["tool_calls"].([]any)
-	if merged["role"] != "assistant" || len(calls) != 2 {
-		t.Fatalf("consecutive function_calls not merged: %v", merged)
+	if len(calls) != 2 {
+		t.Fatalf("consecutive function_calls not merged into assistant message: %v", merged)
 	}
 	c1 := calls[0].(map[string]any)
 	if c1["id"] != "c1" || c1["function"].(map[string]any)["arguments"] != `{"x":1}` {
@@ -564,7 +568,7 @@ func TestBuildRequestResponses(t *testing.T) {
 	if calls[1].(map[string]any)["function"].(map[string]any)["arguments"] != "{}" {
 		t.Fatalf("empty arguments not defaulted: %v", calls[1])
 	}
-	outMsg := msgs[5].(map[string]any)
+	outMsg := msgs[4].(map[string]any)
 	if outMsg["role"] != "tool" || outMsg["tool_call_id"] != "c1" || outMsg["content"] != "ok" {
 		t.Fatalf("function_call_output wrong: %v", outMsg)
 	}

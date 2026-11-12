@@ -151,7 +151,7 @@ func TestOAuthCancelExpireAndReconfigureClearUndelivered(t *testing.T) {
 			case "shutdown":
 				mustHandle(t, m, pluginabi.MethodPluginShutdown, nil)
 			}
-			if m.credentialClaims[authKeyHash("clear-key")] {
+			if m.credentialClaims[authKeyHash("clear-key")].claimed {
 				t.Fatal("undelivered claim survived cleanup")
 			}
 			if got := m.pollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: start.State}); got.Status != pluginapi.AuthLoginStatusError {
@@ -223,7 +223,10 @@ func TestOAuthOldCancelledSessionCannotReleaseNewClaim(t *testing.T) {
 			original := f.responder
 			f.responder = func(method string, payload []byte) ([]byte, error) {
 				if method == pluginabi.MethodHostAuthSave {
-					return hostErr("timeout", "redacted"), nil
+					// An undecodable reply is an UNCERTAIN save (the file may have
+					// landed), so the claim is retained. A definitive error envelope
+					// now releases it (finding 1), which is not this scenario.
+					return []byte("not-an-envelope"), nil
 				}
 				return original(method, payload)
 			}
@@ -286,7 +289,7 @@ func TestOAuthIdleRefreshLoopPrunesExpiredReady(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		m.lifeMu.Lock()
-		retained := m.logins[start.State] != nil || m.credentialClaims[authKeyHash("idle-key")]
+		retained := m.logins[start.State] != nil || m.credentialClaims[authKeyHash("idle-key")].claimed
 		m.lifeMu.Unlock()
 		if !retained {
 			return

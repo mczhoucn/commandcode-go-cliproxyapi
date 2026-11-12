@@ -83,8 +83,10 @@ func TestResponsesEffortBecomesOutputConfig(t *testing.T) {
 	}
 }
 
-// An effort of "none" disables thinking, so no output_config is emitted for
-// it — "none" is a switch, not a strength level the upstream ranks.
+// An effort of "none" is a switch, not a strength level the upstream ranks,
+// so no output_config is emitted for it. It must, however, send
+// thinking {"type":"disabled"} so a model that defaults to reasoning is
+// explicitly turned off rather than left reasoning (fix #15).
 func TestNoneEffortEmitsNoOutputConfig(t *testing.T) {
 	body := []byte(`{"model":"commandcode/glm-5.2","max_output_tokens":256,
 	  "reasoning":{"effort":"none"},
@@ -107,7 +109,7 @@ func TestNoneEffortEmitsNoOutputConfig(t *testing.T) {
 	if req.OutputConfig != nil {
 		t.Fatalf("output_config emitted for none: %+v", req.OutputConfig)
 	}
-	if req.Thinking != nil {
-		t.Fatalf("thinking emitted for none: %+v", req.Thinking)
+	if req.Thinking == nil || req.Thinking.Type != "disabled" {
+		t.Fatalf("effort none must send thinking disabled, got: %+v", req.Thinking)
 	}
 }

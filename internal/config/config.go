@@ -169,6 +169,13 @@ func (c Config) validate() error {
 	if err := validateURL("catalog-url", c.CatalogURL, c.AllowHTTP); err != nil {
 		return err
 	}
+	// catalog-url sends the bearer key to its host. If catalog-url uses a
+	// different host than base-url, the bearer key would be leaked to a third
+	// party. Reject this unless the operator explicitly intends cross-host
+	// (which has no supported use case in this plugin).
+	if err := validateCatalogURLHost(c.BaseURL, c.CatalogURL); err != nil {
+		return err
+	}
 	if c.Catalog.RefreshInterval < time.Minute {
 		return fmt.Errorf("catalog.refresh-interval: must be at least 1m")
 	}
@@ -185,9 +192,44 @@ func (c Config) validate() error {
 		if !strings.HasPrefix(o.Endpoint, "/") {
 			return fmt.Errorf("route-overrides[%s].endpoint: must start with /", name)
 		}
+		// Path traversal and query/fragment in override endpoints are
+		// security-relevant: a ".." can redirect the joined URL to an
+		// unintended subtree, and "?" / "#" would truncate or corrupt the path
+		// (the override is a path suffix, not a full URL).
+		if strings.Contains(o.Endpoint, "?") || strings.Contains(o.Endpoint, "#") {
+			return fmt.Errorf("route-overrides[%s].endpoint: must not contain '?' or '#'", name)
+		}
+		if strings.Contains(o.Endpoint, "..") {
+			return fmt.Errorf("route-overrides[%s].endpoint: must not contain '..'", name)
+		}
 	}
 	if c.ModelPrefix.Enabled && !validPrefix(c.ModelPrefix.Value) {
 		return fmt.Errorf("model-prefix.value: invalid provider-ID characters %q", c.ModelPrefix.Value)
+	}
+	// All protocols disabled means the plugin can never serve any model; this
+	// is almost certainly a misconfiguration rather than an intent to run a
+	// no-op provider.
+	if !c.Protocols.ChatCompletions && !c.Protocols.Messages && !c.Protocols.Responses {
+		return fmt.Errorf("protocols: at least one protocol must be enabled")
+	}
+	return nil
+}
+
+// validateCatalogURLHost rejects a catalog-url whose host differs from the
+// base-url host. The catalog request carries the bearer API key; sending it
+// to a different host would leak the key to an unintended server.
+func validateCatalogURLHost(baseURL, catalogURL string) error {
+	bu, err := url.Parse(baseURL)
+	if err != nil || bu.Host == "" {
+		return nil // base already failed validateURL; skip the cross-host check
+	}
+	cu, err := url.Parse(catalogURL)
+	if err != nil || cu.Host == "" {
+		return nil // catalog already failed validateURL
+	}
+	if !strings.EqualFold(bu.Host, cu.Host) {
+		return fmt.Errorf("catalog-url: host %q differs from base-url host %q; "+
+			"the bearer key would be sent to a different server", cu.Host, bu.Host)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -28,11 +29,90 @@ type HostBridge struct {
 	call RawCaller
 	// inFlight counts host-callback invocations whose goroutines may still
 	// run — including callbacks orphaned past their deadline and the
-	// abandon/drain cleanup spawned for them. handleShutdown waits on it
-	// because Unix loaders free host_api and dlclose the plugin as soon as
-	// the shutdown export returns; any goroutine still calling into the
-	// host after that would crash the process.
-	inFlight sync.WaitGroup
+	// abandon/drain cleanup spawned for them. handleShutdown waits on it so
+	// the shutdown export does not return while plugin goroutines are still
+	// calling into the host. The v8.0.67 host closes this instance's HTTP
+	// operations and streams before calling shutdown and keeps the plugin
+	// image mapped (Go runtimes cannot be hot-unloaded), but older hosts and
+	// a callback racing the instance close still make the drain worthwhile.
+	//
+	// It is an inFlightCounter rather than a sync.WaitGroup because a timed
+	// wait can give up while counts are still held, and new callbacks (a
+	// late log, a watchdog close) may Add afterwards: WaitGroup forbids a
+	// positive Add concurrent with a Wait at zero and panics on reuse before
+	// the previous Wait returned, either of which would kill the host.
+	inFlight inFlightCounter
+}
+
+// inFlightCounter is a WaitGroup-like counter whose Wait takes a timeout and
+// which stays valid for Add/Done after any Wait, timed out or not. idle is
+// closed whenever the count is zero and replaced by a fresh open channel on
+// the 0->1 transition, so each waiter observes the zero point that follows
+// its own snapshot.
+type inFlightCounter struct {
+	mu   sync.Mutex
+	n    int
+	idle chan struct{} // nil means "zero, never used" (treated as closed)
+}
+
+// Add registers delta in-flight units. A negative delta behaves like that
+// many Done calls.
+func (c *inFlightCounter) Add(delta int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if delta < 0 {
+		c.releaseLocked(-delta)
+		return
+	}
+	if delta == 0 {
+		return
+	}
+	if c.n == 0 {
+		c.idle = make(chan struct{})
+	}
+	c.n += delta
+}
+
+// Done releases one in-flight unit. An unmatched Done is ignored instead of
+// panicking: a panic here would run on a host-callback goroutine and take the
+// whole host process down.
+func (c *inFlightCounter) Done() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseLocked(1)
+}
+
+func (c *inFlightCounter) releaseLocked(k int) {
+	if c.n == 0 {
+		return
+	}
+	c.n -= k
+	if c.n <= 0 {
+		c.n = 0
+		if c.idle != nil {
+			close(c.idle)
+		}
+	}
+}
+
+// Wait blocks until the count reaches zero or timeout elapses, returning
+// false on timeout. Abandoning the wait leaves the counter fully usable.
+func (c *inFlightCounter) Wait(timeout time.Duration) bool {
+	c.mu.Lock()
+	if c.n == 0 {
+		c.mu.Unlock()
+		return true
+	}
+	idle := c.idle
+	c.mu.Unlock()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // NewHostBridge wraps the injected raw host caller so the bridge satisfies
@@ -44,10 +124,11 @@ func NewHostBridge(call RawCaller) *HostBridge {
 
 // hostHTTPReq is the wire shape accepted by host.http.do / do_stream.
 type hostHTTPReq struct {
-	Method  string      `json:"method"`
-	URL     string      `json:"url"`
-	Headers http.Header `json:"headers"`
-	Body    []byte      `json:"body"`
+	Method         string      `json:"method"`
+	URL            string      `json:"url"`
+	Headers        http.Header `json:"headers"`
+	Body           []byte      `json:"body"`
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
 }
 
 type hostAuthListResponse struct {
@@ -61,20 +142,27 @@ type hostLogReq struct {
 	Fields  map[string]any `json:"fields"`
 }
 
+// errAuthSaveRejected marks an AuthSave failure that proves the host did NOT
+// persist the file: the request was never sent, the callback itself failed,
+// or the host answered with an error envelope. Timeouts and undecodable
+// replies are deliberately not wrapped with it because the save may have
+// landed; credential claims are released only on this sentinel (claims.go).
+var errAuthSaveRejected = errors.New("host auth save failed")
+
 // AuthSave persists one plugin-owned auth record through the host. The
 // credential is deliberately accepted only as JSON here; callers must not put
 // it in logs or error text.
 func (b *HostBridge) AuthSave(ctx context.Context, req pluginapi.HostAuthSaveRequest) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("host auth save failed: invalid request")
+		return fmt.Errorf("%w: invalid request", errAuthSaveRejected)
 	}
 	raw, err := b.callWithTimeout(ctx, pluginabi.MethodHostAuthSave, payload)
 	if err != nil {
 		if strings.Contains(err.Error(), "timed out") {
 			return fmt.Errorf("host auth save failed: timed out")
 		}
-		return fmt.Errorf("host auth save failed")
+		return errAuthSaveRejected
 	}
 	env, err := decodeEnvelope(raw)
 	if err != nil {
@@ -82,7 +170,7 @@ func (b *HostBridge) AuthSave(ctx context.Context, req pluginapi.HostAuthSaveReq
 	}
 	if !env.OK {
 		// Host error text is not trusted and may echo credential JSON.
-		return fmt.Errorf("host auth save failed")
+		return errAuthSaveRejected
 	}
 	return nil
 }
@@ -253,21 +341,11 @@ func (b *HostBridge) callWithTimeoutResult(ctx context.Context, method string, p
 // WaitForInFlight blocks until every in-flight host-callback invocation has
 // fully completed — including callbacks orphaned past their deadline and
 // their abandon/drain cleanup — or timeout elapses, returning false on
-// timeout (sync.WaitGroup has no timed wait). handleShutdown calls this so
-// the export does not return while our goroutines may still call into host
-// memory that a Unix loader frees immediately afterwards.
+// timeout. handleShutdown calls this so the export does not return while our
+// goroutines may still call into the host. A timed-out wait leaks no helper
+// goroutine and leaves the counter valid for later Add/Done.
 func (b *HostBridge) WaitForInFlight(timeout time.Duration) bool {
-	drained := make(chan struct{})
-	go func() {
-		b.inFlight.Wait()
-		close(drained)
-	}()
-	select {
-	case <-drained:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
+	return b.inFlight.Wait(timeout)
 }
 
 // invoke marshals payload and performs the host callback under ctx through
@@ -299,10 +377,18 @@ func (b *HostBridge) invoke(ctx context.Context, method string, payload any, wha
 
 // Do issues an upstream HTTP request through the host callback
 // "host.http.do"; transport-level failures surface as errors whose text is
-// safe for logs (no keys, no response bodies).
+// safe for logs (no keys, no response bodies). Implements catalog.HostClient.
+// The request is not parented to any plugin callback context.
 func (b *HostBridge) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	return b.doWithCallbackID(ctx, req, "")
+}
+
+// doWithCallbackID performs a blocking host HTTP request with an optional
+// host_callback_id, parenting the upstream HTTP operation to the plugin request
+// context so the host can cancel it when the downstream client disconnects.
+func (b *HostBridge) doWithCallbackID(ctx context.Context, req pluginapi.HTTPRequest, callbackID string) (pluginapi.HTTPResponse, error) {
 	env, err := b.invoke(ctx, pluginabi.MethodHostHTTPDo, hostHTTPReq{
-		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body,
+		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body, HostCallbackID: callbackID,
 	}, "host http do")
 	if err != nil {
 		return pluginapi.HTTPResponse{}, err
@@ -316,7 +402,9 @@ func (b *HostBridge) Do(ctx context.Context, req pluginapi.HTTPRequest) (plugina
 
 // DoStream opens an upstream HTTP stream via "host.http.do_stream" and
 // returns the upstream status, headers, and UPSTREAM stream ID used with
-// StreamRead/StreamClose. When the start callback outlives the attempt
+// StreamRead/StreamClose. The request is not parented to any plugin callback context.
+//
+// When the start callback outlives the attempt
 // deadline, the host may still have registered the upstream stream before
 // surfacing its status: DoStream waits streamTimeoutGrace for the orphaned
 // callback and closes any stream it produced (F1), while still returning
@@ -324,8 +412,14 @@ func (b *HostBridge) Do(ctx context.Context, req pluginapi.HTTPRequest) (plugina
 // grace window is closed by the background abandon goroutine instead, so
 // no registered upstream stream ever leaks regardless of host latency.
 func (b *HostBridge) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (statusCode int, headers http.Header, upstreamStreamID string, err error) {
+	return b.doStreamWithCallbackID(ctx, req, "")
+}
+
+// doStreamWithCallbackID performs a host HTTP streaming request with an optional
+// host_callback_id, parenting the upstream operation to the plugin request context.
+func (b *HostBridge) doStreamWithCallbackID(ctx context.Context, req pluginapi.HTTPRequest, callbackID string) (statusCode int, headers http.Header, upstreamStreamID string, err error) {
 	payloadBytes, _ := json.Marshal(hostHTTPReq{
-		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body,
+		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body, HostCallbackID: callbackID,
 	})
 	raw, late, err := b.callWithTimeoutResult(ctx, pluginabi.MethodHostHTTPDoStream, payloadBytes, streamTimeoutGrace, b.closeLateStream)
 	if late {
@@ -378,9 +472,17 @@ func (b *HostBridge) closeLateStream(raw []byte) {
 // end of stream. context.Background() imposes no deadline — blocking is
 // governed by upstream close semantics and the executor watchdog — but the
 // callback still joins inFlight accounting so shutdown drains a read
-// parked inside the host instead of dlclose-ing over its live FFI frame.
+// parked inside the host before the shutdown export returns.
 func (b *HostBridge) StreamRead(upstreamStreamID string) (payload []byte, errMsg string, done bool, err error) {
-	env, err := b.invoke(context.Background(), pluginabi.MethodHostHTTPStreamRead,
+	return b.StreamReadContext(context.Background(), upstreamStreamID)
+}
+
+// StreamReadContext is StreamRead with a caller-supplied deadline. The
+// pre-first-byte error-body drain uses it so a stalled upstream cannot park
+// the read forever: ctx bounds the single round-trip, and the callback still
+// joins inFlight accounting so shutdown drains a read parked inside the host.
+func (b *HostBridge) StreamReadContext(ctx context.Context, upstreamStreamID string) (payload []byte, errMsg string, done bool, err error) {
+	env, err := b.invoke(ctx, pluginabi.MethodHostHTTPStreamRead,
 		hostStreamIDReq{StreamID: upstreamStreamID}, "host http stream_read")
 	if err != nil {
 		return nil, "", false, err
@@ -454,7 +556,13 @@ var logTimeout = 5 * time.Second
 // WriteTimeout, so a host whose downstream chunk consumer stops draining
 // would otherwise park the execute_stream producer forever. Package var so
 // tests can shrink it.
-var emitTimeout = logTimeout
+//
+// It is deliberately independent of logTimeout and much longer: an emit
+// blocks for as long as the host applies backpressure from a slow client
+// (a mobile link, a paused reader). Tripping after 5s would cut healthy but
+// slow streams mid-response with connection_lifecycle; 60s still bounds a
+// truly wedged consumer.
+var emitTimeout = 60 * time.Second
 
 // Log forwards one diagnostic record to the host callback "host.log".
 // message and fields must already be secret-free. Bounded by logTimeout;

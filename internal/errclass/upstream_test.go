@@ -2,6 +2,7 @@ package errclass
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -120,13 +121,21 @@ func TestUpstreamRetryAfterHeader(t *testing.T) {
 	}
 }
 
-// A bogus hint must be rejected rather than pinning a credential out of
-// rotation for years.
-func TestUpstreamRetryAfterRejectsAbsurdValues(t *testing.T) {
-	for _, raw := range []string{"0", "-5", "999999999", "not-a-date"} {
+// A bogus or absurdly large hint is CLAMPED to maxRetryAfterSeconds rather
+// than silently dropped: a present-but-huge Retry-After is still more useful
+// as a bounded hint than as zero. Zero and negative values remain rejected.
+func TestUpstreamRetryAfterClampsLargeValues(t *testing.T) {
+	// Very large positive value: clamped to cap, not rejected.
+	large := fmt.Sprintf("%d", maxRetryAfterSeconds+1)
+	e := FromUpstreamHeaders(http.StatusServiceUnavailable, nil, http.Header{"Retry-After": []string{large}})
+	if e.RetryAfterSeconds != maxRetryAfterSeconds {
+		t.Errorf("Retry-After %q -> %d, want clamped to %d", large, e.RetryAfterSeconds, maxRetryAfterSeconds)
+	}
+	// Zero and negative are still rejected.
+	for _, raw := range []string{"0", "-5", "not-a-date"} {
 		e := FromUpstreamHeaders(http.StatusServiceUnavailable, nil, http.Header{"Retry-After": []string{raw}})
 		if e.RetryAfterSeconds != 0 {
-			t.Errorf("Retry-After %q -> %d, want rejected", raw, e.RetryAfterSeconds)
+			t.Errorf("Retry-After %q -> %d, want rejected (zero)", raw, e.RetryAfterSeconds)
 		}
 	}
 }

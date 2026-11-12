@@ -284,17 +284,19 @@ func TestChatCompletionsThinkingBudget(t *testing.T) {
 }
 
 func TestChatCompletionsThinkingNoneAndAuto(t *testing.T) {
-	// "none" with ZeroAllowed resolves to 0: no thinking block, sampling kept.
+	// "none" is a switch that explicitly disables thinking (fix #15): it sends
+	// thinking {"type":"disabled"} while keeping sampling controls intact (only
+	// an *enabled* budget conflicts with sampling).
 	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true}
 	m, eErr := chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"none","temperature":0.5}`)
 	if eErr != nil {
 		t.Fatalf("unexpected error: %v", eErr)
 	}
-	if _, ok := m["thinking"]; ok {
-		t.Errorf("thinking must be omitted for zero budget: %v", m["thinking"])
+	if th, ok := m["thinking"].(map[string]any); !ok || th["type"] != "disabled" {
+		t.Errorf("effort none must send thinking disabled: %v", m["thinking"])
 	}
 	if m["temperature"] != 0.5 {
-		t.Errorf("sampling controls must survive zero budget: %v", m["temperature"])
+		t.Errorf("sampling controls must survive effort none: %v", m["temperature"])
 	}
 
 	// dynamic "auto" has no Anthropic sentinel: omitted, sampling kept.
@@ -310,17 +312,18 @@ func TestChatCompletionsThinkingNoneAndAuto(t *testing.T) {
 	}
 }
 
-// F6 regression: with ZeroAllowed AND Min>0, effort "none" must stay at the
-// zero off-sentinel — the Min clamp must not silently re-enable thinking
-// (FR-005).
+// F6 regression: with ZeroAllowed AND Min>0, effort "none" must disable
+// thinking outright — the Min clamp must not silently re-enable it by
+// producing an *enabled* budget (FR-005). "none" sends thinking
+// {"type":"disabled"} (fix #15), never an enabled block.
 func TestChatCompletionsThinkingNoneIgnoresMin(t *testing.T) {
 	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, Min: 2048}
 	m, eErr := chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"none","temperature":0.5,"top_p":0.9}`)
 	if eErr != nil {
 		t.Fatalf("unexpected error: %v", eErr)
 	}
-	if _, ok := m["thinking"]; ok {
-		t.Errorf("effort none must not produce a thinking block despite Min: %v", m["thinking"])
+	if th, ok := m["thinking"].(map[string]any); !ok || th["type"] != "disabled" {
+		t.Errorf("effort none must send thinking disabled despite Min: %v", m["thinking"])
 	}
 	if m["temperature"] != 0.5 || m["top_p"] != 0.9 {
 		t.Errorf("sampling controls must survive effort none: temperature=%v top_p=%v", m["temperature"], m["top_p"])
@@ -784,16 +787,23 @@ func TestResponsesToolChoicePreserved(t *testing.T) {
 	}
 }
 
-func TestResponsesNoneToolChoiceRejected(t *testing.T) {
-	_, eErr := respReq(t, `{"tool_choice":"none","input":[]}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		!strings.Contains(eErr.Message, `"none"`) {
-		t.Fatalf("err = %v", eErr)
+// Fix #14: tool_choice "none" now maps to Anthropic {"type":"none"} (a
+// supported type) instead of being rejected, so a client's "call no tools"
+// constraint survives toward Messages upstreams.
+func TestResponsesNoneToolChoiceMapped(t *testing.T) {
+	m, eErr := respReq(t, `{"tool_choice":"none","input":[]}`)
+	if eErr != nil {
+		t.Fatalf("none: %v", eErr)
+	}
+	tc := m["tool_choice"].(map[string]any)
+	if tc["type"] != "none" || len(tc) != 1 {
+		t.Fatalf("none tool_choice = %v", tc)
 	}
 }
 
 // Remaining tool_choice arms on the CC→Messages leg: "required" maps to
-// Anthropic "any"; "none" fails descriptively; malformed fails translation.
+// Anthropic "any"; "none" maps to Anthropic {"type":"none"} (fix #14);
+// malformed fails translation.
 func TestChatCompletionsToolChoiceArms(t *testing.T) {
 	m, eErr := chatReq(t, `{"tool_choice":"required","messages":[],"tools":[{"type":"function","function":{"name":"f"}}]}`)
 	if eErr != nil {
@@ -804,10 +814,13 @@ func TestChatCompletionsToolChoiceArms(t *testing.T) {
 		t.Fatalf("required tool_choice = %v", tc)
 	}
 
-	_, eErr = chatReq(t, `{"tool_choice":"none","messages":[]}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		!strings.Contains(eErr.Message, `"none"`) {
-		t.Fatalf("none err = %v", eErr)
+	m, eErr = chatReq(t, `{"tool_choice":"none","messages":[]}`)
+	if eErr != nil {
+		t.Fatalf("none: %v", eErr)
+	}
+	tc = m["tool_choice"].(map[string]any)
+	if tc["type"] != "none" || len(tc) != 1 {
+		t.Fatalf("none tool_choice = %v", tc)
 	}
 
 	_, eErr = chatReq(t, `{"tool_choice":42,"messages":[]}`)
@@ -914,10 +927,16 @@ func TestNoParallelFlagWhenAbsentOrTrue(t *testing.T) { // rows 1 + 6 byte pins
 	}
 }
 
-func TestParallelFalseNoneStillUnsupported(t *testing.T) { // row 7
-	_, eErr := chatReq(t, `{"tool_choice":"none","messages":[],"parallel_tool_calls":false}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		!strings.Contains(eErr.Message, `"none"`) {
-		t.Fatalf("err = %v", eErr)
+func TestParallelFalseNoneAttachesFlag(t *testing.T) { // row 7
+	// Fix #14: "none" is now representable, so an explicit
+	// parallel_tool_calls=false rides on the {"type":"none"} block as
+	// disable_parallel_tool_use rather than failing.
+	m, eErr := chatReq(t, `{"tool_choice":"none","messages":[],"parallel_tool_calls":false}`)
+	if eErr != nil {
+		t.Fatalf("none: %v", eErr)
+	}
+	tc := m["tool_choice"].(map[string]any)
+	if tc["type"] != "none" || tc["disable_parallel_tool_use"] != true || len(tc) != 2 {
+		t.Fatalf("none tool_choice = %v", tc)
 	}
 }

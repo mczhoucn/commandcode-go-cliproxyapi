@@ -3,6 +3,7 @@ package responses
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"commandcode-or-or-cliproxyapi/internal/adapter/shared"
 	"commandcode-or-or-cliproxyapi/internal/errclass"
@@ -33,6 +34,20 @@ type StreamConverter struct {
 	textOpen   bool
 	nextIndex  int
 	openBlocks []int
+
+	// Reasoning (thinking) state for cross-format conversion (fix #2).
+	// Upstream Responses reasoning events are converted to reasoning_content
+	// (OpenAI target) or thinking blocks (Claude target).
+	thinkIndex int
+	thinkOpen  bool
+	thinkBuf   strings.Builder
+
+	// Flush state: once flushed, subsequent Flush calls return nil (fix #7).
+	// started records that response.created was observed, so Flush never
+	// emits a terminal for a stream that never opened (which would be
+	// malformed: message_delta/message_stop without a message_start).
+	flushed bool
+	started bool
 
 	// Shared function_call announce-or-replay decision table for both
 	// conversion targets; an instance converts to exactly one target,
@@ -200,6 +215,10 @@ type argsDeltaEvent struct {
 	Delta  string `json:"delta"`
 }
 
+type reasoningDeltaEvent struct {
+	Delta string `json:"delta"`
+}
+
 type terminalEvent struct {
 	Response responseMeta `json:"response"`
 }
@@ -345,12 +364,37 @@ func (sc *StreamConverter) convertEvent(eventType, payload string) ([][]byte, bo
 		if eErr := sc.checkTarget(); eErr != nil {
 			return nil, false, eErr
 		}
-		return nil, false, failureError(&ev)
+		return nil, false, failureError(&ev, []byte(payload))
+	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		// Fix #2: Upstream reasoning is now replayed for cross-format clients.
+		// OpenAI clients receive reasoning_content deltas, Claude clients
+		// receive thinking blocks. Responses passthrough handled by earlier
+		// passthroughEvent; this case only runs for conversion targets.
+		var ev reasoningDeltaEvent
+		if eErr := decodeEvent(eventType, payload, &ev); eErr != nil {
+			return nil, false, eErr
+		}
+		if eErr := sc.checkTarget(); eErr != nil {
+			return nil, false, eErr
+		}
+		return sc.reasoningDelta(ev.Delta)
+	case "response.reasoning_text.done", "response.reasoning_summary_text.done",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		// Fix #2: Lifecycle events validated and ignored (delta carries content).
+		// OpenAI/Claude don't have separate done events for reasoning.
+		if eErr := sc.checkTarget(); eErr != nil {
+			return nil, false, eErr
+		}
+		var ignored map[string]any
+		if eErr := decodeEvent(eventType, payload, &ignored); eErr != nil {
+			return nil, false, eErr
+		}
+		return nil, false, nil
 	default:
-		// Informational events (response.in_progress, annotations,
-		// reasoning summaries) have no client equivalent and are omitted
-		// per the FR-005/FR-006 compatibility policy; the payload is
-		// validated without materializing a discarded generic graph.
+		// Informational events (response.in_progress, annotations) have no
+		// client equivalent and are omitted per the FR-005/FR-006
+		// compatibility policy; the payload is validated without
+		// materializing a discarded generic graph.
 		if payload != "" && !json.Valid([]byte(payload)) {
 			return nil, false, errclass.Translation(fmt.Sprintf(
 				"malformed %s event payload: %s", eventType, shared.RedactedSnippet(payload)))
@@ -371,7 +415,7 @@ func (sc *StreamConverter) passthroughEvent(eventType, payload string, raw []byt
 	case "response.failed", "error":
 		var ev failureEvent
 		json.Unmarshal([]byte(payload), &ev)
-		return nil, false, failureError(&ev)
+		return nil, false, failureError(&ev, []byte(payload))
 	default:
 		return [][]byte{raw}, false, nil
 	}
@@ -400,6 +444,31 @@ func (sc *StreamConverter) textDelta(delta string) ([][]byte, bool, *errclass.Er
 	}
 	out = append(out, sc.claudeChunks().ContentBlockDelta(sc.textIndex,
 		map[string]any{"type": "text_delta", "text": delta}))
+	return out, false, nil
+}
+
+// reasoningDelta converts upstream Responses reasoning events to the target
+// format (fix #2): reasoning_content deltas for OpenAI Chat Completions
+// targets, thinking blocks for Claude Messages targets. Responses passthrough
+// is handled by passthroughEvent and never reaches here.
+func (sc *StreamConverter) reasoningDelta(delta string) ([][]byte, bool, *errclass.Error) {
+	sc.thinkBuf.WriteString(delta)
+	if sc.source == "openai" {
+		// OpenAI Chat Completions: emit reasoning_content in the delta.
+		// The shared.ReasoningFields kernel handles both reasoning_content
+		// and reasoning_details spellings.
+		return [][]byte{sc.chatChunks().Delta(map[string]any{"reasoning_content": delta})}, false, nil
+	}
+	// Claude Messages: emit thinking blocks with auto-open on first delta.
+	var out [][]byte
+	if !sc.thinkOpen {
+		sc.thinkIndex = sc.allocIndex()
+		sc.thinkOpen = true
+		sc.openBlocks = append(sc.openBlocks, sc.thinkIndex)
+		out = append(out, sc.claudeChunks().ContentBlockStart(sc.thinkIndex, "thinking", map[string]any{"thinking": ""}))
+	}
+	out = append(out, sc.claudeChunks().ContentBlockDelta(sc.thinkIndex,
+		map[string]any{"type": "thinking_delta", "thinking": delta}))
 	return out, false, nil
 }
 
@@ -550,6 +619,9 @@ func (sc *StreamConverter) closeOpenBlocks() [][]byte {
 	}
 	sc.openBlocks = nil
 	sc.textOpen = false
+	// The thinking block is closed too: later reasoning must open a fresh
+	// block rather than send a delta after its content_block_stop.
+	sc.thinkOpen = false
 	return out
 }
 
@@ -568,22 +640,91 @@ func (sc *StreamConverter) captureResponse(resp *responseMeta) {
 		sc.model = resp.Model
 	}
 	sc.created = int64(resp.CreatedAt)
+	sc.started = true
 }
 
 // failureError maps response.failed / error events onto FR-009 classes,
 // honoring an upstream status_code when present (§7 semantics); without
 // one the failure is treated as a retryable upstream server failure.
-func failureError(ev *failureEvent) *errclass.Error {
+// Fix #18: uses FromUpstream to preserve vendor error codes and rate-limit
+// metadata for accurate cooldown scope.
+func failureError(ev *failureEvent, rawJSON []byte) *errclass.Error {
 	status := int(ev.StatusCode)
 	if status == 0 {
 		status = int(ev.Response.StatusCode)
 	}
+	if status > 0 {
+		// Fix #18: hand the raw vendor error JSON to FromUpstream so a
+		// structured code / rateLimit is parsed and preserved (cooldown scope
+		// and retry timing), instead of classifying on the status alone.
+		return errclass.FromUpstream(status, rawJSON)
+	}
+	// No status anywhere in the event: an opaque upstream failure, treated as
+	// a retryable upstream server error (StatusCode 0) exactly as before.
 	msg := ev.Message
 	if msg == "" {
 		msg = ev.Response.Error.Message
 	}
-	if status > 0 {
-		return errclass.FromStatus(status, msg)
-	}
 	return errclass.UpstreamFallback(msg)
+}
+
+// Flush synthesizes terminal events when the upstream closed without
+// response.completed (fix #7). OpenAI targets receive a finish chunk,
+// Claude targets receive content_block_stop + message_delta + message_stop,
+// Responses targets receive response.completed with the captured output.
+// Returns nil if nothing was emitted (no terminal to defer) or if already
+// flushed.
+func (sc *StreamConverter) Flush() [][]byte {
+	if sc.flushed {
+		return nil
+	}
+	sc.flushed = true
+	// A stream that never saw response.created never opened a client-facing
+	// response; there is nothing to close and emitting a terminal would be
+	// malformed (e.g. message_delta without message_start).
+	if !sc.started {
+		return nil
+	}
+	switch sc.source {
+	case "openai", "claude":
+		// Reuse the normal-path terminal so a deferred/absent upstream
+		// response.completed closes the converted stream with exactly the
+		// same frames the complete path would have emitted: a finish chunk
+		// (Chat Completions) or close-before-stop blocks + message_delta +
+		// message_stop (Messages). Usage is unknown here, so zero-valued
+		// counts are reported (the truncation itself is surfaced separately
+		// via the stream's error_detail, never replayed here).
+		events, _, _ := sc.terminal(false, 0, 0, shared.UsageDetails{})
+		return events
+	case "openai-response":
+		// Responses passthrough forwards every upstream frame verbatim and
+		// buffers no content, so a synthesized completion can only carry an
+		// empty output snapshot. Emit it anyway so the Responses client sees
+		// a terminal and closes instead of hanging; the truncation is
+		// reported separately via error_detail.
+		return sc.synthesizeResponseCompleted()
+	default:
+		return nil
+	}
+}
+
+// synthesizeResponseCompleted builds a minimal response.completed event for
+// the passthrough target when the upstream closed without one (Flush path).
+// The passthrough buffers no content, so the output snapshot is empty and
+// usage is zero; its only job is to give the client a terminal to close on.
+func (sc *StreamConverter) synthesizeResponseCompleted() [][]byte {
+	ev := map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"id":     sc.id,
+			"model":  sc.model,
+			"output": []any{},
+			"status": "completed",
+			"usage": map[string]any{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
+		},
+	}
+	return [][]byte{shared.SSEEvent("response.completed", ev)}
 }

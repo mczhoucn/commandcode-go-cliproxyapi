@@ -480,9 +480,10 @@ func (w quotaWindow) exhausted() bool {
 	return w.Cap > 0 && w.Used >= w.Cap
 }
 
-// zeroWindow renders one window as fully consumed, keeping its cap so the bar
-// still has a denominator and its reset instant so the user knows when the
-// underlying limit lifts.
+// zeroWindow renders one window as fully consumed, keeping its cap (including
+// Cap == 0) so the bar still has a denominator and its reset instant so the user
+// knows when the underlying limit lifts. Finding 4: Cap 0 + exceeded state are
+// both preserved; quotaWindowDetail reflects exceeded state in the description.
 func zeroWindow(w quotaWindow) quotaWindow {
 	out := w
 	out.Used = w.Cap

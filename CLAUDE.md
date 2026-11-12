@@ -98,9 +98,11 @@ All outbound HTTP must go through `HostBridge` (`host.http.do`, `host.http.do_st
 - `Manager.lifeMu` serializes whole register / reconfigure / shutdown sequences and all login/claim mutation; `Manager.mu` guards the config/catalog snapshot. Never wait on a tick loop while holding `m.mu`.
 - Reconfigure stops the old ticker and waits for exit, then adopts the new manager unconditionally. If the refresh failed and `catalog.stale-while-unavailable` is on, the new manager re-seeds records from the old snapshot's raw entries rebuilt under the new config.
 - Registration does one bounded refresh (`registerRefreshTimeout`, 10s) so a slow catalog cannot block host startup. Discovery needs at least one enabled `commandcode` auth file; with none, the provider publishes no models, and `handleModelsForAuth` retries on demand when a key is added.
-- Shutdown waits (`shutdownDrainTimeout`, 15s) for all host-callback goroutines because Unix loaders free the host API and dlclose the plugin as soon as the export returns. Any new callback path must join `HostBridge.inFlight` through `invoke`/`callWithTimeoutResult`.
+- Shutdown waits (`shutdownDrainTimeout`, 15s) for all host-callback goroutines so none outlives the host API. (v8.0.67 closes the instance's host streams and HTTP operations before calling shutdown and never dlcloses, which is what unblocks parked emits; older loaders may unload as soon as the export returns.) Any new callback path must join `HostBridge.inFlight` through `invoke`/`callWithTimeoutResult`. `inFlight` is a counter with a timed wait, safe to `Add` after a timed-out wait — do not swap it back to a `sync.WaitGroup`.
+- `executor.execute` is always unary: a `stream: true` body is stripped and sent non-stream. Only `executor.execute_stream` streams. The pump goroutine has its own `recover()`; a panic in a goroutine of a c-shared library kills the whole host process, so any new background goroutine needs one too.
+- `host_callback_id` from the executor request is forwarded on `host.http.do` / `do_stream` so the host parents the upstream call on the client's request context (client disconnect cancels upstream). Omit it when absent for older hosts.
 - Stream IDs are direction-specific: IDs from `DoStream` are **upstream**; `executorRequest.StreamID` is the **downstream** ID. Never interchange them.
-- Emit and log callbacks have their own deadlines (`emitTimeout`/`logTimeout`) so a wedged host consumer surfaces as an error instead of parking a producer forever.
+- Emit and log callbacks have their own deadlines (`emitTimeout` 60s, `logTimeout` 5s, deliberately decoupled) so a wedged host consumer surfaces as an error instead of parking a producer forever. The host's emit queue holds 16 chunks and drains at client read speed, so a short emit deadline would abort slow-but-healthy clients.
 
 ### Auth model
 
@@ -129,14 +131,14 @@ Upstream remains CommandCode's OpenAI-compatible Provider API (`provider/v1`), m
 
 ### Management UI
 
-`resources/quota_page.html` and `oauth_page.html` are embedded (`resources/embed.go`) and served from `HandleManagement`. They are plain HTML/JS that authenticate by reading the host's `cli-proxy-auth` localStorage entry, decoding both `enc::v1::` (origin + user-agent) and `enc::v2::` (origin only) XOR formats. If the host changes that storage format again, both pages need updating. Browser tests in `tests/*.cjs` exercise these pages against local mocks.
+`resources/quota_page.html` and `oauth_page.html` are embedded (`resources/embed.go`) and served from `HandleManagement`. They are plain HTML/JS that authenticate by reading the host's `cli-proxy-auth` localStorage entry, decoding both `enc::v1::` (`location.host` + user-agent) and `enc::v2::` (`location.host` only) XOR formats, matching Management Center's `src/utils/encryption.ts`. If the host changes that storage format again, both pages need updating. Browser tests in `tests/*.cjs` exercise these pages against local mocks.
 
 ### Quota surfaces
 
 Two surfaces read the same upstream account API through `fetchQuota` (`quota.go`):
 
 - **Plugin page** (`quota-usage`): account list, key entry, per-card refresh; uses used/cap percentages.
-- **Standard `QuotaProvider`** (`quota_provider.go`): registration advertises `quota_provider`, and `quota.identifier` / `quota.describe` / `quota.fetch` serve Management Center's auth-file cards. The host-supplied shape is **remainingFraction in [0,1]** — the inverse of the page's percentage — and `window` values (`five_hour`, `weekly`) must stay in the host's known set or the UI loses its ordering/period labels. `QuotaBucket` has no display-name field, so the row label is packed into `description`. State flags beat the arithmetic: `unlimited` renders full and `exceeded` renders empty regardless of used/cap. `quota.reset` answers unsupported because CommandCode has no reset endpoint.
+- **Standard `QuotaProvider`** (`quota_provider.go`): registration advertises `quota_provider`, and `quota.identifier` / `quota.describe` / `quota.fetch` serve Management Center's auth-file cards. The host-supplied shape is **remainingFraction in [0,1]** — the inverse of the page's percentage — and `window` values (`five_hour`, `weekly`, `monthly`) must stay in the host's known set or the UI loses its ordering/period labels. `QuotaBucket` has no display-name field, so the row label is packed into `description`. State flags beat the arithmetic: `unlimited` renders full and `exceeded` renders empty regardless of used/cap. `quota.reset` answers unsupported because CommandCode has no reset endpoint.
 
 Changing either surface means keeping both consistent; the plugin page never fetches through the host's quota route.
 
@@ -163,16 +165,19 @@ CPA decides cooldown scope and duration from four envelope fields, so the plugin
 
 | Upstream condition | Reported as | CPA effect |
 |---|---|---|
-| `RATE_LIMITED` + `error.rateLimit.window` | `credential_quota`, `CredentialScoped`, `RetryAfterSeconds` from `rateLimit.reset` | Cool the whole credential until upstream reset |
-| `USAGE_EXCEEDED` / credit exhaustion | `credential_quota`, `CredentialScoped` | Cool the whole credential |
-| Plain 429 | `transient_rate_limit` | Cool only the model, no quota record |
+| `RATE_LIMITED`, any `error.rateLimit`, or usage-window wording (5-hour / weekly / monthly) | `credential_quota`, `CredentialScoped`, HTTP **429**, `RetryAfterSeconds` from `rateLimit.reset` or the message's "resets at / resets in" text | Cool the whole credential until upstream reset |
+| `USAGE_EXCEEDED` / credit / spend-cap exhaustion (upstream 402/403 included) | `credential_quota`, `CredentialScoped`, HTTP **429** | Cool the whole credential |
+| Plain or codeless 429 | `transient_rate_limit` | Cool only the model, no quota record |
 | `model_not_in_plan` / not on endpoint | `model_not_found` | Cool only that model |
 | Request defect (prompt too long) | `request_scoped` | No cooldown, stop rotation |
-| Post-first-byte truncation | `stream_truncated` (via `error_detail` on stream close) | No cooldown, no replay |
+| In-stream classified error (quota, auth, model) | forwarded as-is via `error_detail` on stream close; `Retryable=false` once bytes reached the client | Same as the non-stream row |
+| Post-first-byte truncation, or upstream EOF with no terminal event | `stream_truncated` (via `error_detail` on stream close) | No cooldown, no replay |
 | Client disconnect on emit | `connection_lifecycle` | No cooldown |
 | Dial/TLS/DNS failure | `transient_transport` | Retryable, no cooldown |
 
-Non-JSON upstream bodies fall back to the historical status-only classification, so proxy errors and plain-text failures keep their previous wording. `Retry-After` (delta-seconds or HTTP-date) is admitted only within `(0, 24h]`.
+**The host's credential-wide cooldown is 429-gated.** `MarkResult` (`sdk/cliproxy/auth/conductor_cooldown.go`) only applies the `credential_quota` wrap inside `case 429`; a 401/402/403 cools just the reporting model for a flat 30 minutes. That is why every credential-scoped outcome is rewritten to 429 even when upstream sent 402/403 — clients see 429 for spend-cap errors, by design. On a 429 the host uses `RetryAfterSeconds` verbatim (10s floor); without it, it falls back to exponential backoff from 1s capped at 30m, so a missing reset hint means the credential is retried quickly.
+
+Non-JSON upstream bodies fall back to status-only classification. Both `rateLimit.reset` (seconds, milliseconds when > 1e11, numeric string, or RFC3339) and `Retry-After` (delta-seconds or HTTP-date) are **clamped** to `maxRetryAfterSeconds` (32 days, covering weekly windows and a monthly billing period), never rejected.
 
 Verified end-to-end against a real v8.0.67 host: a window-exhausted 429 produced `scope: credential, reason: credential_quota, remaining_seconds: 3541` (matching the mock's reset instant), while a plain 429 produced `scope: model, reason: transient_rate_limit`.
 
@@ -192,6 +197,7 @@ Cross-compiling `-buildmode=c-shared` requires CGO and a matching C toolchain, s
 ## Conventions in this codebase
 
 - Comments cite spec identifiers (`FR-###`, `arch §`, `AC §`, `F1`–`F5`) whose source documents are **not** in this repository; treat them as stable rationale labels, not links.
+- `docs/` holds the in-repo design records: `model-capabilities.md` (per-model endpoints, reasoning-effort probes, why there is no capability API; linked from the README) and `oauth-api-key-design.md` (Chinese design doc for the OAuth-guide + manual-key entry points). Read them before changing routing defaults or the auth flow.
 - Code comments explain invariants and rejected alternatives heavily (especially around failure modes and race conditions). Match that density when changing concurrency, credentials, or protocol translation.
 - User-facing strings in the management API and pages are Chinese; code comments and docs are English (with bilingual README/CHANGELOG/RELEASE_NOTES).
 - Commits follow Conventional Commits with scopes such as `fix(adapter)`, `feat(auth)`, `feat(quota)`, `fix(plugin)`, `chore(release)`.

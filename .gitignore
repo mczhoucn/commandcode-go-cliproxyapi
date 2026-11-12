@@ -6,3 +6,4 @@ plugins/
 *.h
 build/
 .idea/
+.claude/

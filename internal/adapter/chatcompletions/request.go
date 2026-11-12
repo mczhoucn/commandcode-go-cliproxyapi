@@ -232,21 +232,16 @@ func claudeResultText(content json.RawMessage) (string, *errclass.Error) {
 // claudeUserMessages converts a user turn into Chat Completions messages:
 // text/image blocks become one user message (plain string when only
 // text), each tool_result block becomes a separate role:"tool" message
-// carrying its tool_use_id (FR-005).
+// carrying its tool_use_id (FR-005). Tool messages must immediately
+// follow the assistant tool_calls turn, so they are emitted FIRST; any
+// user text parts come after. This matches DeepSeek's requirement that
+// tool results appear directly after the assistant turn that produced the
+// calls — inserting a user text message between the two would cause a
+// 400 upstream.
 func claudeUserMessages(m *shared.ClaudeMessageRecord) ([]ccMessage, *errclass.Error) {
-	var msgs []ccMessage
+	var toolMsgs []ccMessage
 	var parts []ccContentPart
-	flush := func() {
-		if len(parts) == 0 {
-			return
-		}
-		var c any = parts
-		if len(parts) == 1 && parts[0].Type == "text" {
-			c = parts[0].Text
-		}
-		msgs = append(msgs, ccMessage{Role: "user", Content: c})
-		parts = nil
-	}
+
 	if m.Content != "" {
 		parts = append(parts, ccContentPart{Type: "text", Text: m.Content})
 	}
@@ -267,15 +262,25 @@ func claudeUserMessages(m *shared.ClaudeMessageRecord) ([]ccMessage, *errclass.E
 				// flag is never silently erased (FR-005).
 				text = shared.ToolResultErrorPrefix + text
 			}
-			flush()
-			msgs = append(msgs, ccMessage{
+			toolMsgs = append(toolMsgs, ccMessage{
 				Role: "tool", Content: text, ToolCallID: blk.CallID,
 			})
 		default:
 			return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
 		}
 	}
-	flush()
+
+	// Emit tool messages first so they remain adjacent to the preceding
+	// assistant tool_calls turn, then append the user text message (if any).
+	var msgs []ccMessage
+	msgs = append(msgs, toolMsgs...)
+	if len(parts) > 0 {
+		var c any = parts
+		if len(parts) == 1 && parts[0].Type == "text" {
+			c = parts[0].Text
+		}
+		msgs = append(msgs, ccMessage{Role: "user", Content: c})
+	}
 	return msgs, nil
 }
 
@@ -408,9 +413,22 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 					text = sb.String()
 				}
 				addSystem(text)
-			case "user", "assistant":
+			case "user":
 				if content != nil {
-					out.Messages = append(out.Messages, ccMessage{Role: item.Role, Content: content})
+					out.Messages = append(out.Messages, ccMessage{Role: "user", Content: content})
+				}
+			case "assistant":
+				// Merge into a preceding assistant message of this turn so
+				// [reasoning, message(assistant text), function_call] produces
+				// one upstream assistant message carrying reasoning_content +
+				// content + tool_calls (Fix #13: previously the three items
+				// became three separate assistant messages).
+				if content != nil {
+					if n := len(out.Messages); n > 0 && out.Messages[n-1].Role == "assistant" && out.Messages[n-1].Content == nil {
+						out.Messages[n-1].Content = content
+						continue
+					}
+					out.Messages = append(out.Messages, ccMessage{Role: "assistant", Content: content})
 				}
 			default:
 				return nil, shared.ValidateRole(item.Role, EndpointPath)
@@ -419,14 +437,14 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 			tc := shared.CCToolCall{ID: item.CallID, Type: "function"}
 			tc.Function.Name = item.Name
 			tc.Function.Arguments = shared.DefaultArgs(item.Arguments)
-			// Merge consecutive function_call items into one
-			// assistant message so multi-call turns round-trip.
-			if n := len(out.Messages); n > 0 {
-				last := &out.Messages[n-1]
-				if last.Role == "assistant" && last.Content == nil {
-					last.ToolCalls = append(last.ToolCalls, tc)
-					continue
-				}
+			// Merge into a preceding assistant message of the same turn even
+			// when it already carries content or reasoning (Fix #13): a
+			// function_call naturally follows the assistant's reasoning/text
+			// in one turn, and a separate assistant message would lose the
+			// association.
+			if n := len(out.Messages); n > 0 && out.Messages[n-1].Role == "assistant" {
+				out.Messages[n-1].ToolCalls = append(out.Messages[n-1].ToolCalls, tc)
+				continue
 			}
 			out.Messages = append(out.Messages, ccMessage{
 				Role: "assistant", ToolCalls: []shared.CCToolCall{tc},
@@ -450,14 +468,12 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 				continue
 			}
 			// Attach to the preceding assistant turn when there is one,
-			// otherwise open one — reasoning precedes the text/tool call it
-			// belongs to.
+			// concatenating with any earlier reasoning of the same turn so
+			// consecutive reasoning items do not fragment the assistant turn
+			// (Fix #13). Reasoning precedes the text/tool call it belongs to.
 			if n := len(out.Messages); n > 0 && out.Messages[n-1].Role == "assistant" {
-				last := &out.Messages[n-1]
-				if last.ReasoningContent == "" {
-					last.ReasoningContent = text
-					continue
-				}
+				out.Messages[n-1].ReasoningContent += text
+				continue
 			}
 			out.Messages = append(out.Messages, ccMessage{Role: "assistant", ReasoningContent: text})
 		default:
@@ -505,45 +521,11 @@ func respContent(raw json.RawMessage) (any, *errclass.Error) {
 	return out, nil
 }
 
-// reasoningItemText extracts the plaintext of a Responses reasoning item.
-//
-// DeepSeek's guide defines the accepted shapes: `content` is a string or an
-// array of text parts and is the only reasoning payload replayed into
-// history; `summary` and `encrypted_content` are not supported upstream, so
-// they are never forwarded as reasoning text. An item with none of these
-// contributes nothing.
-//
-// The parts are decoded locally rather than through DecodeStringOrParts
-// because a reasoning item's part type is `reasoning_text`, which is not an
-// input content part and would be rejected by that kernel's allowlist.
+// reasoningItemText extracts the plaintext of a Responses reasoning item
+// for history replay. Delegates to the shared kernel so the Chat Completions
+// and Messages routes cannot diverge on the reasoning replay shape.
 func reasoningItemText(item shared.RespItem) string {
-	if shared.HasContent(item.Content) {
-		var s string
-		if json.Unmarshal(item.Content, &s) == nil {
-			return s
-		}
-		var parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(item.Content, &parts) == nil {
-			var sb strings.Builder
-			for _, p := range parts {
-				switch p.Type {
-				case "reasoning_text", "text", "input_text", "output_text", "summary_text":
-					sb.WriteString(p.Text)
-				}
-			}
-			if text := sb.String(); text != "" {
-				return text
-			}
-		}
-	}
-	var sb strings.Builder
-	for _, s := range item.Summary {
-		sb.WriteString(s.Text)
-	}
-	return sb.String()
+	return shared.RespReasoningItemText(item)
 }
 
 // applyToolChoiceCC maps a normalized tool choice onto the outbound Chat

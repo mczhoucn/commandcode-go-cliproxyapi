@@ -122,7 +122,7 @@ func TestQuotaFetchMapsRemainingFraction(t *testing.T) {
 		t.Errorf("weekly remaining = %v, want ~0.471", frac)
 	}
 	// month pool = max(70,51.5)+2 = 72; remaining (51.5+2)/72 = 74.3%.
-	if frac := byWindow["month"].RemainingFraction; frac < 0.742 || frac > 0.745 {
+	if frac := byWindow["monthly"].RemainingFraction; frac < 0.742 || frac > 0.745 {
 		t.Errorf("month remaining = %v, want ~0.743", frac)
 	}
 	if byWindow["five_hour"].ResetTime != time.UnixMilli(1789657174807).UTC().Format(time.RFC3339) {

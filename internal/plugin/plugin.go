@@ -25,7 +25,7 @@ const ProviderID = "commandcode"
 // pluginName / pluginVersion are reported in registration metadata.
 const (
 	pluginName    = "commandcode-or-or-cliproxyapi"
-	pluginVersion = "0.2.2"
+	pluginVersion = "0.2.3"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
@@ -67,7 +67,7 @@ type Manager struct {
 
 	// Login sessions and unresolved saves share lifeMu with account admission.
 	logins           map[string]*loginSession
-	credentialClaims map[string]bool
+	credentialClaims map[string]credentialClaim
 	mu               sync.RWMutex
 	cfg              config.Config
 	mgr              *catalog.Manager
@@ -417,10 +417,13 @@ func (m *Manager) handleModelsForAuth(request []byte) ([]byte, error) {
 var shutdownDrainTimeout = 15 * time.Second
 
 // handleShutdown stops the refresh loop, drains orphaned host callbacks,
-// and clears state. The drain matters on Unix: the SDK loader frees host_api
-// and dlclose's the plugin immediately after this export returns
-// (loader_unix.go), so a goroutine still calling into the host would crash
-// the process — see COMPATIBILITY.md limitations.
+// and clears state. The v8.0.67 loader (internal/pluginhost/loader_unix.go)
+// closes this instance's host HTTP operations and streams BEFORE calling
+// shutdown, then detaches the callback registration and keeps the plugin
+// image mapped rather than dlclose-ing it (a Go runtime cannot be
+// hot-unloaded). The drain is still needed: a goroutine calling into the
+// host after detach hits a dropped registration, and older hosts freed
+// host_api right after this export returned.
 func (m *Manager) handleShutdown() ([]byte, error) {
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()

@@ -115,9 +115,16 @@ func FromNetwork(err error) *Error {
 // PostFirstByteNetwork classifies a network/timeout failure seen AFTER the
 // first upstream byte was received: part of the response may already be
 // delivered downstream, so a retry would risk duplicate delivery of a half
-// stream — never retryable (§7).
+// stream — never retryable (§7). The stream_truncated wire code matches
+// PostFirstByteTruncated's code so CPA applies the same no-cooldown, no-
+// replay policy to both kinds of post-first-byte failure.
 func PostFirstByteNetwork(msg string) *Error {
-	return &Error{Class: ClassNetwork, Message: Redact(msg), Retryable: false}
+	return &Error{
+		Class:     ClassNetwork,
+		Message:   Redact(msg),
+		Retryable: false,
+		WireCode:  pluginabi.ErrorCodeStreamTruncated,
+	}
 }
 
 // Translation reports an FR-005/FR-006 translation failure; never retryable.
@@ -158,6 +165,12 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 // twice yields the same output — which is what makes edge re-redaction safe.
 var bearerRe = regexp.MustCompile(`(?i)bearer[ \t]*[^\s,"]*`)
 
+// basicAuthRe matches an "Authorization: Basic <creds>" header echo so base64
+// HTTP Basic credentials (user:pass) never reach logs. The value run stops at
+// whitespace/quote/comma. Idempotent: "[redacted]" starts with '[' which is
+// outside the value class.
+var basicAuthRe = regexp.MustCompile(`(?i)(authorization["'\s:]*basic[ \t]+)([^\s,"']+)`)
+
 // apiKeyRe finds x-api-key header echoes (Messages-route auth, FR-007):
 // case-insensitive name, then a run of quote/colon/equals/space separators,
 // then the value run. The value class spans hex/base62 plus the base64
@@ -191,12 +204,77 @@ func redactAPIKey(match string) string {
 // survive; the replacement keeps the parameter name. Idempotent: the
 // redacted value "[redacted]" still matches the value class, so re-running
 // yields the same text.
-var queryKeyRe = regexp.MustCompile(`(?i)([?&](?:api[_-]?key|key|access[_-]?token|token)=)[^\s&"']+`)
+var queryKeyRe = regexp.MustCompile(`(?i)([?&](?:api[_-]?key|key|access[_-]?token|token|secret|password|auth)=)[^\s&"']+`)
 
-// Redact strips bearer tokens, x-api-key echoes, and query-string key
-// parameters from a message so keys never reach logs or clients.
+// cmdcodeKeyRe redacts bare CommandCode-style API keys embedded in prose,
+// e.g. "user_a1b2c3d4e5f6g7h8" (the "user_" prefix followed by hex/base32
+// material). The run stops at whitespace, punctuation, and quotes; the key
+// must contain a digit (real keys always do; ordinary "user_" usernames like
+// "user_admin" have no digits after the prefix). Idempotent: "[redacted]"
+// does not start with "user_".
+var cmdcodeKeyRe = regexp.MustCompile(`(?i)\buser_[A-Za-z0-9_\-.+/=]+`)
+
+func redactCmdCodeKey(match string) string {
+	value := strings.TrimPrefix(match, "user_")
+	value = strings.TrimPrefix(value, "USER_")
+	hasDigit := false
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit || len(value) < 8 {
+		return match
+	}
+	// Replace the entire key (prefix included): a leaked CommandCode key is
+	// secret in full, and leaving "user_" behind still hints at the format.
+	return "[redacted]"
+}
+
+// redactJSONKeyRe finds sensitive JSON values for keys api_key/apiKey/token/
+// access_token/secret when their value is a JSON string. The pattern requires
+// the key to be quoted (a JSON object key) so bare query-param names like
+// "?api_key=..." in URLs are NOT matched — those are covered by queryKeyRe.
+// Run AFTER the bearer and apiKey patterns. Idempotent: after replacement the
+// value is "[redacted]" which starts with '[', outside the value class.
+var redactJSONKeyRe = regexp.MustCompile(`(?i)"(?:api[_-]?key|apiKey|token|access[_-]?token|secret)"\s*:\s*"([A-Za-z0-9_\-.+/=]+)"`)
+
+func redactJSONKey(match string) string {
+	m := redactJSONKeyRe.FindStringSubmatch(match)
+	if len(m) < 2 {
+		return match
+	}
+	value := m[1]
+	hasDigit := false
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit || len(value) < 8 {
+		return match
+	}
+	// Replace only the value inside the quotes; keep key and surrounding quotes.
+	return strings.Replace(match, `"`+value+`"`, `"[redacted]"`, 1)
+}
+
+// Redact strips bearer tokens, x-api-key echoes, Authorization: Basic creds,
+// bare CommandCode keys (user_<alnum>), JSON-object secret values, and query-
+// string key parameters from a message so keys never reach logs or clients.
 func Redact(msg string) string {
 	msg = bearerRe.ReplaceAllString(msg, "Bearer [redacted]")
+	// Keep the "Authorization: Basic " prefix (group 1) and redact only the
+	// base64 credential run (group 2), so the header structure survives.
+	msg = basicAuthRe.ReplaceAllString(msg, "${1}[redacted]")
 	msg = apiKeyRe.ReplaceAllStringFunc(msg, redactAPIKey)
+	// JSON-object secret values must be redacted BEFORE the bare CommandCode
+	// key scanner: a JSON value like "user_a1b2…" should collapse to the whole
+	// value "[redacted]" rather than "user_[redacted]", which the bare scanner
+	// would otherwise leave behind (and which would then block the JSON regex
+	// because "[" is outside its value class).
+	msg = redactJSONKeyRe.ReplaceAllStringFunc(msg, redactJSONKey)
+	msg = cmdcodeKeyRe.ReplaceAllStringFunc(msg, redactCmdCodeKey)
 	return queryKeyRe.ReplaceAllString(msg, "${1}[redacted]")
 }

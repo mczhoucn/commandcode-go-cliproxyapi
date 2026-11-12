@@ -23,7 +23,7 @@ const (
 	refreshTwoKeyYAML = "api-keys:\n" +
 		"  - value: " + cooledRefreshKey + "\n" +
 		"  - value: " + goodRefreshKey + "\n" +
-		"catalog-url: https://catalog.test/models\n"
+		"catalog-url: https://api.commandcode.ai/catalog/models\n"
 )
 
 // authRecorder answers host.http.do, records every Authorization header, and
@@ -144,7 +144,7 @@ func TestRefreshUsesFirstEnabledAuthFile(t *testing.T) {
 func TestRefreshUnsupportedLogQuotesNewlineIDs(t *testing.T) {
 	const evilID = "evil\n2027-01-01 ERROR forged host.log line"
 	cfg, err := config.Load([]byte("api-keys:\n  - value: sk-refresh-evil-key\n" +
-		"catalog-url: https://catalog.test/models\n" +
+		"catalog-url: https://api.commandcode.ai/catalog/models\n" +
 		"protocols:\n  chat-completions: false\n"))
 	if err != nil {
 		t.Fatalf("load config: %v", err)

@@ -756,24 +756,32 @@ func TestOverrideApplicationRecordedInWarnings(t *testing.T) {
 	}
 }
 
-// TestJoinUpstreamURL pins the shared join formula byte-for-byte against
-// the historical inline expression (TrimSuffix "/" + TrimPrefix "/v1") so
-// both former call sites keep producing identical URLs.
+// TestJoinUpstreamURL pins the new exact-segment strip for /v1:
+// only an exact "/v1" segment (followed by "/" or end-of-string) is stripped;
+// "/v1beta/x" and "/v1@evil.com/x" pass through unchanged.
 func TestJoinUpstreamURL(t *testing.T) {
-	legacy := func(base, endpoint string) string {
-		return strings.TrimSuffix(base, "/") + strings.TrimPrefix(endpoint, "/v1")
-	}
-	cases := []struct{ base, endpoint string }{
-		{"https://api.commandcode.ai", "/v1/chat/completions"},
-		{"https://api.commandcode.ai/", "/v1/messages"},
-		{"https://api.commandcode.ai/provider/v1", "/v1/responses"},
-		{"https://api.commandcode.ai", "v1@evil.com"},
-		{"https://api.commandcode.ai", "/custom"},
-		{"https://api.commandcode.ai/", ""},
+	cases := []struct {
+		base, endpoint, want string
+	}{
+		// /v1 exact segment stripped.
+		{"https://api.commandcode.ai", "/v1/chat/completions", "https://api.commandcode.ai/chat/completions"},
+		{"https://api.commandcode.ai/", "/v1/messages", "https://api.commandcode.ai/messages"},
+		{"https://api.commandcode.ai/provider/v1", "/v1/responses", "https://api.commandcode.ai/provider/v1/responses"},
+		// /v1 alone stripped to empty.
+		{"https://api.commandcode.ai/provider/v1", "/v1", "https://api.commandcode.ai/provider/v1"},
+		// /v1beta is NOT stripped.
+		{"https://api.commandcode.ai/provider/v1", "/v1beta/x", "https://api.commandcode.ai/provider/v1/v1beta/x"},
+		// /v1@evil stays intact (@ is a path character when /v1 is kept).
+		{"https://api.commandcode.ai", "/v1@evil.com/x", "https://api.commandcode.ai/v1@evil.com/x"},
+		// no /v1 prefix
+		{"https://api.commandcode.ai", "/custom", "https://api.commandcode.ai/custom"},
+		{"https://api.commandcode.ai/", "", "https://api.commandcode.ai"},
+		// bare v1@evil.com (no leading slash) → not a /v1 segment, stays as-is
+		{"https://api.commandcode.ai", "v1@evil.com", "https://api.commandcode.aiv1@evil.com"},
 	}
 	for _, c := range cases {
-		if got, want := JoinUpstreamURL(c.base, c.endpoint), legacy(c.base, c.endpoint); got != want {
-			t.Errorf("JoinUpstreamURL(%q, %q) = %q, legacy = %q", c.base, c.endpoint, got, want)
+		if got := JoinUpstreamURL(c.base, c.endpoint); got != c.want {
+			t.Errorf("JoinUpstreamURL(%q, %q) = %q, want %q", c.base, c.endpoint, got, c.want)
 		}
 	}
 }
@@ -788,16 +796,32 @@ func TestEndpointEscapesBase(t *testing.T) {
 		endpoint string
 		want     bool
 	}{
-		{"https://api.commandcode.ai", "/v1@evil.com/x", true},
+		// New exact-segment strip keeps /v1@evil.com/x intact, so the @ lands
+		// in the path (safe) rather than being promoted to userinfo.
+		{"https://api.commandcode.ai", "/v1@evil.com/x", false},
+		// Bare @evil.com (no leading slash) still rewrites the authority.
 		{"https://api.commandcode.ai", "@evil.com/", true},
-		{"https://api.commandcode.ai/provider/v1", "/v1@evil.com/x", false}, // @ lands in path
+		{"https://api.commandcode.ai", "v1@evil.com", true},
+		// /v1@evil stays in path on a path-hosted base too.
+		{"https://api.commandcode.ai/provider/v1", "/v1@evil.com/x", false},
 		{"https://api.commandcode.ai", "/v1/chat/completions", false},
 		{"https://api.commandcode.ai/provider/v1", "/v1/messages", false},
 		{"https://api.commandcode.ai/", "/v1/responses", false},
 		{"https://COMMANDCODE.ai", "/v1/chat/completions", false}, // host compare is case-insensitive
-		{"https://api.commandcode.ai", "v1@evil.com", true},
-		{"https://api.commandcode.ai", "\x7f", true},   // unparseable join
-		{"https://api.commandcode.ai\x00", "/x", true}, // unparseable base
+		// Path traversal leaves the base path prefix.
+		{"https://api.commandcode.ai/v1", "/v1/../admin", true},
+		{"https://api.commandcode.ai/a", "/v1/../b", true},
+		{"https://api.commandcode.ai/v1", "/v1/../v1/chat", true},
+		// Absolute URL to a different host.
+		{"https://api.commandcode.ai", "https://evil.com/v1", true},
+		// Different scheme.
+		{"https://api.commandcode.ai", "/v1/chat", false}, // sanity: same scheme
+		{"https://api.commandcode.ai", "\x7f", true},     // unparseable join
+		{"https://api.commandcode.ai\x00", "/x", true},    // unparseable base
+		// Clean path under base path prefix stays safe.
+		{"https://api.commandcode.ai/provider/v1", "/v1/custom", false},
+		// Endpoint with ".." must be rejected even if cleaned it stays under base.
+		{"https://api.commandcode.ai/v1", "/v1/sub/../sub", true},
 	}
 	for _, c := range cases {
 		if got := endpointEscapesBase(c.base, c.endpoint); got != c.want {
@@ -807,17 +831,19 @@ func TestEndpointEscapesBase(t *testing.T) {
 }
 
 // F-security pin: override endpoints are concatenated onto base-url; one that
-// rewrites the URL authority (e.g. "/v1@evil.com/x" against a bare-host
-// base-url) must exclude the model from the routable set (spec 05 §2).
-// Override endpoints flow through the same check before swap's validation.
+// rewrites the URL authority must exclude the model from the routable set
+// (spec 05 §2). The new exact-segment /v1 strip means "/v1@evil.com/x" on a
+// path-hosted base is a path character (safe), while "@evil.com/x" (no leading
+// slash) still rewrites the authority. Tests reflect the new join semantics.
 func TestEndpointEscapeExcludedFromRoutableSet(t *testing.T) {
 	const escapeReason = "resolved endpoint escapes the configured upstream host"
 
-	t.Run("bare-host base rejects authority rewrite", func(t *testing.T) {
+	t.Run("bare @evil endpoint rejects authority rewrite on bare-host base", func(t *testing.T) {
 		cfg := testCfg()
 		cfg.BaseURL = "https://api.commandcode.ai"
 		cfg.RouteOverrides = map[string]config.RouteOverride{
-			"evil":      {Protocol: "chat-completions", Endpoint: "/v1@evil.com/x"},
+			// "v1@evil.com" (no leading slash) rewrites authority on any base.
+			"evil":      {Protocol: "chat-completions", Endpoint: "v1@evil.com"},
 			"custom-ok": {Protocol: "responses", Endpoint: "/v1/custom"},
 		}
 		fc := &fakeClient{resp: pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[
@@ -851,7 +877,7 @@ func TestEndpointEscapeExcludedFromRoutableSet(t *testing.T) {
 		}
 	})
 
-	t.Run("path-hosted base keeps same-host @ endpoint routable", func(t *testing.T) {
+	t.Run("path-hosted base keeps /v1@evil.com/x endpoint routable (@ in path)", func(t *testing.T) {
 		cfg := testCfg()
 		cfg.BaseURL = "https://api.commandcode.ai/provider/v1"
 		cfg.RouteOverrides = map[string]config.RouteOverride{
@@ -865,15 +891,35 @@ func TestEndpointEscapeExcludedFromRoutableSet(t *testing.T) {
 		mustRefresh(t, m)
 		rec := findModel(t, m.Models(), "glm-5.2")
 		if rec.EndpointPath != "/v1@evil.com/x" {
-			t.Errorf("EndpointPath = %q; @ stays in path on default-style base", rec.EndpointPath)
+			t.Errorf("EndpointPath = %q; @ stays in path on path-hosted base", rec.EndpointPath)
 		}
 	})
 
-	t.Run("override endpoints flow through the same check", func(t *testing.T) {
+	t.Run("bare-host base also keeps /v1@evil.com/x routable (@ lands in path)", func(t *testing.T) {
 		cfg := testCfg()
 		cfg.BaseURL = "https://api.commandcode.ai"
 		cfg.RouteOverrides = map[string]config.RouteOverride{
-			"mystery-model": {Protocol: "chat-completions", Endpoint: "/v1@evil.com/y"},
+			"glm-5.2": {Protocol: "chat-completions", Endpoint: "/v1@evil.com/x"},
+		}
+		fc := &fakeClient{resp: pluginapi.HTTPResponse{
+			StatusCode: 200,
+			Body:       []byte(`{"data":[{"id":"glm-5.2"}]}`),
+		}}
+		m := newManager(cfg, fc)
+		mustRefresh(t, m)
+		// With the exact-segment strip, /v1@evil.com/x stays intact in the path
+		// and is safe on a bare-host base.
+		rec := findModel(t, m.Models(), "glm-5.2")
+		if rec.EndpointPath != "/v1@evil.com/x" {
+			t.Errorf("EndpointPath = %q; expect /v1@evil.com/x in path (safe)", rec.EndpointPath)
+		}
+	})
+
+	t.Run("override endpoints with path traversal are excluded", func(t *testing.T) {
+		cfg := testCfg()
+		cfg.BaseURL = "https://api.commandcode.ai/v1"
+		cfg.RouteOverrides = map[string]config.RouteOverride{
+			"mystery-model": {Protocol: "chat-completions", Endpoint: "/v1/../admin"},
 		}
 		fc := &fakeClient{resp: pluginapi.HTTPResponse{
 			StatusCode: 200,
@@ -883,11 +929,11 @@ func TestEndpointEscapeExcludedFromRoutableSet(t *testing.T) {
 		mustRefresh(t, m)
 
 		if got := m.Models(); len(got) != 0 {
-			t.Fatalf("override-supplied escaping endpoint still routable: %+v", got)
+			t.Fatalf("path-traversal endpoint still routable: %+v", got)
 		}
 		unsup := m.Unsupported()
 		if len(unsup) != 1 || unsup[0].UpstreamID != "mystery-model" || unsup[0].Reason != escapeReason {
-			t.Fatalf("unsupported = %+v, want override endpoint excluded with %q", unsup, escapeReason)
+			t.Fatalf("unsupported = %+v, want mystery-model excluded with %q", unsup, escapeReason)
 		}
 	})
 }
@@ -919,33 +965,40 @@ func TestFailClearsLookupIndex(t *testing.T) {
 }
 
 // TestSeedFromRevalidatesEndpointsAgainstNewBase pins the seed-revalidation
-// fix: a record whose endpoint was safe under the OLD base-url (path-hosted,
-// so "/v1@evil.com/x" stays in the path) must not keep serving once seeded
-// into a manager whose base-url is the bare host — there the join turns the
-// old host into userinfo and the endpoint escapes to an attacker authority.
+// fix: a record whose endpoint was safe under the OLD base-url must not keep
+// serving once seeded into a manager whose new base path makes it escape. With
+// the new exact-segment /v1 strip, "/v1@evil.com/x" is safe on both bare-host
+// and path-hosted bases (@ in path), so the test uses path-traversal instead:
+// ".." that moves outside the old base path but ALSO outside the new one.
 func TestSeedFromRevalidatesEndpointsAgainstNewBase(t *testing.T) {
 	body := `{"data":[
 		{"id":"glm-5.2"},
 		{"id":"totally-new-x"}
 	]}`
 	oldCfg := testCfg()
-	oldCfg.BaseURL = "https://api.test/v1"
-	oldCfg.CatalogURL = "https://api.test/v1/models"
+	oldCfg.BaseURL = "https://api.test/v1/safe"
+	oldCfg.CatalogURL = "https://api.test/v1/safe/models"
 	oldCfg.RouteOverrides = map[string]config.RouteOverride{
-		"totally-new-x": {Protocol: "chat-completions", Endpoint: "/v1@evil.com/x"},
+		// This endpoint uses path traversal that escapes both old and new bases.
+		"totally-new-x": {Protocol: "chat-completions", Endpoint: "/v1/../admin"},
 	}
 	prev := newManager(oldCfg, &fakeClient{resp: pluginapi.HTTPResponse{
 		StatusCode: 200,
 		Body:       []byte(body),
 	}})
 	mustRefresh(t, prev)
-	findModel(t, prev.Models(), "totally-new-x") // precondition: routable pre-seed
+	// Precondition: the path-traversal endpoint is rejected at prev refresh.
+	for _, mo := range prev.Models() {
+		if mo.UpstreamID == "totally-new-x" {
+			t.Fatalf("precondition: totally-new-x must not be routable even on old cfg: %+v", mo)
+		}
+	}
 
 	cfg := testCfg()
-	cfg.BaseURL = "https://api.commandcode.ai"
+	cfg.BaseURL = "https://api.commandcode.ai/v1"
 	cfg.CatalogURL = "https://api.commandcode.ai/go/v1/models"
 	cfg.RouteOverrides = map[string]config.RouteOverride{
-		"totally-new-x": {Protocol: "chat-completions", Endpoint: "/v1@evil.com/x"},
+		"totally-new-x": {Protocol: "chat-completions", Endpoint: "/v1/../admin"},
 	}
 	m := newManager(cfg, &fakeClient{})
 	m.SeedFrom(prev)
@@ -970,7 +1023,9 @@ func TestSeedFromRevalidatesEndpointsAgainstNewBase(t *testing.T) {
 		t.Fatalf("unsupported = %+v, want totally-new-x with %q", m.Unsupported(), wantReason)
 	}
 	// Seeding must not mutate prev's snapshot (shared backing arrays).
-	findModel(t, prev.Models(), "totally-new-x")
+	if len(prev.Models()) != 1 || prev.Models()[0].UpstreamID != "glm-5.2" {
+		t.Errorf("prev mutated: %+v", prev.Models())
+	}
 }
 
 // TestSeedFromAppliesProtocolKillSwitch pins the seed-revalidation fix: a

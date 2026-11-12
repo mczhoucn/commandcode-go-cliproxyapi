@@ -33,14 +33,18 @@ type anthropicTool struct {
 // divergent from shared.ClaudeTool decode type: typed stop sequences +
 // named items vs raw-ignore + tool_choice.
 type messagesRequest struct {
-	Model         string                 `json:"model"`
-	MaxTokens     int64                  `json:"max_tokens"`
-	System        any                    `json:"system,omitempty"` // string or []anthropicBlock
-	Messages      []anthropicMessage     `json:"messages"`
-	StopSequences []string               `json:"stop_sequences,omitempty"`
-	Tools         []anthropicTool        `json:"tools,omitempty"`
-	ToolChoice    any                    `json:"tool_choice,omitempty"` // {type,name?,disable_parallel_tool_use?}
-	Thinking      *shared.ClaudeThinking `json:"thinking,omitempty"`
+	Model         string             `json:"model"`
+	MaxTokens     int64              `json:"max_tokens"`
+	System        any                `json:"system,omitempty"` // string or []anthropicBlock
+	Messages      []anthropicMessage `json:"messages"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    any                `json:"tool_choice,omitempty"` // {type,name?,disable_parallel_tool_use?}
+	// Thinking is emitted as raw JSON so we can produce {"type":"disabled"}
+	// without a budget_tokens field (Anthropic only requires budget_tokens
+	// when type is "enabled"; including 0 for disabled is harmless but
+	// raw emission avoids any downstream schema rejection).
+	Thinking json.RawMessage `json:"thinking,omitempty"`
 	// OutputConfig carries the effort level. DeepSeek's Anthropic-compatible
 	// surface reads output_config.effort and ignores thinking.budget_tokens,
 	// so effort is expressed here rather than only as a budget.
@@ -188,9 +192,10 @@ func finalize(req *messagesRequest, system []string, effort string, ts *pluginap
 // records the client's effort in output_config.
 //
 // budget == 0 means reasoning off (ZeroAllowed): no thinking block, and
-// sampling controls stay intact. budget < 0 is the dynamic "auto" sentinel;
-// Anthropic has no dynamic budget field — an adaptive mode would need a
-// catalog-declared capability signal, which does not exist today — so the
+// sampling controls stay intact — UNLESS effort is "none", which must send
+// thinking {"type":"disabled"} to explicitly disable thinking on models that
+// enable it by default; "none" overrides the zero budget path. budget < 0 is
+// the dynamic "auto" sentinel; Anthropic has no dynamic budget field, so the
 // budget is omitted rather than fabricated (FR-005 explicit omission policy).
 // budget > 0 enables thinking and drops sampling controls, which Anthropic
 // rejects alongside thinking.
@@ -199,16 +204,23 @@ func finalize(req *messagesRequest, system []string, effort string, ts *pluginap
 // DeepSeek's Anthropic surface reads output_config.effort and ignores
 // budget_tokens, so omitting it would silently drop the client's choice.
 // The off-state spellings are excluded — "auto" is a dynamic sentinel with no
-// rankable level, and "none" switches thinking off rather than naming a
-// strength, which the budget branch below already expresses.
+// rankable level; "none" switches thinking off (the disabled branch above
+// handles its thinking field separately).
 func applyThinking(req *messagesRequest, budget int64, effort string) {
-	if e := strings.ToLower(strings.TrimSpace(effort)); e != "" && e != "auto" && e != "none" {
+	e := strings.ToLower(strings.TrimSpace(effort))
+	if e != "" && e != "auto" && e != "none" {
 		req.OutputConfig = &claudeOutputConfig{Effort: e}
 	}
-	if budget <= 0 {
+	switch {
+	case e == "none":
+		// Explicitly disable thinking so models that default to reasoning do
+		// not silently continue; {"type":"disabled"} is the documented form.
+		req.Thinking, _ = json.Marshal(map[string]any{"type": "disabled"})
+		return
+	case budget <= 0:
 		return
 	}
-	req.Thinking = &shared.ClaudeThinking{Type: "enabled", BudgetTokens: budget}
+	req.Thinking, _ = json.Marshal(map[string]any{"type": "enabled", "budget_tokens": budget})
 	req.Temperature, req.TopP = nil, nil
 	if req.MaxTokens <= budget {
 		req.MaxTokens = budget + 1024 // budget_tokens must be < max_tokens
@@ -273,6 +285,14 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 			}
 			if hasImage(blocks) {
 				return nil, errclass.Translation("assistant messages cannot carry image content")
+			}
+			// Replay thinking BEFORE text and tool_calls: DeepSeek rejects a
+			// turn whose earlier reasoning was dropped when the request carries
+			// tools (CLAUDE.md: "Historical thinking must be replayed").
+			if m.ReasoningContent != "" {
+				b.add("assistant", "assistant", anthropicBlock{
+					"type": "thinking", "thinking": m.ReasoningContent,
+				})
 			}
 			if text := shared.JoinTexts(blocks); text != "" {
 				b.add("assistant", "assistant", textBlock(text))
@@ -417,19 +437,17 @@ func fromResponses(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupp
 				"type": "tool_result", "tool_use_id": item.CallID, "content": text,
 			})
 		case "reasoning":
-			// Best-effort: keep summary text as a thinking block;
-			// encrypted_content has no Anthropic equivalent, so the
-			// signature is omitted rather than fabricated (FR-005).
-			var sb strings.Builder
-			for i, s := range item.Summary {
-				if i > 0 {
-					sb.WriteString("\n")
-				}
-				sb.WriteString(s.Text)
-			}
-			if sb.Len() > 0 {
+			// Replay historical thinking as a thinking block so the tool-carrying
+			// multi-turn round-trip the upstream requires survives (CLAUDE.md
+			// invariant: "Historical thinking must be replayed"). Prefer the
+			// plaintext `content` (reasoning_text) per DeepSeek's guide; fall
+			// back to `summary` so a round-tripped item the plugin itself
+			// synthesized earlier is not lost. encrypted_content is metadata
+			// with no plaintext, so it stays omitted.
+			text := shared.RespReasoningItemText(item)
+			if text != "" {
 				b.add("assistant", "assistant", anthropicBlock{
-					"type": "thinking", "thinking": sb.String(),
+					"type": "thinking", "thinking": text,
 				})
 			}
 		default:
@@ -463,12 +481,13 @@ func fromResponses(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupp
 }
 
 // applyToolChoiceMessages maps a normalized tool choice onto the outbound
-// Messages request. "none" has no Anthropic equivalent and fails
-// descriptively rather than silently unforcing the client constraint
-// (FR-005 explicit policy). An explicit parallel_tool_calls=false is a
-// client constraint too (FR-005): it becomes disable_parallel_tool_use on
-// the synthesized or decoded tool_choice — synthesized as {"type":"auto"}
-// when no tool_choice was sent, so the flag never rides alone.
+// Messages request. Anthropic supports {"type":"none"} to suppress tool calls
+// without raising an error; it is mapped verbatim rather than failing
+// descriptively (earlier FR-005 policy predated that Anthropic support). An
+// explicit parallel_tool_calls=false is a client constraint too (FR-005): it
+// becomes disable_parallel_tool_use on the synthesized or decoded tool_choice
+// — synthesized as {"type":"auto"} when no tool_choice was sent, so the flag
+// never rides alone.
 func applyToolChoiceMessages(req *messagesRequest, kind, name string, parallel *bool) *errclass.Error {
 	noParallel := parallel != nil && !*parallel
 	if kind == shared.ToolChoiceAbsent && noParallel {
@@ -481,6 +500,8 @@ func applyToolChoiceMessages(req *messagesRequest, kind, name string, parallel *
 		req.ToolChoice = toolChoiceBlock("auto", "", noParallel)
 	case shared.ToolChoiceAny:
 		req.ToolChoice = toolChoiceBlock("any", "", noParallel)
+	case shared.ToolChoiceNone:
+		req.ToolChoice = toolChoiceBlock("none", "", noParallel)
 	case shared.ToolChoiceNamed:
 		req.ToolChoice = toolChoiceBlock("tool", name, noParallel)
 	default:

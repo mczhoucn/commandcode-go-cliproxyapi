@@ -192,7 +192,10 @@ func TestConvertMessagesToOpenAIRefusalContentFilter(t *testing.T) {
 	}
 }
 
-func TestConvertMessagesToOpenAIThinkingOmitted(t *testing.T) {
+// Fix #2 pin: a thinking block reaches a Chat Completions client as
+// message.reasoning_content (read from the wire "thinking" field, not
+// "text"), the same field the stream path emits.
+func TestConvertMessagesToOpenAIThinkingMapped(t *testing.T) {
 	out, eErr := ConvertNonStreamResponse("openai", 200, []byte(claudeThinking))
 	if eErr != nil {
 		t.Fatalf("convert: %v", eErr)
@@ -200,19 +203,21 @@ func TestConvertMessagesToOpenAIThinkingOmitted(t *testing.T) {
 	var cc struct {
 		Choices []struct {
 			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []any  `json:"tool_calls"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []any  `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(out, &cc); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if cc.Choices[0].Message.Content != "answer" || cc.Choices[0].Message.ToolCalls != nil {
-		t.Fatalf("thinking block leaked or text lost: %s", out)
+	m := cc.Choices[0].Message
+	if m.Content != "answer" || m.ReasoningContent != "hmm" || m.ToolCalls != nil {
+		t.Fatalf("thinking not mapped to reasoning_content or text lost: %s", out)
 	}
-	if strings.Contains(string(out), "thinking") {
-		t.Fatalf("reasoning material in output: %s", out)
+	if strings.Contains(string(out), "s1") {
+		t.Fatalf("signature leaked: %s", out)
 	}
 }
 
@@ -362,13 +367,32 @@ func TestConvertMessagesToolUseAbsentInput(t *testing.T) {
 	}
 }
 
-func TestConvertMessagesToResponsesThinkingOmitted(t *testing.T) {
+// Fix #2 pin: thinking becomes one reasoning item at the thinking block's
+// position (ahead of the message), matching the stream synthesizer.
+func TestConvertMessagesToResponsesThinkingMapped(t *testing.T) {
 	out, eErr := ConvertNonStreamResponse("openai-response", 200, []byte(claudeThinking))
 	if eErr != nil {
 		t.Fatalf("convert: %v", eErr)
 	}
-	if !strings.Contains(string(out), `"text":"answer"`) || strings.Contains(string(out), "thinking") {
-		t.Fatalf("thinking leaked or text lost: %s", out)
+	var r struct {
+		ID     string           `json:"id"`
+		Output []map[string]any `json:"output"`
+	}
+	if err := json.Unmarshal(out, &r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(r.Output) != 2 || r.Output[0]["type"] != "reasoning" || r.Output[1]["type"] != "message" {
+		t.Fatalf("output order wrong: %s", out)
+	}
+	if r.Output[0]["id"] != "rs_"+r.ID+"_0" {
+		t.Fatalf("reasoning id = %v", r.Output[0]["id"])
+	}
+	summary := r.Output[0]["summary"].([]any)
+	if len(summary) != 1 || summary[0].(map[string]any)["text"] != "hmm" {
+		t.Fatalf("reasoning text wrong: %s", out)
+	}
+	if !strings.Contains(string(out), `"text":"answer"`) {
+		t.Fatalf("text lost: %s", out)
 	}
 }
 

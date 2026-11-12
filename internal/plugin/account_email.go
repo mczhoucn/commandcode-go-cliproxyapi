@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,10 +17,16 @@ import (
 // state and all host metadata. Do not call host.auth.save for legacy records:
 // their JSON id can differ from the host's path-derived id, creating duplicates.
 // Best effort only: the host does not expose an atomic conditional update.
+// Finding 8: email validation and narrowed race by re-checking after temp write.
 func (m *Manager) syncAccountEmail(_ context.Context, entry pluginapi.HostAuthFileEntry, key, email string) error {
 	email = strings.TrimSpace(email)
+	// Validate email with mail.ParseAddress like admission does (finding 8).
+	address, err := mail.ParseAddress(email)
+	if err != nil || address.Address != email {
+		return fmt.Errorf("account email sync unavailable: invalid email")
+	}
 	path := strings.TrimSpace(entry.Path)
-	if email == "" || path == "" || !strings.HasSuffix(path, ".json") {
+	if path == "" || !strings.HasSuffix(path, ".json") {
 		return fmt.Errorf("account email sync unavailable")
 	}
 	raw, err := os.ReadFile(path)

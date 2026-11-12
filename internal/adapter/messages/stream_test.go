@@ -2,10 +2,12 @@ package messages
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	"commandcode-or-or-cliproxyapi/internal/adapter/shared"
 	"commandcode-or-or-cliproxyapi/internal/errclass"
 )
 
@@ -213,7 +215,9 @@ func TestStreamOpenAIFullFlow(t *testing.T) {
 		t.Error("thinking_delta leaked into openai stream (explicit-omission policy)")
 	}
 	frames := dataFrames(t, events)
-	if len(frames) != 6 { // role, text, frag_a×2, frag_b, finish+usage
+	// role, text, open_a, frag_a×2, open_b, frag_b, finish+usage: tool calls
+	// are announced at content_block_start (Fix #10).
+	if len(frames) != 8 {
 		t.Fatalf("frames = %d: %v", len(frames), frames)
 	}
 	first := choice0(t, frames[0])["delta"].(map[string]any)
@@ -227,32 +231,37 @@ func TestStreamOpenAIFullFlow(t *testing.T) {
 	tc0 := choice0(t, frames[2])["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if tc0["index"] != float64(0) || tc0["id"] != "toolu_a" || tc0["type"] != "function" ||
 		tc0["function"].(map[string]any)["name"] != "f" ||
-		tc0["function"].(map[string]any)["arguments"] != "{\"a\":" {
-		t.Errorf("first fragment = %v", tc0)
+		tc0["function"].(map[string]any)["arguments"] != "" {
+		t.Errorf("tool_use announcement = %v", tc0)
 	}
-	tc1 := choice0(t, frames[3])["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
-	if _, hasID := tc1["id"]; hasID {
-		t.Errorf("continuation fragment must omit id/name: %v", tc1)
+	for i, want := range map[int]string{3: "{\"a\":", 4: "1}"} {
+		tc := choice0(t, frames[i])["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+		if _, hasID := tc["id"]; hasID {
+			t.Errorf("continuation fragment must omit id/name: %v", tc)
+		}
+		if tc["function"].(map[string]any)["arguments"] != want {
+			t.Errorf("frame %d args = %v, want %q", i, tc, want)
+		}
 	}
-	if tc1["function"].(map[string]any)["arguments"] != "1}" {
-		t.Errorf("continuation args = %v", tc1)
-	}
-	tcB := choice0(t, frames[4])["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	tcB := choice0(t, frames[5])["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if tcB["index"] != float64(1) || tcB["id"] != "toolu_b" || tcB["type"] != "function" ||
 		tcB["function"].(map[string]any)["name"] != "g" {
 		t.Errorf("parallel tool block not separated by ordinal index: %v", tcB)
 	}
-	final := choice0(t, frames[5])
+	if got := choice0(t, frames[6])["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"]; got != "{}" {
+		t.Errorf("second tool args = %v", got)
+	}
+	final := choice0(t, frames[7])
 	if final["finish_reason"] != "tool_calls" {
 		t.Errorf("finish_reason = %v", final["finish_reason"])
 	}
-	usage := frames[5]["usage"].(map[string]any)
+	usage := frames[7]["usage"].(map[string]any)
 	if usage["prompt_tokens"] != float64(10) || usage["completion_tokens"] != float64(7) ||
 		usage["total_tokens"] != float64(17) {
 		t.Errorf("usage = %v", usage)
 	}
-	if frames[5]["object"] != "chat.completion.chunk" || frames[5]["model"] != "minimax" {
-		t.Errorf("frame envelope = %v", frames[5])
+	if frames[7]["object"] != "chat.completion.chunk" || frames[7]["model"] != "minimax" {
+		t.Errorf("frame envelope = %v", frames[7])
 	}
 }
 
@@ -440,6 +449,14 @@ func TestStreamResponsesFlow(t *testing.T) {
 	if len(argsDone) != 1 || argsDone[0]["item_id"] != "fc_call_1" || argsDone[0]["output_index"] != float64(1) || argsDone[0]["arguments"] != "{}" {
 		t.Errorf("arguments done = %v", argsDone)
 	}
+	// The message item now closes too (Fix #8 lifecycle); keep only the
+	// function_call completion for the assertions below.
+	if len(itemDone) == 2 {
+		if first, _ := itemDone[0]["item"].(map[string]any); first["type"] != "message" || itemDone[0]["output_index"] != float64(0) {
+			t.Errorf("message item done = %v", itemDone[0])
+		}
+		itemDone = itemDone[1:]
+	}
 	if len(itemDone) != 1 || itemDone[0]["output_index"] != float64(1) {
 		t.Errorf("function_call item done = %v", itemDone)
 	} else if doneItem, _ := itemDone[0]["item"].(map[string]any); doneItem["type"] != "function_call" || doneItem["id"] != "fc_call_1" || doneItem["call_id"] != "call_1" || doneItem["arguments"] != "{}" {
@@ -578,11 +595,10 @@ func TestStreamClaudeTypeFallbackFromPayload(t *testing.T) {
 	}
 }
 
-// Leading-thinking pin: FR-005 omits thinking blocks from the Responses
-// output entirely, so streamed announcements/deltas must reference the
-// SAME compacted positions response.completed.output renders — never raw
-// upstream block indexes, which skip omitted blocks and point at items
-// that do not exist in the terminal array.
+// Leading-thinking pin: thinking now renders as a reasoning item (Fix #2),
+// so streamed announcements/deltas must reference the SAME compacted
+// positions response.completed.output renders: reasoning 0, message 1,
+// function_call 2 — never raw upstream block indexes.
 func TestStreamResponsesLeadingThinkingCompactedOutputIndexes(t *testing.T) {
 	sc := NewStreamConverter("openai-response")
 	events, done, eErr := feed(t, sc,
@@ -599,25 +615,25 @@ func TestStreamResponsesLeadingThinkingCompactedOutputIndexes(t *testing.T) {
 	if eErr != nil || !done {
 		t.Fatalf("done=%v err=%v", done, eErr)
 	}
-	if strings.Contains(strings.Join(mapJoin(events), ""), "hush") {
-		t.Fatal("thinking leaked into responses stream (FR-005 omission policy)")
-	}
 	completed := namedEvents(t, events)["response.completed"][0]["response"].(map[string]any)
 	output, ok := completed["output"].([]any)
-	if !ok || len(output) != 2 {
+	if !ok || len(output) != 3 {
 		t.Fatalf("terminal output = %T %v", completed["output"], completed["output"])
 	}
 	idAt := make([]string, len(output)) // item identity per compacted position
 	for i, it := range output {
 		m := it.(map[string]any)
 		switch m["type"] {
-		case "message":
+		case "reasoning", "message":
 			idAt[i] = m["id"].(string)
 		case "function_call":
 			idAt[i] = m["call_id"].(string)
 		default:
 			t.Fatalf("unexpected terminal item %v", m)
 		}
+	}
+	if r := output[0].(map[string]any); !strings.Contains(fmt.Sprint(r), "hush") {
+		t.Errorf("reasoning item must carry the thinking text: %v", r)
 	}
 	positionOf := func(id string) int {
 		for i, got := range idAt {
@@ -628,17 +644,21 @@ func TestStreamResponsesLeadingThinkingCompactedOutputIndexes(t *testing.T) {
 		t.Fatalf("item %q missing from terminal output %v", id, idAt)
 		return -1
 	}
-	msgPos, callPos := positionOf("msg_t"), positionOf("call_1")
-	if msgPos != 0 || callPos != 1 {
+	rsPos, msgPos, callPos := positionOf(shared.ReasoningItemID("msg_t", 0)), positionOf("msg_t"), positionOf("call_1")
+	if rsPos != 0 || msgPos != 1 || callPos != 2 {
 		t.Fatalf("compacted layout = %v", idAt)
 	}
 	byName := namedEvents(t, events)
 	added := byName["response.output_item.added"]
-	if len(added) != 2 ||
-		added[0]["output_index"] != float64(msgPos) ||
-		added[1]["output_index"] != float64(callPos) {
-		t.Fatalf("announcements must reference terminal positions %d/%d: %v %v",
-			msgPos, callPos, added[0], added[1])
+	if len(added) != 3 ||
+		added[0]["output_index"] != float64(rsPos) ||
+		added[1]["output_index"] != float64(msgPos) ||
+		added[2]["output_index"] != float64(callPos) {
+		t.Fatalf("announcements must reference terminal positions %d/%d/%d: %v",
+			rsPos, msgPos, callPos, added)
+	}
+	if rd := byName["response.reasoning_summary_text.delta"]; len(rd) != 1 || rd[0]["output_index"] != float64(rsPos) || rd[0]["delta"] != "hush" {
+		t.Errorf("reasoning deltas = %v", rd)
 	}
 	if td := byName["response.output_text.delta"][0]; td["output_index"] != float64(msgPos) {
 		t.Errorf("text delta output_index = %v, want %v", td["output_index"], msgPos)

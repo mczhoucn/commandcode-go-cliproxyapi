@@ -35,6 +35,21 @@ type StreamConverter struct {
 	outCount         int  // responses: next compacted output position; thinking blocks consume none (FR-005 omission)
 	emitted          bool // any client event emitted (Flush eligibility)
 	flushed          bool // one-shot guard for Flush
+	// Reasoning (thinking) tracking for the Responses target. Anthropic
+	// sends thinking as a content_block_start(thinking) followed by
+	// thinking_delta events; we synthesize the Responses reasoning item
+	// lifecycle (item added, summary deltas, done) so cross-format clients
+	// receive the thinking text the chat route already emits (Fix #2,
+	// CLAUDE.md parity invariant).
+	thinkSeen    bool
+	thinkStopped bool
+	thinkItemID  string
+	thinkOutIdx  int
+	thinkBuf     strings.Builder
+	// respTextBuf aggregates the Responses message item's output_text so
+	// the closing output_text.done / content_part.done / output_item.done
+	// events carry the full text (Fix #8: message item lifecycle events).
+	respTextBuf strings.Builder
 }
 
 // blockState tracks one open upstream content block by index.
@@ -143,8 +158,12 @@ type contentBlock struct {
 }
 
 type deltaBody struct {
-	Type        string `json:"type"`
-	Text        string `json:"text"`
+	Type string `json:"type"`
+	Text string `json:"text"`
+	// Thinking carries thinking_delta text: Anthropic puts it under
+	// "thinking", never "text", so reading only Text empties every
+	// reasoning fragment.
+	Thinking    string `json:"thinking"`
 	PartialJSON string `json:"partial_json"`
 	StopReason  string `json:"stop_reason"`
 }
@@ -193,6 +212,14 @@ func (sc *StreamConverter) dispatchOpenAI(etype string, ev *sseEvent, events *[]
 			bs.ordinal = sc.toolOrdinal
 			sc.toolOrdinal++
 			sc.toolsSeen = true
+			// Announce the tool_call immediately on block start so a no-arg
+			// tool (start then stop, no deltas) still produces a tool_calls
+			// entry with finish_reason=tool_calls (Fix #10).
+			bs.emitted = true
+			sc.emitRole(events)
+			sc.emitChunk(events, map[string]any{"tool_calls": []any{
+				shared.CCToolCallOpeningEntry(bs.ordinal, bs.id, bs.name, ""),
+			}}, "", false)
 		}
 		sc.blocks[int(ev.Index)] = bs
 	case "content_block_delta":
@@ -207,6 +234,9 @@ func (sc *StreamConverter) dispatchOpenAI(etype string, ev *sseEvent, events *[]
 			}
 			var tc map[string]any
 			if !bs.emitted {
+				// Defensive: bs.emitted is set at content_block_start, so
+				// this branch is only reached if content_block_start was
+				// missed; fall back to opening entry with this fragment.
 				tc = shared.CCToolCallOpeningEntry(bs.ordinal, bs.id, bs.name, ev.Delta.PartialJSON)
 				bs.emitted = true
 			} else {
@@ -218,10 +248,16 @@ func (sc *StreamConverter) dispatchOpenAI(etype string, ev *sseEvent, events *[]
 			sc.emitRole(events)
 			sc.emitChunk(events, map[string]any{"tool_calls": []any{tc}}, "", false)
 		case "thinking_delta":
-			// FR-005 explicit omission policy: chat.completion.chunk has no
-			// standard reasoning-delta field, so thinking text is dropped
-			// rather than put in a non-standard field. Signatures have no
-			// destination either.
+			// Replay thinking as reasoning_content so OpenAI clients that read
+			// the standard spelling receive the thinking text (Fix #2, CLAUDE.md
+			// parity invariant: "Historical thinking must be replayed"). A
+			// thinking_delta addressed to a non-thinking block is a protocol
+			// defect and is dropped, matching the Responses dispatcher.
+			if bs == nil || bs.kind != "thinking" {
+				break
+			}
+			sc.emitRole(events)
+			sc.emitChunk(events, map[string]any{"reasoning_content": ev.Delta.Thinking}, "", false)
 		}
 	case "message_delta":
 		if ev.Usage.InputTokens != 0 {
@@ -253,15 +289,15 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 		sc.captureCache(ev.Message.Usage)
 		// Lifecycle parity with the Chat Completions route's synthesizer:
 		// announce the response before any deltas reference it (F18).
-		*events = append(*events, sc.responsesEm().Created())
+		// in_progress follows created before any item event (fix #8).
+		*events = append(*events, sc.responsesEm().Created(), sc.responsesEm().InProgress())
 	case "content_block_start":
 		bs := &blockState{kind: ev.ContentBlock.Type, id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
 		sc.blocks[int(ev.Index)] = bs
 		// Announce each translatable item before its first delta (F18
-		// lifecycle parity); thinking blocks produce no deltas and are
-		// omitted entirely (FR-005). Indexes come from the SAME compacted
-		// space outputItems() renders, so streamed output_index values
-		// always match terminal response.completed.output positions.
+		// lifecycle parity). Indexes come from the SAME compacted space
+		// outputItems() renders, so streamed output_index values always match
+		// terminal response.completed.output positions.
 		switch bs.kind {
 		case "text":
 			if sc.msgIdx >= 0 {
@@ -274,6 +310,9 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 			*events = append(*events, sc.responsesEm().ItemAdded(sc.msgIdx, map[string]any{
 				"type": "message", "id": sc.msgID, "role": "assistant", "content": []any{},
 			}))
+			// The text part is opened before the first delta and closed at
+			// completion (fix #8: message item lifecycle).
+			*events = append(*events, sc.responsesEm().ContentPartAdded(sc.msgID, sc.msgIdx))
 		case "tool_use":
 			sc.toolsSeen = true
 			bs.outIdx = sc.outCount
@@ -282,6 +321,26 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 			*events = append(*events, sc.responsesEm().ItemAdded(bs.outIdx, map[string]any{
 				"type": "function_call", "id": bs.itemID, "call_id": bs.id, "name": bs.name, "arguments": "",
 			}))
+		case "thinking":
+			// Fix #2: emit reasoning item lifecycle (added, summary_text deltas,
+			// summary_text.done, done) so Responses clients receive the thinking
+			// text the chat route already emits (CLAUDE.md parity invariant:
+			// "Historical thinking must be replayed").
+			// Thinking blocks carry no id, so the item identity follows the
+			// host convention rs_<response>_<choice>. Only the first thinking
+			// block announces: later (interleaved) thinking blocks extend the
+			// same reasoning item, so outCount stays aligned with the single
+			// item outputItems renders at this block's position.
+			if sc.thinkSeen {
+				break
+			}
+			sc.thinkSeen = true
+			sc.thinkItemID = shared.ReasoningItemID(sc.msgID, 0)
+			sc.thinkOutIdx = sc.outCount
+			sc.outCount++
+			em := sc.responsesEm()
+			*events = append(*events, em.ReasoningItemAdded(sc.thinkItemID, sc.thinkOutIdx))
+			*events = append(*events, em.ReasoningPartAdded(sc.thinkItemID, sc.thinkOutIdx))
 		}
 	case "content_block_delta":
 		idx := int(ev.Index)
@@ -291,6 +350,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 			if bs != nil {
 				bs.text.WriteString(ev.Delta.Text)
 			}
+			sc.respTextBuf.WriteString(ev.Delta.Text)
 			// Deltas target the single aggregated message item, so later
 			// text blocks reference its announced position, never their own.
 			dIdx := idx
@@ -305,8 +365,20 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 			bs.args.WriteString(ev.Delta.PartialJSON)
 			*events = append(*events, sc.responsesEm().ArgsDelta(bs.itemID, bs.outIdx, ev.Delta.PartialJSON))
 		case "thinking_delta":
-			// FR-005 explicit omission policy: no standard Responses
-			// reasoning-delta event; dropped.
+			// Fix #2: emit reasoning_text events so Responses clients receive the
+			// thinking text the chat route already emits (CLAUDE.md parity invariant:
+			// "Historical thinking must be replayed"). DeepSeek docs state both
+			// response.reasoning_text.* and response.reasoning_summary_text.* are
+			// distinct event types, so emit both.
+			// A thinking fragment only belongs to a thinking block. One that
+			// targets any other block (or an unannounced index) is dropped:
+			// opening a reasoning item mid-stream would claim an output_index
+			// after text/tool items and desynchronize the terminal output.
+			if bs == nil || bs.kind != "thinking" || !sc.thinkSeen {
+				break
+			}
+			sc.thinkBuf.WriteString(ev.Delta.Thinking)
+			*events = append(*events, sc.responsesEm().ReasoningSummaryDelta(sc.thinkItemID, sc.thinkOutIdx, ev.Delta.Thinking)...)
 		}
 	case "message_delta":
 		if ev.Usage.InputTokens != 0 {
@@ -332,7 +404,9 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 // represented by their function_call output items and never override the
 // status (FR-006). Each function_call is closed at its announced
 // output_index before completed, because clients finish a call only after
-// the matching done event. Shared by message_stop and Flush so an early
+// the matching done event. Reasoning items are closed similarly (Fix #2:
+// emit reasoning_summary_text.done and response.output_item.done before
+// response.completed). Shared by message_stop and Flush so an early
 // upstream close cannot diverge from the normal-path shape.
 func (sc *StreamConverter) responsesCompleted() [][]byte {
 	status := shared.ResponseStatusFromClaudeStop(sc.stopReason)
@@ -345,6 +419,26 @@ func (sc *StreamConverter) responsesCompleted() [][]byte {
 	}
 	sort.Ints(indexes)
 	events := make([][]byte, 0, len(indexes)*2+1)
+	// Close reasoning item if seen (Fix #2: emit reasoning_summary_text.done
+	// and output_item.done before response.completed).
+	if sc.thinkSeen && !sc.thinkStopped {
+		sc.thinkStopped = true
+		text := sc.thinkBuf.String()
+		events = append(events, em.ReasoningSummaryDone(sc.thinkItemID, sc.thinkOutIdx, text)...)
+		events = append(events, em.ReasoningPartDone(sc.thinkItemID, sc.thinkOutIdx, text))
+		events = append(events, em.ReasoningItemDone(sc.thinkItemID, sc.thinkOutIdx, text))
+	}
+	// Close the message item (fix #8): output_text.done, content_part.done,
+	// then output_item.done, each carrying the full aggregated text.
+	if sc.msgIdx >= 0 {
+		text := sc.respTextBuf.String()
+		events = append(events,
+			em.OutputTextDone(sc.msgID, sc.msgIdx, text),
+			em.ContentPartDone(sc.msgID, sc.msgIdx, text),
+			em.MessageItemDone(sc.msgIdx, sc.msgID, text),
+		)
+		sc.msgIdx = -1 // one-shot: a later Flush must not close it twice
+	}
 	for _, i := range indexes {
 		bs := sc.blocks[i]
 		if bs == nil || bs.kind != "tool_use" {
@@ -394,8 +488,9 @@ func (sc *StreamConverter) Flush() [][]byte {
 // OutputAssembler: ALL text blocks aggregate into ONE message item
 // positioned at the first text block's slot while tool_use blocks become
 // separate function_call items — the canonical native shape, equal to the
-// non-stream claudeToResponses converter (FR-006 mode parity); thinking
-// blocks are omitted (FR-005).
+// non-stream claudeToResponses converter (FR-006 mode parity). Thinking
+// blocks become reasoning items (Fix #2: emit reasoning so Responses clients
+// receive thinking text the chat route already emits).
 func (sc *StreamConverter) outputItems() []any {
 	indexes := make([]int, 0, len(sc.blocks))
 	for i := range sc.blocks {
@@ -403,9 +498,18 @@ func (sc *StreamConverter) outputItems() []any {
 	}
 	sort.Ints(indexes)
 	oa := shared.NewOutputAssembler(sc.msgID)
+	// Fix #2: the single reasoning item renders at the FIRST thinking block's
+	// position, the same compacted slot its announcement claimed, so the
+	// streamed output_index values keep matching the terminal array.
+	reasoningPlaced := false
 	for _, i := range indexes {
 		bs := sc.blocks[i]
 		switch bs.kind {
+		case "thinking":
+			if sc.thinkSeen && !reasoningPlaced {
+				reasoningPlaced = true
+				oa.AppendReasoning(shared.NewRespReasoningItem(sc.thinkItemID, sc.thinkBuf.String()))
+			}
 		case "text":
 			oa.ReserveTextSlot()
 			oa.AddText(bs.text.String())
@@ -461,14 +565,32 @@ func (sc *StreamConverter) captureCache(u usageCounts) {
 }
 
 // sseError maps an Anthropic in-stream error event onto the shared
-// classification (FR-009) via its documented error-type taxonomy.
+// classification. Fix #18: pass the raw error JSON to FromUpstream so vendor
+// code/rateLimit fields are parsed and preserved (for cooldown scope + retry
+// timing). The status is derived from the documented Anthropic error type.
 func sseError(e map[string]any) *errclass.Error {
 	errorType := sget(e, "type")
 	message := sget(e, "message")
 	if strings.Contains(strings.ToLower(errorType), "gousagelimiterror") || strings.Contains(strings.ToLower(errorType), "freeusagelimiterror") {
 		message = errorType + ": " + message
 	}
-	return errclass.FromStatus(anthropicErrorStatus(errorType), message)
+	status := anthropicErrorStatus(errorType)
+	// Fix #18: the vendor's code / rateLimit must reach FromUpstream so a
+	// window-exhausted error cools the whole credential until upstream reset
+	// instead of degrading to a status-only classification. The envelope is
+	// rebuilt rather than re-marshalled verbatim: FromUpstream decodes code as
+	// a string (a numeric code would fail the whole decode and leak raw JSON
+	// into the message), and the usage-limit prefix above must survive.
+	code := sget(e, "code")
+	if code == "" && message == "" {
+		return errclass.FromStatus(status, message)
+	}
+	inner := map[string]any{"code": code, "message": message}
+	if rl, ok := e["rateLimit"]; ok {
+		inner["rateLimit"] = rl
+	}
+	raw, _ := json.Marshal(map[string]any{"error": inner})
+	return errclass.FromUpstream(status, raw)
 }
 
 func anthropicErrorStatus(t string) int {

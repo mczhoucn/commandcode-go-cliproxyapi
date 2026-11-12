@@ -209,13 +209,19 @@ func TestAccountAddErrorsNeverSaveOrLeakSecrets(t *testing.T) {
 			f.setAuthFiles("existing-unrelated-key")
 			m := NewManager(NewHostBridge(f.call))
 			resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/accounts", Body: []byte(`{"api_key":"new-safe-test-key"}`)})
-			if err != nil || resp.StatusCode != http.StatusBadGateway || strings.Contains(string(resp.Body), "credential-secret") {
-				t.Fatalf("host failure: status=%d body=%s err=%v", resp.StatusCode, resp.Body, err)
+			// Finding 2: an unreadable UNRELATED auth file (AuthGet failure) is
+			// skipped rather than aborting the duplicate check, so the add proceeds.
+			want := http.StatusBadGateway
+			if method == pluginabi.MethodHostAuthGet {
+				want = http.StatusCreated
+			}
+			if err != nil || resp.StatusCode != want || strings.Contains(string(resp.Body), "credential-secret") {
+				t.Fatalf("host failure: status=%d want=%d body=%s err=%v", resp.StatusCode, want, resp.Body, err)
 			}
 			if len(f.callsOf(method)) == 0 {
 				t.Fatal("test did not reach failing host callback")
 			}
-			if method != pluginabi.MethodHostAuthSave && len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 {
+			if method == pluginabi.MethodHostAuthList && len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 {
 				t.Fatal("failed duplicate check still saved")
 			}
 		})

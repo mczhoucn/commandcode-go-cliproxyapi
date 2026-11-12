@@ -36,20 +36,29 @@ type StreamConverter struct {
 	thinkIndex   int                       // claude index of the currently-open thinking block
 	nextIndex    int                       // next output/block index
 	msgIndex     int                       // announced assistant message item index (-1 until text)
-	thinkItemID  string                    // announced reasoning item identity ("" until reasoning)
-	thinkIndexIn int                       // announced reasoning output index (-1 until reasoning)
-	thinkStopped bool                      // reasoning done transitions already emitted
-	thinkSeen    bool                      // any reasoning text observed (terminal item inclusion)
-	thinkBuf     strings.Builder           // aggregated reasoning summary text
+	reasoning    []*reasoningSegment       // every announced Responses reasoning item, in arrival order
+	curReasoning *reasoningSegment         // open reasoning item receiving deltas (nil once closed)
 	tools        map[int64]*streamTool
-	toolOrder    []int64 // upstream tool_call indices in first-arrival order
-	toolsSeen    bool    // any tool_calls entry observed (terminal-reason precedence)
+	liveTool     *streamTool      // claude target: the one tool_use block streamed live (nil until the first tool)
+	deferred     []*claudeSegment // claude target: blocks started after liveTool, rendered at the terminal
+	toolOrder    []int64          // upstream tool_call indices in first-arrival order
+	toolsSeen    bool             // any tool_calls entry observed (terminal-reason precedence)
 	usage        *ccUsage
 	finished     bool            // finish_reason processed
 	heldFinish   string          // finish_reason awaiting terminal emission (flushed on the next data line or [DONE], so the standard include_usage trailer lands in the terminal event; Flush covers close-without-[DONE])
-	terminalSent bool            // claudeTerminal already emitted message_delta (Flush must still close with message_stop)
+	terminalSent bool            // terminal (message_delta / response.completed) already emitted; claude Flush must still close with message_stop
 	flushed      bool            // Flush already ran (one-shot guard)
 	respText     strings.Builder // openai-response accumulated output_text
+}
+
+// reasoningSegment is one announced Responses reasoning item. Reasoning
+// that resumes after the previous item closed (text or a tool call came in
+// between) opens a NEW item instead of sending deltas to a done item, so
+// no thinking text is lost and no event references a closed item (fix #16).
+type reasoningSegment struct {
+	itemID string
+	outIdx int
+	text   strings.Builder
 }
 
 // streamTool accumulates one upstream tool_calls index; args collects
@@ -61,7 +70,21 @@ type streamTool struct {
 	itemID     string // fc_-prefixed Responses item id shared by deltas and done events
 	name       string
 	args       strings.Builder
-	stopped    bool // content_block_stop emitted
+	stopped    bool // claude target: content_block_stop emitted
+}
+
+// claudeSegment is one Messages content block held back while the live
+// tool_use block is open (fix #9). Chat Completions addresses tool argument
+// fragments by tool index, so a fragment for an earlier tool can arrive
+// after a later block started. Anthropic allows one open block at a time
+// and no deltas after content_block_stop, so the first tool_use streams
+// live and stays open; every block that starts after it is buffered here
+// and rendered complete (start, one delta, stop) at the terminal, in
+// arrival order. No fragment is dropped and none lands after its stop.
+type claudeSegment struct {
+	kind string          // "text" | "thinking" | "tool_use"
+	text strings.Builder // text or thinking content
+	tool *streamTool     // tool_use: arguments accumulate in tool.args
 }
 
 // NewStreamConverter returns a converter translating Chat Completions
@@ -70,7 +93,6 @@ func NewStreamConverter(sourceFormat string) *StreamConverter {
 	return &StreamConverter{
 		sourceFormat: sourceFormat,
 		msgIndex:     -1,
-		thinkIndexIn: -1,
 		tools:        map[int64]*streamTool{},
 	}
 }
@@ -126,21 +148,24 @@ func (sc *StreamConverter) Flush() [][]byte {
 		return nil
 	}
 	sc.flushed = true
+	if sc.done || !sc.started {
+		// [DONE] already delivered the terminal, or nothing was emitted.
+		return nil
+	}
 	switch sc.sourceFormat {
 	case "claude":
-		events := sc.claudeTerminal()
-		if len(events) == 0 {
-			if !sc.terminalSent {
-				return nil
-			}
-			// The post-finish include_usage trailer already delivered the
-			// terminal via claudeLine; close-without-[DONE] must still emit
-			// message_stop or Anthropic clients hang until timeout.
-			return [][]byte{sc.claudeEm.MessageStop()}
-		}
+		// Close live blocks and render deferred ones first: a stream cut
+		// before finish_reason still owes the client every block (fix #9)
+		// and a synthesized message_delta (fix #6).
+		events := sc.finalizeBlocks()
+		events = append(events, sc.claudeTerminal(true)...)
+		// When the post-finish include_usage trailer already delivered the
+		// terminal, close-without-[DONE] must still emit message_stop or
+		// Anthropic clients hang until timeout.
 		return append(events, sc.claudeEm.MessageStop())
 	case "openai-response":
-		return sc.responsesTerminal()
+		events := sc.stopReasoning()
+		return append(events, sc.responsesTerminal(true)...)
 	default:
 		return nil
 	}
@@ -227,6 +252,9 @@ type ccChunkError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    any    `json:"code"`
+	// RateLimit is CommandCode's window-exhaustion detail ({window, reset,
+	// model}); forwarded to errclass so the cooldown lasts until the reset.
+	RateLimit json.RawMessage `json:"rateLimit,omitempty"`
 }
 
 // decodeChunk parses one data payload; malformed JSON yields a
@@ -255,10 +283,10 @@ func (sc *StreamConverter) decodeChunk(data string) (*ccChunk, *errclass.Error) 
 }
 
 // chunkError classifies an in-stream Chat Completions error object onto
-// FR-009 classes, mirroring the sibling adapters' stream-error paths:
-// a numeric code (or rate-limit marker) maps through FromStatus so §7
-// retryability semantics apply; anything else is a retryable upstream
-// server failure.
+// FR-009 classes. Fix #18: pass the raw error JSON to FromUpstream so vendor
+// code/rateLimit fields are parsed and preserved (for cooldown scope + retry
+// timing). The status is derived from the in-stream code if numeric, else 429
+// when the error signals a quota/rate condition, else a generic upstream failure.
 func chunkError(e *ccChunkError) *errclass.Error {
 	status := 0
 	switch c := e.Code.(type) {
@@ -267,17 +295,34 @@ func chunkError(e *ccChunkError) *errclass.Error {
 	case string:
 		if n, err := strconv.Atoi(c); err == nil {
 			status = n
-		} else if strings.Contains(c, "rate_limit") {
+		}
+	}
+	// If no numeric code, infer 429 from quota/rate markers in the string
+	// code, type, or message (a non-numeric code like "rate_limit_exceeded"
+	// is the usual carrier, so it must be part of the scanned text).
+	if status == 0 {
+		codeStr, _ := e.Code.(string)
+		lower := strings.ToLower(codeStr + " " + e.Type + " " + e.Message)
+		if strings.Contains(lower, "rate_limit") || strings.Contains(lower, "usage_exceeded") ||
+			strings.Contains(lower, "credits") || strings.Contains(lower, "usage-limit") {
 			status = 429
 		}
 	}
-	if status == 0 && strings.Contains(e.Type, "rate_limit") {
-		status = 429
+	if status == 0 {
+		// No status signal at all: an opaque upstream failure, retryable
+		// with StatusCode 0 exactly as before.
+		return errclass.UpstreamFallback(e.Message)
 	}
-	if status > 0 {
-		return errclass.FromStatus(status, e.Message)
+	// Rebuild a well-formed vendor envelope rather than re-marshalling e:
+	// FromUpstream decodes code as a string, so a numeric code would fail the
+	// whole decode; rateLimit rides along for credential-scoped cooldown.
+	codeStr, _ := e.Code.(string)
+	inner := map[string]any{"code": codeStr, "message": e.Message}
+	if len(e.RateLimit) > 0 {
+		inner["rateLimit"] = e.RateLimit
 	}
-	return errclass.UpstreamFallback(e.Message)
+	raw, _ := json.Marshal(map[string]any{"error": inner})
+	return errclass.FromUpstream(status, raw)
 }
 
 // ---- Chat Completions -> claude (Anthropic Messages) stream (FR-006) ----
@@ -302,8 +347,8 @@ func (sc *StreamConverter) claudeLine(line string) ([][]byte, *errclass.Error) {
 	}
 	if shared.IsSSEDone(data) {
 		sc.done = true
-		events := sc.stopBlocks()
-		events = append(events, sc.claudeTerminal()...)
+		events := sc.finalizeBlocks()
+		events = append(events, sc.claudeTerminal(true)...)
 		return append(events, sc.claudeEm.MessageStop()), nil
 	}
 	chunk, eErr := sc.decodeChunk(data)
@@ -314,7 +359,7 @@ func (sc *StreamConverter) claudeLine(line string) ([][]byte, *errclass.Error) {
 	if sc.heldFinish != "" {
 		// A post-finish chunk (typically the include_usage trailer)
 		// flushes the deferred terminal so it carries the final counts.
-		events = append(events, sc.claudeTerminal()...)
+		events = append(events, sc.claudeTerminal(false)...)
 	}
 	if !sc.started && len(chunk.Choices) > 0 {
 		sc.started = true
@@ -330,19 +375,28 @@ func (sc *StreamConverter) claudeLine(line string) ([][]byte, *errclass.Error) {
 	}
 	choice := chunk.Choices[0]
 	if thinking, ok := choice.Delta.ReasoningText(); ok {
-		// Vendor thinking spellings become the leading thinking block. A
-		// reopen (thinking after text or tools) closes every open block
-		// first, the same one-open-block rule the text path follows.
-		if !sc.thinkOpen {
-			events = append(events, sc.stopBlocks()...)
-			sc.thinkIndex = sc.nextIndex
-			sc.nextIndex++
-			sc.thinkOpen = true
-			events = append(events, sc.claudeEm.ThinkingBlockStart(sc.thinkIndex))
+		if sc.liveTool != nil {
+			// A block that starts after the live tool_use is held back
+			// and rendered complete at the terminal (fix #9).
+			sc.deferText("thinking", thinking)
+		} else {
+			// Vendor thinking spellings become the leading thinking block. A
+			// reopen (thinking after text) closes every open block first, the
+			// same one-open-block rule the text path follows.
+			if !sc.thinkOpen {
+				events = append(events, sc.stopBlocks()...)
+				sc.thinkIndex = sc.nextIndex
+				sc.nextIndex++
+				sc.thinkOpen = true
+				events = append(events, sc.claudeEm.ThinkingBlockStart(sc.thinkIndex))
+			}
+			events = append(events, sc.claudeEm.ThinkingDelta(sc.thinkIndex, thinking))
 		}
-		events = append(events, sc.claudeEm.ThinkingDelta(sc.thinkIndex, thinking))
 	}
-	if choice.Delta.Content != "" {
+	if choice.Delta.Content != "" && sc.liveTool != nil {
+		// Text after the live tool_use is held back too (fix #9).
+		sc.deferText("text", choice.Delta.Content)
+	} else if choice.Delta.Content != "" {
 		// The text block opens lazily on first non-empty content so pure
 		// tool-call streams carry no phantom empty text block, matching
 		// non-stream chatToClaude's block shape. Every content_block_start
@@ -365,35 +419,104 @@ func (sc *StreamConverter) claudeLine(line string) ([][]byte, *errclass.Error) {
 	for _, tc := range choice.Delta.ToolCalls {
 		t := sc.tools[tc.Index]
 		if t == nil {
-			events = append(events, sc.stopBlocks()...)
-			t = &streamTool{blockIndex: sc.nextIndex, id: tc.ID, name: tc.Function.Name}
-			sc.nextIndex++
+			t = &streamTool{id: tc.ID, name: tc.Function.Name}
 			sc.tools[tc.Index] = t
 			sc.toolsSeen = true
 			sc.toolOrder = append(sc.toolOrder, tc.Index)
-			events = append(events, sc.claudeEm.ContentBlockStart(t.blockIndex, "tool_use",
-				map[string]any{"id": t.id, "name": t.name, "input": map[string]any{}}))
+			if sc.liveTool == nil {
+				// The first tool streams live and stays open until the
+				// terminal, so a late fragment for it is never orphaned.
+				events = append(events, sc.stopBlocks()...)
+				t.blockIndex = sc.nextIndex
+				sc.nextIndex++
+				sc.liveTool = t
+				events = append(events, sc.claudeEm.ContentBlockStart(t.blockIndex, "tool_use",
+					map[string]any{"id": t.id, "name": t.name, "input": map[string]any{}}))
+			} else {
+				sc.deferred = append(sc.deferred, &claudeSegment{kind: "tool_use", tool: t})
+			}
 		}
-		if tc.Function.Arguments != "" {
+		if tc.Function.Arguments == "" {
+			continue
+		}
+		if t == sc.liveTool && !t.stopped {
 			events = append(events, sc.claudeEm.ContentBlockDelta(t.blockIndex,
 				map[string]any{"type": "input_json_delta", "partial_json": tc.Function.Arguments}))
+			continue
 		}
+		// A deferred tool accumulates so its complete arguments render
+		// once at the terminal (fix #9).
+		t.args.WriteString(tc.Function.Arguments)
 	}
 	if choice.FinishReason != "" && !sc.finished {
 		sc.finished = true
 		sc.heldFinish = choice.FinishReason
-		events = append(events, sc.stopBlocks()...)
+		events = append(events, sc.finalizeBlocks()...)
 	}
 	return events, nil
 }
 
+// deferText appends text or thinking to the trailing deferred segment of
+// the same kind, or starts a new one, keeping arrival order (fix #9).
+func (sc *StreamConverter) deferText(kind, text string) {
+	if n := len(sc.deferred); n > 0 && sc.deferred[n-1].kind == kind {
+		sc.deferred[n-1].text.WriteString(text)
+		return
+	}
+	seg := &claudeSegment{kind: kind}
+	seg.text.WriteString(text)
+	sc.deferred = append(sc.deferred, seg)
+}
+
+// finalizeBlocks closes every live block and then renders each deferred
+// block complete (start, its whole content as one delta, stop) at fresh
+// sequential indexes. Idempotent: the deferred queue drains once, so the
+// finish_reason, [DONE] and Flush paths can all call it.
+func (sc *StreamConverter) finalizeBlocks() [][]byte {
+	events := sc.stopBlocks()
+	for _, seg := range sc.deferred {
+		idx := sc.nextIndex
+		sc.nextIndex++
+		switch seg.kind {
+		case "thinking":
+			events = append(events,
+				sc.claudeEm.ThinkingBlockStart(idx),
+				sc.claudeEm.ThinkingDelta(idx, seg.text.String()))
+		case "text":
+			events = append(events,
+				sc.claudeEm.ContentBlockStart(idx, "text", map[string]any{"text": ""}),
+				sc.claudeEm.ContentBlockDelta(idx, map[string]any{"type": "text_delta", "text": seg.text.String()}))
+		case "tool_use":
+			t := seg.tool
+			t.blockIndex = idx
+			t.stopped = true
+			events = append(events, sc.claudeEm.ContentBlockStart(idx, "tool_use",
+				map[string]any{"id": t.id, "name": t.name, "input": map[string]any{}}))
+			if args := t.args.String(); args != "" {
+				events = append(events, sc.claudeEm.ContentBlockDelta(idx,
+					map[string]any{"type": "input_json_delta", "partial_json": args}))
+			}
+		}
+		events = append(events, sc.claudeEm.ContentBlockStop(idx))
+	}
+	sc.deferred = nil
+	return events
+}
+
 // claudeTerminal renders the held message_delta exactly once, carrying
-// the captured usage when any arrived before emission.
-func (sc *StreamConverter) claudeTerminal() [][]byte {
+// the captured usage when any arrived before emission. force marks the
+// end of the stream ([DONE] or Flush): if the upstream never sent a
+// finish_reason but the message did start, a message_delta is synthesized
+// with the stop-derived reason so the client is not left with an
+// unterminated message (fix #6). A post-finish data line passes false.
+func (sc *StreamConverter) claudeTerminal(force bool) [][]byte {
 	finish := sc.heldFinish
 	sc.heldFinish = ""
 	if finish == "" {
-		return nil
+		if !force || !sc.started || sc.terminalSent {
+			return nil
+		}
+		finish = "stop"
 	}
 	sc.terminalSent = true
 	// Observed tool calls outrank the status-derived reason, mirroring
@@ -440,12 +563,9 @@ func (sc *StreamConverter) stopBlocks() [][]byte {
 	var events [][]byte
 	events = append(events, sc.stopThinking()...)
 	events = append(events, sc.stopText()...)
-	for _, idx := range sc.toolOrder {
-		t := sc.tools[idx]
-		if t != nil && !t.stopped {
-			t.stopped = true
-			events = append(events, sc.claudeEm.ContentBlockStop(t.blockIndex))
-		}
+	if t := sc.liveTool; t != nil && !t.stopped {
+		t.stopped = true
+		events = append(events, sc.claudeEm.ContentBlockStop(t.blockIndex))
 	}
 	return events
 }
@@ -469,7 +589,7 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 	if shared.IsSSEDone(data) {
 		sc.done = true
 		events := sc.stopReasoning()
-		return append(events, sc.responsesTerminal()...), nil
+		return append(events, sc.responsesTerminal(true)...), nil
 	}
 	chunk, eErr := sc.decodeChunk(data)
 	if eErr != nil {
@@ -479,40 +599,54 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 	if sc.heldFinish != "" {
 		// A post-finish chunk (typically the include_usage trailer)
 		// flushes the deferred terminal so it carries the final counts.
-		events = append(events, sc.responsesTerminal()...)
+		events = append(events, sc.responsesTerminal(false)...)
 	}
 	if !sc.started && len(chunk.Choices) > 0 {
 		sc.started = true
 		sc.id = chunk.ID
 		sc.model = chunk.Model
 		// Lifecycle parity with the Responses protocol: announce the
-		// response before any deltas reference it (F18).
-		events = append(events, sc.responsesEm().Created())
+		// response, then mark it in progress, before any deltas reference
+		// it (F18, fix #8).
+		em := sc.responsesEm()
+		events = append(events, em.Created(), em.InProgress())
 	}
 	if len(chunk.Choices) == 0 {
 		return events, nil
 	}
 	choice := chunk.Choices[0]
 	if thinking, ok := choice.Delta.ReasoningText(); ok {
-		if !sc.thinkSeen {
-			sc.thinkSeen = true
-			sc.thinkIndexIn = sc.nextIndex
+		if sc.curReasoning == nil {
+			// First reasoning, or reasoning that resumes after text or a
+			// tool call closed the previous item: open a fresh item at the
+			// next output position rather than streaming into a done item
+			// (fix #16). The first keeps the rs_<id>_0 identity.
+			seg := &reasoningSegment{
+				itemID: shared.ReasoningItemID(sc.id, len(sc.reasoning)),
+				outIdx: sc.nextIndex,
+			}
 			sc.nextIndex++
-			sc.thinkItemID = shared.ReasoningItemID(sc.id, 0)
-			events = append(events, sc.responsesEm().ReasoningItemAdded(sc.thinkItemID, sc.thinkIndexIn))
-			events = append(events, sc.responsesEm().ReasoningPartAdded(sc.thinkItemID, sc.thinkIndexIn))
+			sc.reasoning = append(sc.reasoning, seg)
+			sc.curReasoning = seg
+			em := sc.responsesEm()
+			events = append(events, em.ReasoningItemAdded(seg.itemID, seg.outIdx), em.ReasoningPartAdded(seg.itemID, seg.outIdx))
 		}
-		sc.thinkBuf.WriteString(thinking)
-		events = append(events, sc.responsesEm().ReasoningSummaryDelta(sc.thinkItemID, sc.thinkIndexIn, thinking)...)
+		seg := sc.curReasoning
+		seg.text.WriteString(thinking)
+		events = append(events, sc.responsesEm().ReasoningSummaryDelta(seg.itemID, seg.outIdx, thinking)...)
 	}
 	if choice.Delta.Content != "" {
 		events = append(events, sc.stopReasoning()...)
 		if sc.msgIndex < 0 {
 			sc.msgIndex = sc.nextIndex
 			sc.nextIndex++
-			events = append(events, sc.responsesEm().ItemAdded(sc.msgIndex, map[string]any{
+			em := sc.responsesEm()
+			events = append(events, em.ItemAdded(sc.msgIndex, map[string]any{
 				"type": "message", "role": "assistant", "id": sc.id, "content": []any{},
 			}))
+			// The output_text part opens before its first delta and closes
+			// at the terminal (fix #8 message item lifecycle).
+			events = append(events, em.ContentPartAdded(sc.id, sc.msgIndex))
 		}
 		sc.respText.WriteString(choice.Delta.Content)
 		events = append(events, sc.responsesEm().TextDelta(sc.id, sc.msgIndex, choice.Delta.Content))
@@ -552,16 +686,17 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 // thinking run always closes before the next item is announced
 // (host-translator parity).
 func (sc *StreamConverter) stopReasoning() [][]byte {
-	if !sc.thinkSeen || sc.thinkStopped {
+	seg := sc.curReasoning
+	if seg == nil {
 		return nil
 	}
-	sc.thinkStopped = true
-	text := sc.thinkBuf.String()
+	sc.curReasoning = nil // later reasoning opens a new item (fix #16)
+	text := seg.text.String()
 	em := sc.responsesEm()
-	events := em.ReasoningSummaryDone(sc.thinkItemID, sc.thinkIndexIn, text)
+	events := em.ReasoningSummaryDone(seg.itemID, seg.outIdx, text)
 	return append(events,
-		em.ReasoningPartDone(sc.thinkItemID, sc.thinkIndexIn, text),
-		em.ReasoningItemDone(sc.thinkItemID, sc.thinkIndexIn, text),
+		em.ReasoningPartDone(seg.itemID, seg.outIdx, text),
+		em.ReasoningItemDone(seg.itemID, seg.outIdx, text),
 	)
 }
 
@@ -573,13 +708,21 @@ func (sc *StreamConverter) responsesEm() shared.ResponsesEventEmitter {
 }
 
 // responsesTerminal renders the held response.completed exactly once,
-// carrying the captured usage when any arrived before emission.
-func (sc *StreamConverter) responsesTerminal() [][]byte {
+// carrying the captured usage when any arrived before emission. force
+// marks the end of the stream ([DONE] or Flush): a started response that
+// never received a finish_reason still gets its closing events and a
+// completed terminal instead of hanging the client (fix #6). A post-finish
+// data line passes false.
+func (sc *StreamConverter) responsesTerminal(force bool) [][]byte {
 	finish := sc.heldFinish
 	sc.heldFinish = ""
 	if finish == "" {
-		return nil
+		if !force || !sc.started || sc.terminalSent {
+			return nil
+		}
+		finish = "stop"
 	}
+	sc.terminalSent = true
 	// Status derives positionally from finish alone: length→incomplete,
 	// else completed. Tool calls are represented by output items, not
 	// status vocabulary (F-R2, Messages-route parity).
@@ -592,23 +735,26 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 	// function_call items; this mirrors the Messages-route invariant that
 	// terminal output order equals announcement order (W4 pin).
 	oa := shared.NewOutputAssembler(sc.id)
-	// The reasoning item renders first: it was announced before the message
-	// and function_call items, so its array position keeps the streamed
-	// output_index values valid.
-	if sc.thinkSeen {
-		oa.AppendReasoning(shared.NewRespReasoningItem(sc.thinkItemID, sc.thinkBuf.String()))
+	// Every item renders at the output_index it was announced with:
+	// reasoning items (possibly several, fix #16), the one message slot,
+	// and function calls are placed by walking the announced positions in
+	// order, so Render() reproduces the streamed indexes exactly.
+	byPos := make(map[int]func(), sc.nextIndex)
+	for _, seg := range sc.reasoning {
+		seg := seg
+		byPos[seg.outIdx] = func() { oa.AppendReasoning(shared.NewRespReasoningItem(seg.itemID, seg.text.String())) }
 	}
-	reserved := false
+	if sc.msgIndex >= 0 {
+		byPos[sc.msgIndex] = oa.ReserveTextSlot
+	}
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]
-		if sc.msgIndex >= 0 && !reserved && t.blockIndex > sc.msgIndex {
-			oa.ReserveTextSlot()
-			reserved = true
-		}
-		oa.AppendFunctionCall(t.id, t.name, shared.DefaultArgs(t.args.String()))
+		byPos[t.blockIndex] = func() { oa.AppendFunctionCall(t.id, t.name, shared.DefaultArgs(t.args.String())) }
 	}
-	if sc.msgIndex >= 0 && !reserved {
-		oa.ReserveTextSlot()
+	for pos := 0; pos < sc.nextIndex; pos++ {
+		if place := byPos[pos]; place != nil {
+			place()
+		}
 	}
 	oa.AddText(sc.respText.String())
 	// Always attach (F-R6): zero-valued fields when upstream sent none.
@@ -628,7 +774,17 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 	}
 	usage := shared.NewResponsesUsageFrom(input, outputTokens, details)
 	em := sc.responsesEm()
-	events := make([][]byte, 0, len(sc.toolOrder)*2+1)
+	events := make([][]byte, 0, len(sc.toolOrder)*2+4)
+	// Close the message item before the function calls, the same order the
+	// Messages-route synthesizer uses (fix #8 lifecycle, FR-006 parity).
+	if sc.msgIndex >= 0 {
+		text := sc.respText.String()
+		events = append(events,
+			em.OutputTextDone(sc.id, sc.msgIndex, text),
+			em.ContentPartDone(sc.id, sc.msgIndex, text),
+			em.MessageItemDone(sc.msgIndex, sc.id, text),
+		)
+	}
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]
 		if t == nil {

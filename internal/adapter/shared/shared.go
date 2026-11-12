@@ -576,20 +576,28 @@ type ReasoningFields struct {
 // authoritative per-token text; vendors mirror the plain string in it when
 // both are present, so details-only avoids duplicating content), then
 // "reasoning", then an already-standard "reasoning_content".
+//
+// Only truly empty fragments are skipped when joining — a fragment that is
+// whitespace-only (e.g. a "\n\n" separator or " " between tokens) must
+// survive the join or the assembled text loses formatting and tokens fuse
+// incorrectly (fix #5). The source-priority decision is separate: a details
+// array whose joined text is whitespace-only carries no real thinking, so it
+// falls through to the plain "reasoning" / "reasoning_content" fields rather
+// than shadowing them with blank text.
 func (f *ReasoningFields) ReasoningText() (string, bool) {
 	var parts []string
 	for _, d := range f.ReasoningDetails {
-		if strings.TrimSpace(d.Text) != "" {
+		if d.Text != "" {
 			parts = append(parts, d.Text)
 		}
 	}
-	if len(parts) > 0 {
-		return strings.Join(parts, ""), true
+	if joined := strings.Join(parts, ""); strings.TrimSpace(joined) != "" {
+		return joined, true
 	}
-	if strings.TrimSpace(f.Reasoning) != "" {
+	if f.Reasoning != "" {
 		return f.Reasoning, true
 	}
-	if strings.TrimSpace(f.ReasoningContent) != "" {
+	if f.ReasoningContent != "" {
 		return f.ReasoningContent, true
 	}
 	return "", false
@@ -672,6 +680,55 @@ func NewRespReasoningItem(id, text string) RespReasoningItem {
 		Type:    "reasoning",
 		Summary: []RespReasoningPart{{Type: "summary_text", Text: text}},
 	}
+}
+
+// RespReasoningItemText extracts the plaintext of a Responses reasoning
+// item for history replay. DeepSeek's guide defines the accepted shapes:
+// `content` is a string or an array of text parts and is the only reasoning
+// payload replayed into history; `summary` and `encrypted_content` are not
+// supported upstream as reasoning text, so `content` (the plaintext) is
+// preferred. When `content` carries nothing, `summary` is used as a
+// best-effort fallback — it is the form the host translator emits, so a
+// round-tripped item (one the plugin itself synthesized earlier) is not
+// silently lost.
+//
+// The parts are decoded locally rather than through DecodeStringOrParts
+// because a reasoning item's part type is `reasoning_text`, which is not an
+// input content part and would be rejected by that kernel's allowlist.
+//
+// Shared so the Chat Completions and Messages routes cannot diverge on the
+// replay shape (CLAUDE.md parity invariant).
+func RespReasoningItemText(item RespItem) string {
+	if HasContent(item.Content) {
+		var s string
+		if json.Unmarshal(item.Content, &s) == nil {
+			return s
+		}
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(item.Content, &parts) == nil {
+			var sb strings.Builder
+			for _, p := range parts {
+				switch p.Type {
+				case "reasoning_text", "text", "input_text", "output_text", "summary_text":
+					sb.WriteString(p.Text)
+				}
+			}
+			if text := sb.String(); text != "" {
+				return text
+			}
+		}
+	}
+	// Summary parts are discrete summary paragraphs (not token fragments),
+	// so they join on a newline — the shape the host translator emits and
+	// the form a round-tripped item carries.
+	summaries := make([]string, 0, len(item.Summary))
+	for _, s := range item.Summary {
+		summaries = append(summaries, s.Text)
+	}
+	return strings.Join(summaries, "\n")
 }
 
 // ReasoningItemInProgress renders the reasoning item announcement: the same
@@ -846,10 +903,25 @@ type ResponsesEventEmitter struct {
 	Model string // model rendered on the terminal completed payload
 }
 
-// Created renders the leading response.created announcement.
+// Created renders the leading response.created announcement. Synthesizers
+// follow it immediately with InProgress (fix #8): the OpenAI Responses
+// lifecycle places response.in_progress between created and the first item
+// event, and strict clients wait for it.
 func (e ResponsesEventEmitter) Created() []byte {
 	return SSEEvent("response.created", map[string]any{
 		"type": "response.created",
+		"response": map[string]any{
+			"id": e.ID, "object": "response", "created_at": time.Now().Unix(), "status": "in_progress",
+		},
+	})
+}
+
+// InProgress emits the response.in_progress lifecycle event that must
+// follow response.created. Callers that use Created() should emit this
+// immediately after.
+func (e ResponsesEventEmitter) InProgress() []byte {
+	return SSEEvent("response.in_progress", map[string]any{
+		"type": "response.in_progress",
 		"response": map[string]any{
 			"id": e.ID, "object": "response", "created_at": time.Now().Unix(), "status": "in_progress",
 		},
@@ -870,6 +942,49 @@ func (e ResponsesEventEmitter) ItemAdded(outputIndex int, item map[string]any) [
 func (e ResponsesEventEmitter) TextDelta(itemID string, outputIndex int, delta string) []byte {
 	return SSEEvent("response.output_text.delta", map[string]any{
 		"type": "response.output_text.delta", "item_id": itemID, "output_index": outputIndex, "delta": delta,
+	})
+}
+
+// ContentPartAdded announces the first (and only) text content part of a
+// message item, with an empty text placeholder. Must be emitted after
+// ItemAdded and before the first TextDelta.
+func (e ResponsesEventEmitter) ContentPartAdded(itemID string, outputIndex int) []byte {
+	return SSEEvent("response.content_part.added", map[string]any{
+		"type": "response.content_part.added", "item_id": itemID, "output_index": outputIndex,
+		"content_index": 0,
+		"part":          map[string]any{"type": "output_text", "text": ""},
+	})
+}
+
+// OutputTextDone closes the streamed output text with the complete
+// aggregated string. Must be emitted before ContentPartDone.
+func (e ResponsesEventEmitter) OutputTextDone(itemID string, outputIndex int, text string) []byte {
+	return SSEEvent("response.output_text.done", map[string]any{
+		"type": "response.output_text.done", "item_id": itemID, "output_index": outputIndex,
+		"text": text,
+	})
+}
+
+// ContentPartDone closes the announced content part with the full text.
+func (e ResponsesEventEmitter) ContentPartDone(itemID string, outputIndex int, text string) []byte {
+	return SSEEvent("response.content_part.done", map[string]any{
+		"type": "response.content_part.done", "item_id": itemID, "output_index": outputIndex,
+		"content_index": 0,
+		"part":          map[string]any{"type": "output_text", "text": text},
+	})
+}
+
+// MessageItemDone closes the announced message item with the full output
+// text in its content array. Must be emitted after ContentPartDone and
+// before response.completed.
+func (e ResponsesEventEmitter) MessageItemDone(outputIndex int, itemID, text string) []byte {
+	content, _ := json.Marshal([]map[string]any{{"type": "output_text", "text": text}})
+	return SSEEvent("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": outputIndex,
+		"item": map[string]any{
+			"id": itemID, "type": "message", "role": "assistant",
+			"content": json.RawMessage(content), "status": "completed",
+		},
 	})
 }
 
@@ -1339,6 +1454,11 @@ type CCMessage struct {
 	Content    json.RawMessage `json:"content"` // string or typed parts
 	ToolCalls  []CCToolCall    `json:"tool_calls"`
 	ToolCallID string          `json:"tool_call_id"`
+	// ReasoningContent carries historical thinking text for replay; DeepSeek
+	// rejects tool-carrying turns when earlier reasoning is dropped
+	// (CLAUDE.md: "Historical thinking must be replayed"). Round-trips
+	// verbatim from upstream; omitted when empty.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // CCTool is one Chat Completions tool definition.

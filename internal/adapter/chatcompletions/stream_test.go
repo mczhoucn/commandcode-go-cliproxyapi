@@ -124,15 +124,12 @@ func TestStreamConverterClaude(t *testing.T) {
 		t.Fatalf("second fragment wrong: %v", frag[1])
 	}
 
-	// Second tool index in one chunk (text already closed): the still-open
-	// first tool block stops first (close-before-next-start), then start + delta.
+	// Second tool index (fix #9): the first tool block stays open because
+	// Chat Completions may still send it fragments; the second is held back
+	// and rendered complete at finish_reason.
 	evs = feedAll(t, sc, `data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"g","arguments":"{\"j\":2}"}}]}}]}`)
-	if len(evs) != 3 || evs[0].Name != "content_block_stop" || evs[0].Data["index"] != float64(1) ||
-		evs[1].Data["index"] != float64(2) {
-		t.Fatalf("second tool block wrong: %v", evs)
-	}
-	if blk := evs[1].Data["content_block"].(map[string]any); blk["id"] != "c2" || blk["name"] != "g" {
-		t.Fatalf("second tool_use wrong: %v", evs[1])
+	if len(evs) != 0 {
+		t.Fatalf("second tool block must be deferred: %v", evs)
 	}
 
 	// Empty-choices chunk is ignored.
@@ -142,13 +139,24 @@ func TestStreamConverterClaude(t *testing.T) {
 
 	// finish_reason closes blocks; message_delta is held until the next
 	// data line (the standard include_usage trailer follows finish).
-	// Block 1 was already closed when block 2 started, so one stop remains.
+	// The live tool block closes first, then the deferred one renders
+	// complete (start, full arguments, stop).
 	evs = feedAll(t, sc, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":5}}`)
-	if len(evs) != 1 {
-		t.Fatalf("want one stop with message_delta deferred, got %v", evs)
+	if len(evs) != 4 {
+		t.Fatalf("want stop(1) + deferred start/delta/stop(2), message_delta deferred, got %v", evs)
 	}
-	if evs[0].Name != "content_block_stop" || evs[0].Data["index"] != float64(2) {
-		t.Fatalf("tool block stop wrong: %v", evs)
+	if evs[0].Name != "content_block_stop" || evs[0].Data["index"] != float64(1) {
+		t.Fatalf("live tool block stop wrong: %v", evs)
+	}
+	if blk, _ := evs[1].Data["content_block"].(map[string]any); evs[1].Name != "content_block_start" ||
+		evs[1].Data["index"] != float64(2) || blk["id"] != "c2" || blk["name"] != "g" {
+		t.Fatalf("deferred tool_use start wrong: %v", evs[1])
+	}
+	if d := evs[2].Data["delta"].(map[string]any); d["partial_json"] != `{"j":2}` {
+		t.Fatalf("deferred tool args wrong: %v", evs[2])
+	}
+	if evs[3].Name != "content_block_stop" || evs[3].Data["index"] != float64(2) {
+		t.Fatalf("deferred tool stop wrong: %v", evs[3])
 	}
 
 	// The post-finish line flushes the held message_delta (the line's own
@@ -438,9 +446,14 @@ func TestStreamConverterClaudeVariants(t *testing.T) {
 		if eErr != nil || !done {
 			t.Fatalf("unexpected: %v", eErr)
 		}
+		// No finish_reason arrived, so [DONE] synthesizes the message_delta
+		// (fix #6); still no content block.
 		evs := parseEvents(t, all)
-		if len(evs) != 2 || evs[0].Name != "message_start" || evs[1].Name != "message_stop" {
+		if len(evs) != 3 || evs[0].Name != "message_start" || evs[1].Name != "message_delta" || evs[2].Name != "message_stop" {
 			t.Fatalf("abrupt DONE sequence wrong: %v", evs)
+		}
+		if evs[1].Data["delta"].(map[string]any)["stop_reason"] != "end_turn" {
+			t.Fatalf("synthesized stop_reason wrong: %v", evs[1])
 		}
 	})
 	t.Run("CRLF line endings tolerated", func(t *testing.T) {
@@ -486,23 +499,25 @@ func TestStreamConverterResponses(t *testing.T) {
 
 	// The role chunk primes id/model and announces response.created (F18).
 	evs = feedAll(t, sc, `data: {"id":"r1","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}`)
-	if len(evs) != 1 || evs[0].Name != "response.created" {
-		t.Fatalf("first chunk must announce response.created: %v", evs)
+	// response.in_progress follows created (fix #8 lifecycle).
+	if len(evs) != 2 || evs[0].Name != "response.created" || evs[1].Name != "response.in_progress" {
+		t.Fatalf("first chunk must announce response.created then in_progress: %v", evs)
 	}
 	if resp := evs[0].Data["response"].(map[string]any); resp["id"] != "r1" || resp["status"] != "in_progress" {
 		t.Fatalf("created payload wrong: %v", resp)
 	}
 	evs = feedAll(t, sc, `data: {"choices":[{"delta":{"content":"He"}}]}`)
-	if len(evs) != 2 || evs[0].Name != "response.output_item.added" || evs[1].Name != "response.output_text.delta" {
-		t.Fatalf("text chunk must announce the message item first: %v", evs)
+	if len(evs) != 3 || evs[0].Name != "response.output_item.added" ||
+		evs[1].Name != "response.content_part.added" || evs[2].Name != "response.output_text.delta" {
+		t.Fatalf("text chunk must announce the message item and its part first: %v", evs)
 	}
 	item := evs[0].Data["item"].(map[string]any)
 	if item["type"] != "message" || item["role"] != "assistant" || evs[0].Data["output_index"] != float64(0) {
 		t.Fatalf("message item wrong: %v", evs[0])
 	}
-	td := evs[1].Data
+	td := evs[2].Data
 	if td["item_id"] != "r1" || td["output_index"] != float64(0) || td["delta"] != "He" {
-		t.Fatalf("output_text delta wrong: %v", evs[1])
+		t.Fatalf("output_text delta wrong: %v", evs[2])
 	}
 
 	// Tool call: registration chunk announces output_item.added (F18) after
@@ -953,11 +968,16 @@ func TestStreamConverterFlushAfterFinishWithoutDONE(t *testing.T) {
 		feedAll(t, sc,
 			`data: {"id":"r2","choices":[{"delta":{"role":"assistant","content":"x"}}]}`,
 			`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+		// The message item closes (fix #8) before response.completed.
 		flushed := parseEvents(t, sc.Flush())
-		if len(flushed) != 1 || flushed[0].Name != "response.completed" {
+		names := make([]string, len(flushed))
+		for i, e := range flushed {
+			names[i] = e.Name
+		}
+		if strings.Join(names, ",") != "response.output_text.done,response.content_part.done,response.output_item.done,response.completed" {
 			t.Fatalf("flush = %v", flushed)
 		}
-		resp := flushed[0].Data["response"].(map[string]any)
+		resp := flushed[3].Data["response"].(map[string]any)
 		u := resp["usage"].(map[string]any)
 		if u["input_tokens"] != float64(3) || u["output_tokens"] != float64(4) {
 			t.Fatalf("flushed completed usage wrong: %v", resp)
@@ -978,10 +998,43 @@ func TestStreamConverterFlushAfterFinishWithoutDONE(t *testing.T) {
 		if evs := sc.Flush(); len(evs) != 0 {
 			t.Fatalf("flush after [DONE] must return nothing: %v", evs)
 		}
-		noFinish := NewStreamConverter("claude")
-		feedAll(t, noFinish, `data: {"id":"r","model":"m","choices":[{"delta":{"content":"x"}}]}`)
-		if evs := noFinish.Flush(); len(evs) != 0 {
-			t.Fatalf("flush without finish_reason must return nothing: %v", evs)
+		if evs := NewStreamConverter("claude").Flush(); len(evs) != 0 {
+			t.Fatalf("flush before any chunk must return nothing: %v", evs)
+		}
+	})
+	// Fix #6: a started stream that closes before any finish_reason still
+	// gets a complete terminal on both synthesized targets.
+	t.Run("claude flush without finish_reason synthesizes the terminal", func(t *testing.T) {
+		sc := NewStreamConverter("claude")
+		feedAll(t, sc, `data: {"id":"r","model":"m","choices":[{"delta":{"content":"x"}}]}`)
+		flushed := parseEvents(t, sc.Flush())
+		if len(flushed) != 3 || flushed[0].Name != "content_block_stop" ||
+			flushed[1].Name != "message_delta" || flushed[2].Name != "message_stop" {
+			t.Fatalf("flush = %v", flushed)
+		}
+		if flushed[1].Data["delta"].(map[string]any)["stop_reason"] != "end_turn" {
+			t.Fatalf("synthesized stop_reason wrong: %v", flushed[1])
+		}
+	})
+	t.Run("responses flush without finish_reason synthesizes the terminal", func(t *testing.T) {
+		sc := NewStreamConverter("openai-response")
+		feedAll(t, sc,
+			`data: {"id":"r","choices":[{"delta":{"reasoning_content":"think"}}]}`)
+		flushed := parseEvents(t, sc.Flush())
+		if len(flushed) == 0 || flushed[len(flushed)-1].Name != "response.completed" {
+			t.Fatalf("flush = %v", flushed)
+		}
+		var reasoningDone bool
+		for _, e := range flushed {
+			if e.Name == "response.output_item.done" && e.Data["item"].(map[string]any)["type"] == "reasoning" {
+				reasoningDone = true
+			}
+		}
+		if !reasoningDone {
+			t.Fatalf("open reasoning item must close before completed: %v", flushed)
+		}
+		if again := sc.Flush(); len(again) != 0 {
+			t.Fatalf("second flush must return nothing: %v", again)
 		}
 	})
 	t.Run("claude post-finish usage trailer then close-without-DONE still emits message_stop once", func(t *testing.T) {

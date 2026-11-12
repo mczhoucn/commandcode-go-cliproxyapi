@@ -111,11 +111,15 @@ func (m *Manager) authEntryByIndex(ctx context.Context, authIndex string) (plugi
 //
 // CommandCode reports only REMAINING monthly credits, so the month bucket is
 // omitted when the plan is unknown (no denominator) — same policy as the
-// plugin's own page.
+// plugin's own page. Finding 10: the bucket window is "monthly", the spelling
+// the host's own quota fixtures use (plugin_quota_test.go, types_test.go). The
+// Management Center's order/period table knows only five_hour and weekly
+// (utils/quota/builders.ts), so neither "month" nor "monthly" gets a period
+// label there; the row label comes from the description instead.
 func quotaResponseFromUsage(usage quotaUsage) pluginapi.QuotaFetchResponse {
 	buckets := make([]pluginapi.QuotaBucket, 0, 3)
 	if usage.Month != nil {
-		buckets = append(buckets, quotaBucket("month", "Monthly credits", *usage.Month))
+		buckets = append(buckets, quotaBucket("monthly", "Monthly credits", *usage.Month))
 	}
 	buckets = append(buckets,
 		quotaBucket("five_hour", "5-hour window", usage.FiveHour),
@@ -128,11 +132,21 @@ func quotaResponseFromUsage(usage quotaUsage) pluginapi.QuotaFetchResponse {
 	// Surface exhaustion as a summary metric rather than an error: the card
 	// stays readable, the named limit appears beside the plan, and the buckets
 	// below already read 100% used.
+	//
+	// Finding 10: the Management Center renders a metric as "<label> <value>
+	// <unit>" (PluginQuotaBody.tsx formatMetric), so a bare 0 reads like a count
+	// ("... exhausted 0"). The value is the remaining percentage (0) with an
+	// explicit unit, giving "... exhausted 0 % left". A reset epoch was rejected:
+	// the UI formats it as a plain number, not a date. The host keeps any metric
+	// with a string key/label and a finite numeric value
+	// (plugin_quota.go filterUsableQuotaSummary).
 	if window := usage.exhaustedWindow(); window != "" {
 		resp.Summary = append(resp.Summary, pluginapi.QuotaMetric{
-			Key:   "quota_status",
-			Label: quotaExhaustedLabel(window),
-			Value: 0,
+			Key:    "quota_status",
+			Label:  quotaExhaustedLabel(window),
+			Value:  0,
+			Unit:   "% left",
+			Format: "number",
 		})
 	}
 	return resp
@@ -181,9 +195,13 @@ func quotaBucket(window, label string, w quotaWindow) pluginapi.QuotaBucket {
 }
 
 // quotaWindowDetail renders the human-readable "used / cap" detail shared by the
-// built-in quota cards.
+// built-in quota cards. Finding 4: state flags beat arithmetic, so "exceeded"
+// reads as exhausted regardless of Cap.
 func quotaWindowDetail(w quotaWindow) string {
-	if w.Cap <= 0 {
+	if w.Status == "exceeded" {
+		return "exhausted"
+	}
+	if w.Status == "unlimited" || w.Cap <= 0 {
 		return "unlimited"
 	}
 	return fmt.Sprintf("%.2f of %.2f credits used", w.Used, w.Cap)

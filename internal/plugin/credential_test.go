@@ -29,8 +29,14 @@ func TestCredentialAdmissionPlansAndSources(t *testing.T) {
 					}
 					return old(method, payload)
 				}
+				// Finding 9: verification runs outside lifeMu, then prepare takes
+				// the lock for the claim + duplicate check with the trimmed key.
+				email, planID, vf := m.verifyCredential(context.Background(), "verified-key")
+				if vf != nil {
+					t.Fatal(vf.message)
+				}
 				m.lifeMu.Lock()
-				auth, failure := m.prepareCredentialLocked(context.Background(), "  verified-key  ", source)
+				auth, failure := m.prepareCredentialLocked(context.Background(), "verified-key", email, planID, source)
 				m.lifeMu.Unlock()
 				if failure != nil {
 					t.Fatal(failure.message)
@@ -74,7 +80,10 @@ func TestCredentialAdmissionRejectsUnverifiableResponses(t *testing.T) {
 			status           int
 		}{"status-" + status, accountSubscriptionPath, string(mustJSON(map[string]any{"success": true, "data": map[string]string{"planId": "individual-goat", "status": status, "currentPeriodEnd": "2099-01-01T00:00:00Z"}})), 200})
 	}
-	for _, end := range []string{"2020-01-01T00:00:00Z", "invalid", ""} {
+	// Finding 6: empty currentPeriodEnd is now ACCEPTED (non-expiring), so it is
+	// no longer in the rejection set. A past instant or an unparseable value is
+	// still rejected (cannot confirm validity).
+	for _, end := range []string{"2020-01-01T00:00:00Z", "invalid"} {
 		cases = append(cases, struct {
 			name, path, body string
 			status           int
@@ -102,7 +111,7 @@ func TestCredentialAdmissionRejectsUnverifiableResponses(t *testing.T) {
 					start := loginStart(t, m)
 					resp = loginRequest(t, m, "complete", start.State, "credential-secret")
 				}
-				if resp.StatusCode < 400 || len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 || strings.Contains(string(resp.Body), "credential-secret") || m.credentialClaims[authKeyHash("credential-secret")] {
+				if resp.StatusCode < 400 || len(f.callsOf(pluginabi.MethodHostAuthSave)) != 0 || strings.Contains(string(resp.Body), "credential-secret") || m.credentialClaims[authKeyHash("credential-secret")].claimed {
 					t.Fatalf("unverifiable %s accepted or leaked key: %d", entry, resp.StatusCode)
 				}
 			}
@@ -130,22 +139,29 @@ func TestCredentialTimeoutAndUnknownSaveKeepCorrectClaims(t *testing.T) {
 			t.Fatal("host callback not drained")
 		}
 	})
-	t.Run("save uncertainty", func(t *testing.T) {
+	t.Run("save error releases claim for retry", func(t *testing.T) {
+		// Finding 1: a save error is no longer treated as an uncertain reservation.
+		// The claim is released so a retry can proceed; duplicate safety comes from
+		// checkExistingCredentialLocked reading the real host auth set on the retry.
 		m, f := oauthTestManager()
 		old := f.responder
+		failSave := true
 		f.responder = func(method string, payload []byte) ([]byte, error) {
-			if method == pluginabi.MethodHostAuthSave {
+			if method == pluginabi.MethodHostAuthSave && failSave {
 				return nil, errors.New("credential-secret")
 			}
 			return old(method, payload)
 		}
 		resp, _ := m.addAccount(context.Background(), mustJSON(map[string]string{"api_key": "uncertain-save"}))
-		if resp.StatusCode != http.StatusBadGateway || !m.credentialClaims[authKeyHash("uncertain-save")] {
-			t.Fatal("uncertain save lost reservation")
+		if resp.StatusCode != http.StatusBadGateway || m.credentialClaims[authKeyHash("uncertain-save")].claimed {
+			t.Fatal("save error did not release the claim")
 		}
+		// With the host save working and no file persisted by the failed attempt,
+		// the retry succeeds instead of being locked out by a leaked claim.
+		failSave = false
 		resp, _ = m.addAccount(context.Background(), mustJSON(map[string]string{"api_key": "uncertain-save"}))
-		if resp.StatusCode != http.StatusConflict || len(f.callsOf(pluginabi.MethodHostAuthSave)) != 1 {
-			t.Fatal("uncertain save retried")
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("retry after save error did not succeed: %d", resp.StatusCode)
 		}
 	})
 }

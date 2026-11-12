@@ -121,6 +121,7 @@ func TestStreamReasoningToResponses(t *testing.T) {
 	// so a client listening for either one receives the chain of thought.
 	want := []string{
 		"response.created",
+		"response.in_progress",
 		"response.output_item.added", // reasoning @0
 		"response.reasoning_summary_part.added",
 		"response.reasoning_summary_text.delta",
@@ -132,12 +133,32 @@ func TestStreamReasoningToResponses(t *testing.T) {
 		"response.reasoning_summary_part.done",
 		"response.output_item.done",
 		"response.output_item.added", // message @1
+		"response.content_part.added",
 		"response.output_text.delta",
+		"response.output_text.done", // message lifecycle closes (fix #8)
+		"response.content_part.done",
+		"response.output_item.done",
 		"response.completed",
 	}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("event sequence = %v, want %v", names, want)
 	}
+	// Drop the message-lifecycle events (pinned above) so the positional
+	// assertions below keep addressing the reasoning chain.
+	kept := evs[:0:0]
+	for _, e := range evs {
+		switch e.Name {
+		case "response.in_progress", "response.content_part.added",
+			"response.output_text.done", "response.content_part.done":
+			continue
+		case "response.output_item.done":
+			if e.Data["item"].(map[string]any)["type"] == "message" {
+				continue
+			}
+		}
+		kept = append(kept, e)
+	}
+	evs = kept
 
 	added := evs[1].Data
 	item := added["item"].(map[string]any)

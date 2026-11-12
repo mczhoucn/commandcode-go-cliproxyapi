@@ -131,8 +131,18 @@ func TestResponsesSynthesisRouteParity(t *testing.T) {
 			t.Errorf("synthesized stream missing %s", want)
 		}
 	}
-	if strings.Count(a, "data: ") != 9 {
-		t.Errorf("event count = %d, want 9 (created, 2 added, text delta, 2 args deltas, args done, item done, completed)",
-			strings.Count(a, "data: "))
+	for _, want := range []string{
+		`response.in_progress`, `response.content_part.added`, `response.output_text.done`,
+		`response.content_part.done`,
+	} {
+		if !strings.Contains(a, want) {
+			t.Errorf("synthesized stream missing message lifecycle event %s", want)
+		}
+	}
+	// created, in_progress, msg added, part added, text delta, call added,
+	// 2 args deltas, text done, part done, msg item done, args done,
+	// call item done, completed (fix #8 message lifecycle).
+	if strings.Count(a, "data: ") != 14 {
+		t.Errorf("event count = %d, want 14", strings.Count(a, "data: "))
 	}
 }

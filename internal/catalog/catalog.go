@@ -249,6 +249,12 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 	var warns []string
 	warns = append(warns, extraWarns...)
 	seen := make(map[string]bool, len(entries))
+
+	// Track which route-override keys were matched so we can warn about
+	// keys that resolve no catalog entry (typos, stale IDs). An override key
+	// may match via the bare upstream ID OR the prefixed public ID; we record
+	// each key that fires in resolve().
+	matchedOverrideKeys := make(map[string]bool, len(m.cfg.RouteOverrides))
 	for _, e := range entries {
 		if e.ID == "" {
 			unsup = append(unsup, UnsupportedModel{Reason: "missing id"})
@@ -259,7 +265,10 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			continue
 		}
 		seen[e.ID] = true
-		route, endpoint, ok, warn := m.resolve(e)
+		route, endpoint, ok, warn, matchedKey := m.resolve(e)
+		if matchedKey != "" {
+			matchedOverrideKeys[matchedKey] = true
+		}
 		if warn != "" {
 			warns = append(warns, warn)
 		}
@@ -335,6 +344,14 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 		index[rec.PublicID] = rec
 		index[rec.UpstreamID] = rec
 	}
+	// Warn about route-override keys that never matched any catalog entry.
+	// This catches typos and stale IDs written as either form (bare upstream
+	// ID or prefixed public ID).
+	for k := range m.cfg.RouteOverrides {
+		if !matchedOverrideKeys[k] {
+			warns = append(warns, fmt.Sprintf("route-override key %q did not match any catalog model", k))
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.raw, m.models, m.index, m.unsup, m.warns = entries, models, index, unsup, warns
@@ -358,42 +375,127 @@ func (m *Manager) protocolEnabled(r Route) bool {
 // Chat-Completions-only default (arch §5 as amended for CommandCode). A
 // catalog entry is therefore always routable; the protocol gates and the
 // endpoint-escape check still filter what reaches the model list.
-func (m *Manager) resolve(e rawModel) (Route, string, bool, string) {
+//
+// Override keys may be written as either the bare upstream ID or the
+// prefixed public ID (e.g. "glm-5.2" or "commandcode/glm-5.2"). The bare
+// upstream ID takes precedence when both keys are present (they refer to the
+// same model, so the user probably wrote one form without knowing about the
+// other). An override key that matches neither form warns at snapshot build.
+func (m *Manager) resolve(e rawModel) (Route, string, bool, string, string) {
+	publicID := config.PublicID(m.cfg, e.ID)
+	// Prefer the bare upstream ID key; fall back to the prefixed public ID.
 	if o, ok := m.cfg.RouteOverrides[e.ID]; ok {
 		// Spec 04 §5: an override MUST be visible in diagnostics. Load
 		// validation (spec 04 §6) guarantees a known protocol, so the
 		// map lookup above is the only decision point here.
 		return Route(o.Protocol), o.Endpoint, true, fmt.Sprintf(
-			"model %q routed via user override (%s %s)", e.ID, o.Protocol, o.Endpoint)
+			"model %q routed via user override (%s %s)", e.ID, o.Protocol, o.Endpoint), e.ID
 	}
-	return DefaultRoute, "", true, ""
+	if publicID != e.ID {
+		if o, ok := m.cfg.RouteOverrides[publicID]; ok {
+			return Route(o.Protocol), o.Endpoint, true, fmt.Sprintf(
+				"model %q routed via user override key %q (%s %s)", e.ID, publicID, o.Protocol, o.Endpoint), publicID
+		}
+	}
+	return DefaultRoute, "", true, "", ""
 }
 
 // JoinUpstreamURL joins the configured base-url onto an endpoint path and
 // is the single source of truth for that join (spec 05 §2): base-url
-// already carries the version segment (default .../zen/go/v1, catalog at
-// {base}/models), so a leading "/v1" on the endpoint is dropped instead of
-// doubled. The authority-escape check (endpointEscapesBase) must parse
-// exactly the URL this produces — two independent join formulas would be
-// free to drift apart and validate one URL while sending another.
+// already carries the version segment (default .../provider/v1, catalog at
+// {base}/models), so a leading "/v1" PATH SEGMENT on the endpoint is dropped
+// instead of doubled. Only an exact "/v1" segment is trimmed: "/v1beta/x"
+// must NOT become "/beta/x", so we strip the prefix only when it is followed
+// by "/" or end-of-string. The authority-escape check (endpointEscapesBase)
+// must parse exactly the URL this produces — two independent join formulas
+// would be free to drift apart and validate one URL while sending another.
 func JoinUpstreamURL(baseURL, endpoint string) string {
-	return strings.TrimSuffix(baseURL, "/") + strings.TrimPrefix(endpoint, "/v1")
+	trimmed := endpoint
+	if strings.HasPrefix(endpoint, "/v1/") {
+		trimmed = endpoint[len("/v1"):]
+	} else if endpoint == "/v1" {
+		trimmed = ""
+	}
+	return strings.TrimSuffix(baseURL, "/") + trimmed
 }
 
 // endpointEscapesBase reports whether joining baseURL with endpoint via
-// JoinUpstreamURL would send the request to a different authority or scheme
-// than the configured base-url. Any parse failure counts as escaping (fail
-// closed).
+// JoinUpstreamURL would send the request to a different authority, scheme, or
+// base path than the configured base-url, or would use userinfo credentials.
+// Any parse failure counts as escaping (fail closed). Path-traversal sequences
+// (".."), userinfo in the endpoint, and absolute URLs to other hosts are all
+// rejected.
 func endpointEscapesBase(baseURL, endpoint string) bool {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return true
 	}
-	got, err := url.Parse(JoinUpstreamURL(baseURL, endpoint))
+	// An "@" in the endpoint combined with a bare-host base-url (no path) can
+	// cause the URL parser to interpret everything before the "@" as userinfo
+	// and everything after as the new host. Example:
+	//   base  = "https://api.example.com"
+	//   ep    = "/v1@evil.com/x"
+	//   old join: ".../v1" + "@evil.com/x" => userinfo rewrite
+	//   new join: "...commandcode.ai" + "/v1@evil.com/x" => "/v1@evil.com/x" is a safe path
+	//
+	// Even with the new join (which does NOT strip /v1 unless it's an exact
+	// segment), a bare-host base + endpoint containing "@" can still create
+	// an authority rewrite when the "@" lands between the scheme+host and the
+	// path. The safe approach: if the base has no path (just scheme+host), any
+	// "@" in the endpoint that would appear in the join result before the first
+	// "/" is a potential authority rewrite, and we reject it.
+	if base.Path == "" || base.Path == "/" {
+		// Endpoint starts at the authority boundary; an "@" anywhere before
+		// the first "/" in the endpoint could make the parser reinterpret the
+		// base hostname as userinfo.
+		epForCheck := endpoint
+		if strings.HasPrefix(epForCheck, "/v1/") {
+			epForCheck = epForCheck[len("/v1"):]
+		} else if epForCheck == "/v1" {
+			epForCheck = ""
+		}
+		if idx := strings.Index(epForCheck, "/"); idx < 0 {
+			// No path separator — treat as escaping if "@" present
+			if strings.Contains(epForCheck, "@") {
+				return true
+			}
+		} else {
+			// Check only the part before the first "/"
+			if strings.Contains(epForCheck[:idx], "@") {
+				return true
+			}
+		}
+	}
+
+	joined := JoinUpstreamURL(baseURL, endpoint)
+	got, err := url.Parse(joined)
 	if err != nil {
 		return true
 	}
-	return !strings.EqualFold(got.Host, base.Host) || got.Scheme != base.Scheme
+	// Different scheme or host.
+	if !strings.EqualFold(got.Host, base.Host) || got.Scheme != base.Scheme {
+		return true
+	}
+	// Userinfo in the joined URL means the endpoint contained an "@" that the
+	// URL parser treated as userinfo, sending credentials to an attacker host.
+	if got.User != nil {
+		return true
+	}
+	// Path traversal: a ".." anywhere in the cleaned path means the endpoint
+	// left the configured base path prefix.
+	cleanedPath := got.EscapedPath()
+	if strings.Contains(cleanedPath, "..") || strings.Contains(cleanedPath, "%2e%2e") ||
+		strings.Contains(strings.ToLower(cleanedPath), "%2e%2e") {
+		return true
+	}
+	// The joined path must stay on or under the base path prefix. This prevents
+	// an endpoint "/../admin" from reaching an entirely different subtree.
+	basePath := strings.TrimSuffix(base.Path, "/")
+	gotPath := got.Path
+	if basePath != "" && !strings.HasPrefix(gotPath, basePath) {
+		return true
+	}
+	return false
 }
 
 func firstNonEmpty(a, b []string) []string {

@@ -30,6 +30,14 @@ func TestReasoningTextPriority(t *testing.T) {
 			want:   "plain", ok: true,
 		},
 		{
+			// Fix #5: an interior whitespace fragment is a real separator and
+			// must survive the join; dropping it would fuse the tokens into
+			// "Helloworld".
+			name:   "interior whitespace fragments survive the join",
+			fields: ReasoningFields{ReasoningDetails: []ReasoningDetail{{Text: "Hello"}, {Text: " "}, {Text: "world"}}},
+			want:   "Hello world", ok: true,
+		},
+		{
 			name:   "standard reasoning_content is the last resort",
 			fields: ReasoningFields{ReasoningContent: "std"},
 			want:   "std", ok: true,

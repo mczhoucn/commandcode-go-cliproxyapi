@@ -74,7 +74,7 @@ func TestLoadFullConfigHonorsEveryField(t *testing.T) {
 enabled: true
 future-key: 1
 base-url: http://localhost:9090/v1
-catalog-url: https://example.com/models
+catalog-url: http://localhost:9090/api/models
 model-prefix:
   enabled: true
   value: myprefix
@@ -86,7 +86,7 @@ catalog:
 protocols:
   chat-completions: false
   messages: false
-  responses: false
+  responses: true
 route-overrides:
   gpt-5.6-luna:
     protocol: responses
@@ -102,7 +102,7 @@ max-response-bytes: 1024
 	if c.BaseURL != "http://localhost:9090/v1" {
 		t.Errorf("BaseURL = %q", c.BaseURL)
 	}
-	if c.CatalogURL != "https://example.com/models" {
+	if c.CatalogURL != "http://localhost:9090/api/models" {
 		t.Errorf("CatalogURL = %q", c.CatalogURL)
 	}
 	if !c.ModelPrefix.Enabled || c.ModelPrefix.Value != "myprefix" {
@@ -118,7 +118,7 @@ max-response-bytes: 1024
 	if c.Catalog.StaleWhileUnavailable {
 		t.Errorf("StaleWhileUnavailable = true")
 	}
-	if c.Protocols.ChatCompletions || c.Protocols.Messages || c.Protocols.Responses {
+	if c.Protocols.ChatCompletions || c.Protocols.Messages || !c.Protocols.Responses {
 		t.Errorf("Protocols = %+v", c.Protocols)
 	}
 	o, ok := c.RouteOverrides["gpt-5.6-luna"]
@@ -237,12 +237,13 @@ func TestLoadDerivedCatalogURLTrimsTrailingSlash(t *testing.T) {
 
 // An EXPLICIT catalog-url ending in "/" must normalize the same way as the
 // derived default, so the stored endpoint never carries a trailing slash.
+// catalog-url must share the same host as base-url.
 func TestLoadExplicitCatalogURLTrimsTrailingSlash(t *testing.T) {
-	c, err := Load([]byte("catalog-url: https://mirror.example.com/api/models///\n" + withKey))
+	c, err := Load([]byte("catalog-url: https://api.commandcode.ai/provider/models///\n" + withKey))
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if c.CatalogURL != "https://mirror.example.com/api/models" {
+	if c.CatalogURL != "https://api.commandcode.ai/provider/models" {
 		t.Errorf("CatalogURL = %q, want trailing slashes trimmed", c.CatalogURL)
 	}
 }
