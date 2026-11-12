@@ -924,23 +924,48 @@ func (e ResponsesEventEmitter) ReasoningPartAdded(itemID string, outputIndex int
 	})
 }
 
-// ReasoningSummaryDelta streams one partial reasoning summary fragment.
-func (e ResponsesEventEmitter) ReasoningSummaryDelta(itemID string, outputIndex int, delta string) []byte {
-	return SSEEvent("response.reasoning_summary_text.delta", map[string]any{
-		"type":    "response.reasoning_summary_text.delta",
-		"item_id": itemID, "output_index": outputIndex, "summary_index": 0, "delta": delta,
-	})
+// ReasoningSummaryDelta streams one partial reasoning fragment under BOTH
+// event families.
+//
+// DeepSeek's Responses guide names these events response.reasoning_text.*,
+// while the OpenAI Responses specification (and the host translator this
+// plugin mirrors) names them response.reasoning_summary_text.*. They are
+// distinct event types, not aliases, so a client listening for one family
+// misses a stream that emits only the other. Emitting both keeps either
+// client working; each frame stays individually valid, and the summary
+// payload carries the same aggregated text as the reasoning one.
+func (e ResponsesEventEmitter) ReasoningSummaryDelta(itemID string, outputIndex int, delta string) [][]byte {
+	return [][]byte{
+		SSEEvent("response.reasoning_summary_text.delta", map[string]any{
+			"type":    "response.reasoning_summary_text.delta",
+			"item_id": itemID, "output_index": outputIndex, "summary_index": 0, "delta": delta,
+		}),
+		SSEEvent("response.reasoning_text.delta", map[string]any{
+			"type":    "response.reasoning_text.delta",
+			"item_id": itemID, "output_index": outputIndex, "content_index": 0, "delta": delta,
+		}),
+	}
 }
 
 // ReasoningSummaryDone closes the summary text, ReasoningPartDone closes the
 // summary part, and ReasoningItemDone closes the announced reasoning item
 // with the aggregated text — the three terminal transitions of one thinking
 // run, emitted together when text, tool calls, or the stream end arrive.
-func (e ResponsesEventEmitter) ReasoningSummaryDone(itemID string, outputIndex int, text string) []byte {
-	return SSEEvent("response.reasoning_summary_text.done", map[string]any{
-		"type":    "response.reasoning_summary_text.done",
-		"item_id": itemID, "output_index": outputIndex, "summary_index": 0, "text": text,
-	})
+//
+// Like the delta pair, the done frame is emitted under both families so a
+// client that only understands response.reasoning_text.* still receives a
+// terminal event for the reasoning item.
+func (e ResponsesEventEmitter) ReasoningSummaryDone(itemID string, outputIndex int, text string) [][]byte {
+	return [][]byte{
+		SSEEvent("response.reasoning_summary_text.done", map[string]any{
+			"type":    "response.reasoning_summary_text.done",
+			"item_id": itemID, "output_index": outputIndex, "summary_index": 0, "text": text,
+		}),
+		SSEEvent("response.reasoning_text.done", map[string]any{
+			"type":    "response.reasoning_text.done",
+			"item_id": itemID, "output_index": outputIndex, "content_index": 0, "text": text,
+		}),
+	}
 }
 
 // ReasoningPartDone closes the summary part with its aggregated text.
@@ -1353,10 +1378,14 @@ func JoinTexts(parts []map[string]any) string {
 
 // ContentPart is one OpenAI-style content part decoded by
 // DecodeStringOrParts: a text part (ImageURL empty) or an image part
-// carrying its resolved URL.
+// carrying its resolved URL and optional preprocessing detail.
 type ContentPart struct {
 	Text     string
 	ImageURL string // resolved image URL; empty for text parts
+	// Detail is the client's requested image preprocessing level
+	// (low | high | original | auto). Empty means the client expressed no
+	// preference and the upstream default applies.
+	Detail string
 }
 
 // DecodeStringOrParts is THE shared string-or-parts kernel owning the
@@ -1383,6 +1412,10 @@ func DecodeStringOrParts(raw json.RawMessage, targetLabel string) ([]ContentPart
 		Type     string          `json:"type"`
 		Text     string          `json:"text"`
 		ImageURL json.RawMessage `json:"image_url"`
+		// Detail appears both beside image_url (Responses `input_image`) and
+		// inside it (Chat Completions `image_url.detail`); OpenAIImageDetail
+		// accepts either placement.
+		Detail string `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return nil, errclass.Translation("malformed message content: " + err.Error())
@@ -1397,7 +1430,7 @@ func DecodeStringOrParts(raw json.RawMessage, targetLabel string) ([]ContentPart
 			if eErr != nil {
 				return nil, eErr
 			}
-			out = append(out, ContentPart{ImageURL: url})
+			out = append(out, ContentPart{ImageURL: url, Detail: OpenAIImageDetail(p.ImageURL, p.Detail)})
 			continue
 		}
 		if p.Text != "" { // uniform DROP policy: no dead text parts upstream
@@ -1455,6 +1488,23 @@ type ClaudeThinking struct {
 	BudgetTokens int64  `json:"budget_tokens"`
 }
 
+// ClaudeOutputConfig is the Anthropic output_config control. DeepSeek reads
+// only effort from it; the field is declared so a client that expresses
+// thinking strength this way is not silently ignored.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// ClaudeEffort returns the effort a Claude client expressed through
+// output_config, falling back to "" when absent. Anthropic's surface has no
+// other effort spelling, so this is the only inbound source.
+func (c *ClaudeOutputConfig) ClaudeEffort() string {
+	if c == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(c.Effort))
+}
+
 // ThinkingEnabled reports whether an Anthropic thinking control requests
 // extended thinking: present with type "enabled" (FR-005). One kernel
 // serves every adapter gating on the control so the check cannot diverge.
@@ -1502,9 +1552,12 @@ type ClaudeRequestRecord struct {
 	ToolChoiceKind string
 	ToolChoiceName string
 	Thinking       *ClaudeThinking
-	Stream         bool
-	Temperature    *float64
-	TopP           *float64
+	// Effort is the client's thinking strength as expressed through
+	// output_config.effort, lowercased; "" when the client supplied none.
+	Effort      string
+	Stream      bool
+	Temperature *float64
+	TopP        *float64
 }
 
 // claudeWireMessage mirrors the inbound Anthropic message shape (decode-only).
@@ -1515,9 +1568,13 @@ type claudeWireMessage struct {
 
 // claudeWireBlock mirrors the inbound Anthropic block shape (decode-only).
 type claudeWireBlock struct {
-	Type   string `json:"type"`
-	Text   string `json:"text"`
-	Source *struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+	// Thinking carries an extended-thinking block's text. It has its own wire
+	// field — a thinking block never uses "text" — so decoding only "text"
+	// silently emptied every replayed thinking block.
+	Thinking string `json:"thinking"`
+	Source   *struct {
 		Type      string `json:"type"` // base64 | url
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
@@ -1548,6 +1605,7 @@ func DecodeClaudeMessages(body json.RawMessage) (*ClaudeRequestRecord, *errclass
 		Tools         []ClaudeTool        `json:"tools"`
 		ToolChoice    json.RawMessage     `json:"tool_choice"`
 		Thinking      *ClaudeThinking     `json:"thinking"`
+		OutputConfig  *ClaudeOutputConfig `json:"output_config"`
 		Stream        bool                `json:"stream"`
 		Temperature   *float64            `json:"temperature"`
 		TopP          *float64            `json:"top_p"`
@@ -1571,6 +1629,7 @@ func DecodeClaudeMessages(body json.RawMessage) (*ClaudeRequestRecord, *errclass
 		ToolChoiceKind: kind,
 		ToolChoiceName: name,
 		Thinking:       env.Thinking,
+		Effort:         env.OutputConfig.ClaudeEffort(),
 		Stream:         env.Stream,
 		Temperature:    env.Temperature,
 		TopP:           env.TopP,
@@ -1614,6 +1673,11 @@ func decodeClaudeBlocks(raw json.RawMessage) ([]ClaudeBlock, *errclass.Error) {
 			Name: wb.Name, Input: wb.Input,
 			Result: wb.Content, IsError: wb.IsError,
 		}
+		// A thinking block carries its payload in "thinking", not "text";
+		// fold it into Text so every renderer reads one field.
+		if wb.Type == "thinking" && wb.Thinking != "" {
+			blk.Text = wb.Thinking
+		}
 		switch wb.Type {
 		case "image":
 			if wb.Source == nil {
@@ -1632,6 +1696,37 @@ func decodeClaudeBlocks(raw json.RawMessage) ([]ClaudeBlock, *errclass.Error) {
 		blocks = append(blocks, blk)
 	}
 	return blocks, nil
+}
+
+// OpenAIImageDetail resolves the client's requested image preprocessing level
+// from either placement the OpenAI wire allows: `image_url.detail` (Chat
+// Completions) or a sibling `detail` (Responses `input_image`). The sibling
+// wins when both are present because Responses clients set it there.
+//
+// Only the four documented values survive; anything else is dropped so a
+// malformed preference cannot reach the upstream as an invalid field.
+func OpenAIImageDetail(raw json.RawMessage, sibling string) string {
+	if d := normalizeImageDetail(sibling); d != "" {
+		return d
+	}
+	if len(raw) == 0 {
+		return ""
+	}
+	var obj struct {
+		Detail string `json:"detail"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	return normalizeImageDetail(obj.Detail)
+}
+
+func normalizeImageDetail(detail string) string {
+	switch strings.ToLower(strings.TrimSpace(detail)) {
+	case "low", "high", "original", "auto":
+		return strings.ToLower(strings.TrimSpace(detail))
+	}
+	return ""
 }
 
 // OpenAIImageURL extracts the image URL from an OpenAI-style content part:

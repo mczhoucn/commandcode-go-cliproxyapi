@@ -4,6 +4,13 @@
 
 ## v0.1.5 — 2026-11-12
 
+- **补齐 DeepSeek 文档所定义的下游能力**（三种客户端协议均已覆盖）：
+  - **思考内容历史回传**：此前 Claude 和 Responses 客户端的历史思考块被直接丢弃。带 `tools` 的请求在后续轮次必须完整回传思考内容，否则上游拒绝。现在 Claude 的 `thinking` 块回传为 `reasoning_content`，Responses 的 `reasoning` item 明文 `content` 合并进相邻 assistant 消息。
+  - **Anthropic `output_config.effort`**：DeepSeek 的 Anthropic 兼容面读取 `output_config.effort` 并忽略 `budget_tokens`。三种客户端声明的思考强度现在都会以该字段发出；显式 `output_config.effort` 优先于预算换算，`none`/`auto` 作为开关处理而不当作强度。
+  - **图片 `detail`**：`low`/`high`/`original`/`auto` 在 Chat Completions 与 Responses 两种书写位置都会被识别并保留，非法值丢弃。
+  - **Responses 思考事件双发**：同一段思维链同时以 OpenAI 标准的 `response.reasoning_summary_text.*` 和 DeepSeek 文档的 `response.reasoning_text.*` 两族事件发出，任一族客户端都能读到。
+- 修复 Claude 请求解码器未读取 `thinking` 字段导致所有历史思考块文本为空的问题。
+- 上游协议不变：仍使用 CommandCode 的 OpenAI 兼容 Provider API（`provider/v1`），与两个参考实现一致；不实现 CLI 私有的 `/alpha/generate`。
 - 插件现在注册 CPA 的标准配额提供者能力（`QuotaProvider`）：CommandCode 认证文件在管理后台的认证文件列表里可以直接看到套餐与剩余额度进度条，和内置 provider 一致，不再只存在于插件自己的页面。
 - 标准卡片显示 5 小时、每周和每月三个窗口的剩余比例、已用/上限与重置时间；CommandCode 只上报剩余月度额度，套餐未知时不显示月度窗口，避免出现没有分母的假进度条。
 - CommandCode 没有重置额度的接口，因此不声明支持重置。
@@ -22,6 +29,13 @@
 
 ### v0.1.5 English highlights — 2026-11-12
 
+- **DeepSeek-documented client capabilities are now complete on all three protocols**:
+  - **Historical thinking is replayed.** Claude and Responses clients used to have their earlier thinking discarded. A tool-carrying request must replay it on every later turn or the upstream rejects the request, so Claude `thinking` blocks now round-trip as `reasoning_content` and a Responses `reasoning` item's plaintext `content` merges into the adjacent assistant message.
+  - **Anthropic `output_config.effort`.** DeepSeek's Anthropic surface reads `output_config.effort` and ignores `budget_tokens`. All three client formats now emit it; an explicit effort wins over a budget-derived level, and `none`/`auto` are treated as switches rather than strengths.
+  - **Image `detail`.** `low`/`high`/`original`/`auto` is recognized in both documented placements and preserved; unknown values are dropped.
+  - **Dual Responses reasoning events.** One chain of thought is emitted under both the OpenAI-standard `response.reasoning_summary_text.*` family and DeepSeek's documented `response.reasoning_text.*` family, so a client listening for either receives it.
+- Fix the Claude request decoder not reading the `thinking` field, which emptied every replayed thinking block.
+- The upstream protocol is unchanged: CommandCode's OpenAI-compatible Provider API (`provider/v1`), matching both reference implementations. The CLI-private `/alpha/generate` is not implemented.
 - The plugin now registers CPA's standard `QuotaProvider` capability, so CommandCode credentials render their plan and remaining usage directly on the host's auth-file cards instead of only on the plugin's own page.
 - The standard card shows the 5-hour, weekly, and monthly windows with remaining ratio, used/cap, and reset time. CommandCode reports only remaining monthly credits, so the monthly window is omitted when the plan is unknown rather than drawing a meter with no denominator.
 - Reset is not advertised: CommandCode exposes no quota reset endpoint.

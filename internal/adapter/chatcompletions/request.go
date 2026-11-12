@@ -94,6 +94,11 @@ func isValidThinking(raw json.RawMessage) bool {
 
 type imageURLField struct {
 	URL string `json:"url"`
+	// Detail selects image preprocessing: low | high | original | auto.
+	// CommandCode/DeepSeek shrink `low` images to 512x512 before inference and
+	// keep the original for every other value, so the client's choice must
+	// survive translation rather than being dropped.
+	Detail string `json:"detail,omitempty"`
 }
 
 type ccContentPart struct {
@@ -107,6 +112,12 @@ type ccMessage struct {
 	Content    any                 `json:"content"` // string, []ccContentPart, or nil
 	ToolCalls  []shared.CCToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string              `json:"tool_call_id,omitempty"`
+	// ReasoningContent carries historical thinking text back to the upstream.
+	// CommandCode returns it beside content; DeepSeek requires it to be
+	// replayed on every later turn whenever the request carries tools,
+	// otherwise the upstream rejects the request. Omitting it silently
+	// breaks multi-turn thinking, so the field round-trips verbatim.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type ccRequest struct {
@@ -161,7 +172,17 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 	if len(src.StopSequences) > 0 {
 		out.Stop = src.StopSequences
 	}
-	if shared.ThinkingEnabled(src.Thinking) {
+	// Effort precedence: an explicit output_config.effort is the client's own
+	// strength choice and wins; otherwise a thinking budget is converted to
+	// the nearest supported level. DeepSeek reads effort directly, so
+	// preferring the explicit value avoids lossy budget→level rounding.
+	switch {
+	case src.Effort != "":
+		if eErr := thinking.ValidateEffort(src.Effort, ts); eErr != nil {
+			return nil, eErr
+		}
+		out.ReasoningEffort = src.Effort
+	case shared.ThinkingEnabled(src.Thinking):
 		out.ReasoningEffort = thinking.EffortFromBudget(src.Thinking.BudgetTokens, ts)
 	}
 	applyToolChoiceCC(out, src.ToolChoiceKind, src.ToolChoiceName)
@@ -258,23 +279,32 @@ func claudeUserMessages(m *shared.ClaudeMessageRecord) ([]ccMessage, *errclass.E
 	return msgs, nil
 }
 
-// claudeAssistantMessage converts an assistant turn: text blocks join
-// the message content, tool_use blocks become tool_calls. Historical
-// thinking and redacted_thinking blocks have no Chat Completions
-// representation and are omitted by the FR-005 explicit omission policy
-// (the forward-looking control maps via effortFromBudget instead; the
-// redacted variant is pure encrypted metadata). Returns nil for empty turns.
+// claudeAssistantMessage converts an assistant turn: text blocks join the
+// message content, tool_use blocks become tool_calls, and thinking blocks are
+// replayed as reasoning_content.
+//
+// Replaying thinking is REQUIRED, not cosmetic: when the request carries
+// tools, the upstream rejects a turn whose earlier assistant thinking was
+// dropped (DeepSeek documents a 400 for exactly this). The Chat Completions
+// wire represents it as reasoning_content beside content, which is also the
+// spelling CommandCode returns, so the value round-trips unchanged.
+//
+// redacted_thinking stays omitted: it is encrypted metadata with no plaintext
+// to replay. Returns nil for empty turns.
 func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclass.Error) {
 	msg := &ccMessage{Role: "assistant"}
 	var sb strings.Builder
+	var thinking strings.Builder
 	sb.WriteString(m.Content)
 	for i := range m.Blocks {
 		blk := &m.Blocks[i]
 		switch blk.Kind {
 		case "text":
 			sb.WriteString(blk.Text)
-		case "thinking", "redacted_thinking":
-			// omitted: no Chat Completions equivalent (FR-005 policy)
+		case "thinking":
+			thinking.WriteString(blk.Text)
+		case "redacted_thinking":
+			// omitted: encrypted metadata with no plaintext equivalent
 		case "tool_use":
 			tc := shared.CCToolCall{ID: blk.CallID, Type: "function"}
 			tc.Function.Name = blk.Name
@@ -287,7 +317,10 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclas
 	if sb.Len() > 0 {
 		msg.Content = sb.String()
 	}
-	if msg.Content == nil && len(msg.ToolCalls) == 0 {
+	if t := thinking.String(); t != "" {
+		msg.ReasoningContent = t
+	}
+	if msg.Content == nil && len(msg.ToolCalls) == 0 && msg.ReasoningContent == "" {
 		return nil, nil
 	}
 	return msg, nil
@@ -407,7 +440,26 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 				Role: "tool", Content: text, ToolCallID: item.CallID,
 			})
 		case "reasoning":
-			// omitted: no Chat Completions equivalent (FR-005 policy)
+			// DeepSeek's Responses guide: a reasoning item's plaintext content
+			// merges into the adjacent assistant message; summary and
+			// encrypted_content are unsupported. Dropping the text would break
+			// the tool-carrying multi-turn replay the upstream requires, so the
+			// plaintext is carried as reasoning_content instead.
+			text := reasoningItemText(item)
+			if text == "" {
+				continue
+			}
+			// Attach to the preceding assistant turn when there is one,
+			// otherwise open one — reasoning precedes the text/tool call it
+			// belongs to.
+			if n := len(out.Messages); n > 0 && out.Messages[n-1].Role == "assistant" {
+				last := &out.Messages[n-1]
+				if last.ReasoningContent == "" {
+					last.ReasoningContent = text
+					continue
+				}
+			}
+			out.Messages = append(out.Messages, ccMessage{Role: "assistant", ReasoningContent: text})
 		default:
 			return nil, shared.UnsupportedInputItemType(item.Type)
 		}
@@ -445,12 +497,53 @@ func respContent(raw json.RawMessage) (any, *errclass.Error) {
 	out := make([]ccContentPart, 0, len(parts))
 	for _, p := range parts {
 		if p.ImageURL != "" {
-			out = append(out, ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: p.ImageURL}})
+			out = append(out, ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: p.ImageURL, Detail: p.Detail}})
 			continue
 		}
 		out = append(out, ccContentPart{Type: "text", Text: p.Text})
 	}
 	return out, nil
+}
+
+// reasoningItemText extracts the plaintext of a Responses reasoning item.
+//
+// DeepSeek's guide defines the accepted shapes: `content` is a string or an
+// array of text parts and is the only reasoning payload replayed into
+// history; `summary` and `encrypted_content` are not supported upstream, so
+// they are never forwarded as reasoning text. An item with none of these
+// contributes nothing.
+//
+// The parts are decoded locally rather than through DecodeStringOrParts
+// because a reasoning item's part type is `reasoning_text`, which is not an
+// input content part and would be rejected by that kernel's allowlist.
+func reasoningItemText(item shared.RespItem) string {
+	if shared.HasContent(item.Content) {
+		var s string
+		if json.Unmarshal(item.Content, &s) == nil {
+			return s
+		}
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(item.Content, &parts) == nil {
+			var sb strings.Builder
+			for _, p := range parts {
+				switch p.Type {
+				case "reasoning_text", "text", "input_text", "output_text", "summary_text":
+					sb.WriteString(p.Text)
+				}
+			}
+			if text := sb.String(); text != "" {
+				return text
+			}
+		}
+	}
+	var sb strings.Builder
+	for _, s := range item.Summary {
+		sb.WriteString(s.Text)
+	}
+	return sb.String()
 }
 
 // applyToolChoiceCC maps a normalized tool choice onto the outbound Chat

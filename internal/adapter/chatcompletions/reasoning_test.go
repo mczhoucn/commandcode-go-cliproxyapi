@@ -115,13 +115,20 @@ func TestStreamReasoningToResponses(t *testing.T) {
 	for i, e := range evs {
 		names[i] = e.Name
 	}
+	// Each reasoning delta/done is emitted under BOTH event families: the
+	// OpenAI Responses spelling (reasoning_summary_text.*) and DeepSeek's
+	// documented spelling (reasoning_text.*). They are distinct event types,
+	// so a client listening for either one receives the chain of thought.
 	want := []string{
 		"response.created",
 		"response.output_item.added", // reasoning @0
 		"response.reasoning_summary_part.added",
 		"response.reasoning_summary_text.delta",
+		"response.reasoning_text.delta",
 		"response.reasoning_summary_text.delta",
+		"response.reasoning_text.delta",
 		"response.reasoning_summary_text.done", // closed by the text delta
+		"response.reasoning_text.done",
 		"response.reasoning_summary_part.done",
 		"response.output_item.done",
 		"response.output_item.added", // message @1
@@ -149,20 +156,28 @@ func TestStreamReasoningToResponses(t *testing.T) {
 	if d := evs[3].Data; d["delta"] != "We" || d["item_id"] != "rs_c1_0" || d["summary_index"] != float64(0) {
 		t.Fatalf("first summary delta wrong: %v", d)
 	}
-	if d := evs[5].Data; d["text"] != "We need" {
+	// Index 4 is the reasoning_text.delta twin of index 3.
+	if d := evs[4].Data; d["type"] != "response.reasoning_text.delta" || d["delta"] != "We" ||
+		d["item_id"] != "rs_c1_0" || d["content_index"] != float64(0) {
+		t.Fatalf("reasoning_text delta wrong: %v", d)
+	}
+	if d := evs[7].Data; d["text"] != "We need" {
 		t.Fatalf("summary done must carry the accumulated text: %v", d)
 	}
-	if done := evs[7].Data["item"].(map[string]any); done["type"] != "reasoning" ||
-		done["summary"].([]any)[0].(map[string]any)["text"] != "We need" {
-		t.Fatalf("reasoning item done wrong: %v", evs[7].Data)
+	if d := evs[8].Data; d["type"] != "response.reasoning_text.done" || d["text"] != "We need" {
+		t.Fatalf("reasoning_text done wrong: %v", d)
 	}
-	if msg := evs[8].Data; msg["output_index"] != float64(1) {
+	if done := evs[10].Data["item"].(map[string]any); done["type"] != "reasoning" ||
+		done["summary"].([]any)[0].(map[string]any)["text"] != "We need" {
+		t.Fatalf("reasoning item done wrong: %v", evs[10].Data)
+	}
+	if msg := evs[11].Data; msg["output_index"] != float64(1) {
 		t.Fatalf("message must follow the reasoning item: %v", msg)
 	}
 
 	// The first finish_reason (stop) is the one held: the post-finish line's
 	// own finish_reason is ignored as a repeat.
-	completed := evs[10].Data["response"].(map[string]any)
+	completed := evs[13].Data["response"].(map[string]any)
 	if completed["status"] != "completed" {
 		t.Fatalf("status = %v, want completed", completed["status"])
 	}

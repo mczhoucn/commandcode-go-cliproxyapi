@@ -503,7 +503,7 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 			events = append(events, sc.responsesEm().ReasoningPartAdded(sc.thinkItemID, sc.thinkIndexIn))
 		}
 		sc.thinkBuf.WriteString(thinking)
-		events = append(events, sc.responsesEm().ReasoningSummaryDelta(sc.thinkItemID, sc.thinkIndexIn, thinking))
+		events = append(events, sc.responsesEm().ReasoningSummaryDelta(sc.thinkItemID, sc.thinkIndexIn, thinking)...)
 	}
 	if choice.Delta.Content != "" {
 		events = append(events, sc.stopReasoning()...)
@@ -558,11 +558,11 @@ func (sc *StreamConverter) stopReasoning() [][]byte {
 	sc.thinkStopped = true
 	text := sc.thinkBuf.String()
 	em := sc.responsesEm()
-	return [][]byte{
-		em.ReasoningSummaryDone(sc.thinkItemID, sc.thinkIndexIn, text),
+	events := em.ReasoningSummaryDone(sc.thinkItemID, sc.thinkIndexIn, text)
+	return append(events,
 		em.ReasoningPartDone(sc.thinkItemID, sc.thinkIndexIn, text),
 		em.ReasoningItemDone(sc.thinkItemID, sc.thinkIndexIn, text),
-	}
+	)
 }
 
 // responsesEm binds the shared Responses emitter kernel to the captured

@@ -41,9 +41,19 @@ type messagesRequest struct {
 	Tools         []anthropicTool        `json:"tools,omitempty"`
 	ToolChoice    any                    `json:"tool_choice,omitempty"` // {type,name?,disable_parallel_tool_use?}
 	Thinking      *shared.ClaudeThinking `json:"thinking,omitempty"`
-	Stream        bool                   `json:"stream,omitempty"`
-	Temperature   *float64               `json:"temperature,omitempty"`
-	TopP          *float64               `json:"top_p,omitempty"`
+	// OutputConfig carries the effort level. DeepSeek's Anthropic-compatible
+	// surface reads output_config.effort and ignores thinking.budget_tokens,
+	// so effort is expressed here rather than only as a budget.
+	OutputConfig *claudeOutputConfig `json:"output_config,omitempty"`
+	Stream       bool                `json:"stream,omitempty"`
+	Temperature  *float64            `json:"temperature,omitempty"`
+	TopP         *float64            `json:"top_p,omitempty"`
+}
+
+// claudeOutputConfig is the Anthropic output_config object; only effort is
+// documented as supported, so nothing else is emitted.
+type claudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // BuildRequest translates an inbound request body from sourceFormat
@@ -168,21 +178,33 @@ func finalize(req *messagesRequest, system []string, effort string, ts *pluginap
 			// applying a zero budget, which would silently disable thinking.
 			return nil, thinking.UnsupportedEffort(effort)
 		}
-		applyThinking(req, budget)
+		applyThinking(req, budget, effort)
 	}
 	b, _ := json.Marshal(req) // only marshallable composed types; cannot fail
 	return b, nil
 }
 
-// applyThinking maps a resolved budget onto the Messages thinking field.
+// applyThinking maps a resolved budget onto the Messages thinking field and
+// records the client's effort in output_config.
+//
 // budget == 0 means reasoning off (ZeroAllowed): no thinking block, and
-// sampling controls stay intact. budget < 0 is the dynamic "auto"
-// sentinel; Anthropic has no dynamic budget field — an adaptive mode
-// would need a catalog-declared capability signal, which does not exist
-// today — so it is omitted rather than fabricated (FR-005 explicit
-// omission policy). budget > 0 enables thinking and drops sampling
-// controls, which Anthropic rejects alongside thinking.
-func applyThinking(req *messagesRequest, budget int64) {
+// sampling controls stay intact. budget < 0 is the dynamic "auto" sentinel;
+// Anthropic has no dynamic budget field — an adaptive mode would need a
+// catalog-declared capability signal, which does not exist today — so the
+// budget is omitted rather than fabricated (FR-005 explicit omission policy).
+// budget > 0 enables thinking and drops sampling controls, which Anthropic
+// rejects alongside thinking.
+//
+// effort is always forwarded when the client supplied a strength level:
+// DeepSeek's Anthropic surface reads output_config.effort and ignores
+// budget_tokens, so omitting it would silently drop the client's choice.
+// The off-state spellings are excluded — "auto" is a dynamic sentinel with no
+// rankable level, and "none" switches thinking off rather than naming a
+// strength, which the budget branch below already expresses.
+func applyThinking(req *messagesRequest, budget int64, effort string) {
+	if e := strings.ToLower(strings.TrimSpace(effort)); e != "" && e != "auto" && e != "none" {
+		req.OutputConfig = &claudeOutputConfig{Effort: e}
+	}
 	if budget <= 0 {
 		return
 	}

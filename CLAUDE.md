@@ -114,6 +114,17 @@ All outbound HTTP must go through `HostBridge` (`host.http.do`, `host.http.do_st
 - Upstream sends thinking text under `reasoning` / `reasoning_details[].text`, never `reasoning_content`. `shared.BackfillReasoningContent` mirrors it for OpenAI clients; Claude targets get `thinking` blocks; Responses targets get reasoning summary items.
 - `internal/thinking` maps budget↔effort using tables copied from the host SDK (`internal/thinking/convert.go`). They were taken at v7.2.138 and are unchanged in v8.0.67; re-check on any further SDK bump. When a model declares no thinking capability (all CommandCode models today), client efforts are forwarded verbatim rather than locally rejected.
 - Adapters share kernels in `shared` deliberately: identically shaped requests must produce identical policies on all routes (e.g. empty content dropped, tool results text-only, `fc_`-prefixed Responses item IDs, `total_tokens = input + output`). `responses_parity_test.go` and the many `F5`/parity comments pin these cross-route invariants.
+
+### Downstream protocol coverage (DeepSeek-documented surface)
+
+The plugin speaks the full surface described by DeepSeek's public guides, because CommandCode forwards to those models. Four details are easy to regress:
+
+- **Historical thinking must be replayed.** A request carrying `tools` is rejected upstream if an earlier assistant turn's thinking was dropped. Claude `thinking` blocks round-trip as `reasoning_content`; a Responses `reasoning` item's plaintext `content` merges into the adjacent assistant message. `redacted_thinking` and `summary`/`encrypted_content` stay omitted — they have no plaintext to replay. The Claude decoder folds the wire `thinking` field into `ClaudeBlock.Text`; reading only `text` empties every block.
+- **Effort placement differs per protocol.** Anthropic uses `output_config.effort`, Chat Completions uses `reasoning_effort`, Responses uses `reasoning.effort`. DeepSeek ignores `thinking.budget_tokens`, so an explicit effort always wins over the budget-derived level, and `none`/`auto` are switches rather than rankable strengths.
+- **Image `detail`** (`low`/`high`/`original`/`auto`) is accepted both as `image_url.detail` and as a sibling `detail` on Responses `input_image`; `shared.OpenAIImageDetail` normalizes and rejects anything else.
+- **Responses reasoning events are emitted under two families** — `response.reasoning_summary_text.*` (OpenAI spec) and `response.reasoning_text.*` (DeepSeek docs). They are distinct event types rather than aliases, so both must be sent for either client to work. `ReasoningSummaryDelta`/`ReasoningSummaryDone` return `[][]byte`.
+
+Upstream remains CommandCode's OpenAI-compatible Provider API (`provider/v1`), matching both reference implementations. The vendor CLI's private `/alpha/generate` protocol (a `config`/`permissionMode`/`threadId` envelope with `tool-call`/`tool-result`/`reasoning` message blocks) is deliberately **not** implemented: it is undocumented, and using it would imply CommandCode Go plan support, which this plugin does not claim.
 - `errclass` classes are the envelope error codes; all messages pass through `Redact` (bearer, `x-api-key`, query-string keys), and post-first-byte network failures are never retryable. Do not add a code path that forwards an upstream body without redaction.
 
 ### Management UI

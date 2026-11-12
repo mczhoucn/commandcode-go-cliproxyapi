@@ -449,11 +449,19 @@ func TestBuildRequestClaudeVariants(t *testing.T) {
 			t.Fatalf("assistant string content lost: %v", a)
 		}
 	})
-	t.Run("thinking-only assistant dropped", func(t *testing.T) {
+	// Historical thinking is REPLAYED, not dropped: when the request carries
+	// tools the upstream rejects a turn whose earlier thinking was lost, so a
+	// thinking-only assistant turn survives as reasoning_content.
+	t.Run("thinking-only assistant replayed", func(t *testing.T) {
 		m := mustBuild(t, "claude",
 			`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]}]}`, nil)
-		if msgs := m["messages"].([]any); len(msgs) != 0 {
-			t.Fatalf("thinking-only assistant not dropped: %v", msgs)
+		msgs := m["messages"].([]any)
+		if len(msgs) != 1 {
+			t.Fatalf("thinking-only assistant dropped: %v", msgs)
+		}
+		a := msgs[0].(map[string]any)
+		if a["role"] != "assistant" || a["reasoning_content"] != "hmm" {
+			t.Fatalf("thinking not replayed as reasoning_content: %v", a)
 		}
 	})
 	// FR-005 omission policy parity: redacted_thinking is encrypted
