@@ -68,29 +68,26 @@ func (m *Manager) quotaFetch(ctx context.Context, req pluginapi.QuotaFetchReques
 	if err != nil {
 		return pluginapi.QuotaFetchResponse{}, err
 	}
-	// An exhausted window means this credential cannot serve requests right
-	// now. Returning the error (rather than a 0% card) marks the fetch as
-	// failed, which is the only signal this read-only management endpoint can
-	// carry; routing itself is governed by the executor's cooldown reporting.
-	if window := usage.exhaustedWindow(); window != "" {
-		return pluginapi.QuotaFetchResponse{}, quotaExhaustedError(window)
-	}
+	// An exhausted window is NOT a fetch failure. The host renders any error as
+	// "failed to fetch quota" and drops the whole card, hiding the window data
+	// that explains the situation. Return the snapshot instead: the windows are
+	// already folded to 100% by applyWindowHierarchy, and the exhausted window
+	// is named in the summary so the card says which limit applies.
 	return quotaResponseFromUsage(usage), nil
 }
 
-// quotaExhaustedError names the window that has no allowance left. The message
-// is what an operator sees on the auth-file card, so it says which limit
-// applies rather than a bare "quota exceeded".
-func quotaExhaustedError(window string) error {
+// quotaExhaustedLabel names the window that has no allowance left, for the
+// summary row on the host's auth-file card. Empty when quota remains.
+func quotaExhaustedLabel(window string) string {
 	switch window {
 	case "month":
-		return fmt.Errorf("monthly plan credits exhausted")
+		return "Monthly plan credits exhausted"
 	case "weekly":
-		return fmt.Errorf("weekly usage window exhausted")
+		return "Weekly usage window exhausted"
 	case "five_hour":
-		return fmt.Errorf("5-hour usage window exhausted")
+		return "5-hour usage window exhausted"
 	}
-	return fmt.Errorf("quota exhausted")
+	return ""
 }
 
 // authEntryByIndex finds one plugin-owned auth file entry by runtime index.
@@ -127,6 +124,16 @@ func quotaResponseFromUsage(usage quotaUsage) pluginapi.QuotaFetchResponse {
 	resp := pluginapi.QuotaFetchResponse{
 		Subscription: quotaSubscription(usage),
 		Groups:       []pluginapi.QuotaGroup{{DisplayName: "CommandCode", Buckets: buckets}},
+	}
+	// Surface exhaustion as a summary metric rather than an error: the card
+	// stays readable, the named limit appears beside the plan, and the buckets
+	// below already read 100% used.
+	if window := usage.exhaustedWindow(); window != "" {
+		resp.Summary = append(resp.Summary, pluginapi.QuotaMetric{
+			Key:   "quota_status",
+			Label: quotaExhaustedLabel(window),
+			Value: 0,
+		})
 	}
 	return resp
 }

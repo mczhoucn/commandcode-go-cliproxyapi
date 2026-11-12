@@ -140,9 +140,11 @@ Two surfaces read the same upstream account API through `fetchQuota` (`quota.go`
 
 Changing either surface means keeping both consistent; the plugin page never fetches through the host's quota route.
 
-**Window hierarchy.** The three windows nest (`month` > `weekly` > `five_hour`): the shorter is carved out of the longer, so a spent longer window forces the shorter ones to zero even when upstream reports headroom (`applyWindowHierarchy` in `quota.go`, applied inside `fetchQuota` so both surfaces agree). Propagation is downward only. `exhausted()` treats `unlimited` and zero-cap windows as never exhausted, and counts `used >= cap` as spent even without an upstream flag. A spent credential makes `quota.fetch` return an error naming the window (`exhaustedWindow` picks the longest spent one) rather than a 0% card that reads as idle.
+**Window hierarchy.** The three windows nest (`month` > `weekly` > `five_hour`): the shorter is carved out of the longer, so a spent longer window forces the shorter ones to zero even when upstream reports headroom (`applyWindowHierarchy` in `quota.go`, applied inside `fetchQuota` so both surfaces agree). Propagation is downward only. `exhausted()` treats `unlimited` and zero-cap windows as never exhausted, and counts `used >= cap` as spent even without an upstream flag.
 
-That error only marks the *management fetch* as failed. `FetchCredentialQuota` is a read-only management endpoint and **does not affect routing** — CPA stops routing to a credential through executor cooldown reporting (see below), not through the quota surface. The plugin API exposes no RPC to set a cooldown or mark a credential unavailable; only `scheduler.pick` could influence selection, and that is a global scheduler, too invasive for this provider.
+**An exhausted window is never a fetch error.** The host renders any `quota.fetch` error as "failed to fetch quota" and drops the whole card, which hides the very window data that explains the problem. So `quotaResponseFromUsage` returns the full snapshot — buckets already folded to 100% — plus one `Summary` metric whose label names the spent window (`quotaExhaustedLabel`). `quota.fetch` therefore only fails for genuine retrieval problems.
+
+That error path could not have affected routing anyway: `FetchCredentialQuota` is a read-only management endpoint. CPA stops routing to a credential through executor cooldown reporting (see below), not through the quota surface. The plugin API exposes no RPC to set a cooldown or mark a credential unavailable; only `scheduler.pick` could influence selection, and that is a global scheduler, too invasive for this provider.
 
 ### Host SDK compatibility floor
 

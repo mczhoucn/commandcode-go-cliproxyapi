@@ -2,11 +2,23 @@
 
 本文件记录面向使用者的更新摘要。详细版本历史见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，操作步骤见 [中文说明](README.zh-CN.md) / [English README](README.md)。
 
+## v0.2.2 — 2026-11-12
+
+- 修复 v0.2.1 的问题：窗口耗尽时整张额度卡片显示「额度加载失败：failed to fetch quota: weekly usage window exhausted」，用户看不到任何窗口数据。
+- 现在耗尽不再当作查询失败。卡片照常显示三个窗口（进度条已是 100%），并在套餐旁多出一行说明是哪个限额已用完。
+- 只有真正的取数失败（网络、鉴权、响应格式）才会报错。
+
+### v0.2.2 English highlights — 2026-11-12
+
+- Fix the v0.2.1 regression where an exhausted window made the whole card read "failed to fetch quota", hiding every window value.
+- Exhaustion is no longer a fetch failure: the card shows all three windows at 100% plus one row naming the exhausted limit.
+- Only genuine retrieval failures (network, auth, malformed response) surface as errors.
+
 ## v0.2.1 — 2026-11-12
 
 - **额度窗口按层级联动**：月度、每周、5 小时三条窗口是嵌套关系，短窗口从长窗口划出。长窗口耗尽时，短窗口强制显示为已用完，即使上游仍报告有余量——否则界面会误导用户继续请求，而实际只会收到拒绝。
 - 归零只向下传染：每周用完会把 5 小时窗口归零；5 小时用完不影响每周和每月。
-- 任意窗口耗尽时，标准额度查询直接返回失败并说明是哪个窗口耗尽（月度 / 每周 / 5 小时），而不是返回一张 0% 的空闲卡片。
+- 任意窗口耗尽时，标准额度查询返回失败并指明是哪个窗口耗尽。**这一条在 v0.2.2 中已改回**：返回失败会让整张卡片变成「加载失败」，反而看不到窗口数据。
 - 判定口径：`status` 为 `exceeded`、或 `used >= cap` 都算耗尽；`unlimited` 和 cap 为 0 的窗口永不视为耗尽。
 - 不改变套餐支持范围或上游协议。
 
@@ -14,7 +26,7 @@
 
 - **Quota windows now cascade by hierarchy.** The monthly, weekly and 5-hour windows nest, so a spent longer window forces the shorter ones to render as exhausted even when the upstream still reports headroom — otherwise the UI invites requests the account cannot serve.
 - Propagation is downward only: a spent week zeroes the 5-hour window; a spent 5-hour window leaves the week and month untouched.
-- When any window is spent, the standard quota fetch fails with the exhausted window named (monthly / weekly / 5-hour) instead of returning a 0%-remaining card that reads as idle.
+- When any window was spent, the standard quota fetch failed with the exhausted window named. **Reverted in v0.2.2**: the failure hid every window value behind "failed to fetch quota".
 - Exhaustion counts an `exceeded` status or `used >= cap`; `unlimited` and zero-cap windows are never exhausted.
 - No plan-support or upstream-protocol changes.
 

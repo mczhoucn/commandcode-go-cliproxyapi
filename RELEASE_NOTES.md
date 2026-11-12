@@ -2,6 +2,22 @@
 
 User-facing change summary: [ChangeLog](CHANGELOG.md). Supported plans: **CommandCode GOAT / Pro / Max**, not CommandCode Go.
 
+## v0.2.2 — Quota card stays readable when a window is spent (2026-11-12)
+
+- Fix a v0.2.1 regression: when any usage window was exhausted the whole card showed "failed to fetch quota: … usage window exhausted", hiding every window value.
+- Exhaustion is no longer treated as a fetch failure. The card shows all three windows (already at 100%) and adds one row naming the exhausted limit (monthly / weekly / 5-hour).
+- Only genuine retrieval failures — network, auth, malformed response — surface as errors.
+- Behaviour is otherwise identical to v0.2.1.
+- Supported plans remain **CommandCode GOAT / Pro / Max; CommandCode Go is not supported**.
+
+**中文**
+
+- 修复 v0.2.1 的回归问题：任一用量窗口耗尽时，整张额度卡片显示「额度加载失败」，看不到任何窗口数据。
+- 耗尽不再当作查询失败。卡片照常显示三个窗口（进度条已是 100%），并多出一行说明是哪个限额已用完（月度 / 每周 / 5 小时）。
+- 只有真正的取数失败（网络、鉴权、响应格式）才会报错。
+- 其余行为与 v0.2.1 相同。
+- 仍然只支持 **CommandCode GOAT / Pro / Max，不支持 Go 套餐**。
+
 ## v0.2.0 — Renamed to `commandcode-or-or-cliproxyapi` (2026-11-12)
 
 - The plugin is now **`commandcode-or-or-cliproxyapi`** (formerly `commandcode-go-cliproxyapi`). The new name drops the misleading `go`, which never meant CommandCode Go plan support.

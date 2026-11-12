@@ -141,28 +141,69 @@ func TestExhaustedWindowPrecedence(t *testing.T) {
 	}
 }
 
-// A spent credential must make the standard quota fetch fail, naming the
-// window, rather than returning a 0% card that reads as healthy-but-idle.
-func TestQuotaFetchFailsWhenWindowExhausted(t *testing.T) {
+// An exhausted window must be REPORTED, not turned into a fetch failure: the
+// host renders any error as "failed to fetch quota" and drops the card, so the
+// window data that explains the situation would disappear. The label names the
+// limit instead, and the buckets already read 100% used.
+func TestExhaustedWindowProducesLabelNotError(t *testing.T) {
 	for _, window := range []string{"month", "weekly", "five_hour"} {
-		err := quotaExhaustedError(window)
-		if err == nil {
-			t.Fatalf("%s: nil error", window)
+		label := quotaExhaustedLabel(window)
+		if label == "" {
+			t.Fatalf("%s: empty label", window)
 		}
-		msg := err.Error()
 		switch window {
 		case "month":
-			if !strings.Contains(msg, "monthly") {
-				t.Errorf("month message = %q", msg)
+			if !strings.Contains(label, "Monthly") {
+				t.Errorf("month label = %q", label)
 			}
 		case "weekly":
-			if !strings.Contains(msg, "weekly") {
-				t.Errorf("weekly message = %q", msg)
+			if !strings.Contains(label, "Weekly") {
+				t.Errorf("weekly label = %q", label)
 			}
 		case "five_hour":
-			if !strings.Contains(msg, "5-hour") {
-				t.Errorf("five-hour message = %q", msg)
+			if !strings.Contains(label, "5-hour") {
+				t.Errorf("five-hour label = %q", label)
 			}
 		}
+	}
+	if label := quotaExhaustedLabel(""); label != "" {
+		t.Errorf("healthy quota must not produce a label, got %q", label)
+	}
+}
+
+// The response keeps the buckets and adds a summary row naming the limit.
+func TestQuotaResponseCarriesExhaustionSummary(t *testing.T) {
+	usage := quotaUsage{
+		Plan:     "GOAT",
+		Weekly:   quotaWindow{Status: "exceeded", Used: 35, Cap: 35, Percent: 100},
+		FiveHour: quotaWindow{Status: "exceeded", Used: 14, Cap: 14, Percent: 100},
+	}
+	resp := quotaResponseFromUsage(usage)
+	if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 2 {
+		t.Fatalf("buckets must survive exhaustion: %+v", resp.Groups)
+	}
+	if len(resp.Summary) != 1 {
+		t.Fatalf("summary = %+v, want one exhaustion row", resp.Summary)
+	}
+	if !strings.Contains(resp.Summary[0].Label, "Weekly") {
+		t.Errorf("summary label = %q, want the week named", resp.Summary[0].Label)
+	}
+	// The folded five-hour bucket still reads fully used.
+	for _, b := range resp.Groups[0].Buckets {
+		if b.Window == "five_hour" && b.RemainingFraction != 0 {
+			t.Errorf("five-hour remaining = %v, want 0", b.RemainingFraction)
+		}
+	}
+}
+
+// A healthy credential adds no summary row.
+func TestHealthyQuotaHasNoExhaustionSummary(t *testing.T) {
+	resp := quotaResponseFromUsage(quotaUsage{
+		Plan:     "GOAT",
+		Weekly:   quotaWindow{Status: "ok", Used: 5, Cap: 35},
+		FiveHour: quotaWindow{Status: "ok", Used: 1, Cap: 14},
+	})
+	if len(resp.Summary) != 0 {
+		t.Fatalf("summary = %+v, want none", resp.Summary)
 	}
 }
