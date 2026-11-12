@@ -73,12 +73,13 @@ Without this plugin, a manual CommandCode GOAT / Pro / Max integration must mana
 - **CLIProxyAPI**: `v8.0.43+` (first release with the quota provider and the cooldown error fields this plugin reports)
 - **Go Toolchain**: Go 1.26+ (CGO enabled for `-buildmode=c-shared`)
 
-## v0.1.4 upgrade and release notes
+## v0.1.5 upgrade and release notes
 
-- This release fixes the compatibility issue where the CommandCode quota and OAuth pages showed “Enable Remember password” even when Remember password was enabled in Management Center. The pages now decode both the legacy `enc::v1::` and current `enc::v2::` `cli-proxy-auth` storage formats, using the correct origin-based key derivation for v2.
-- Existing auth files remain usable. Plugin `api-keys` config is retired and is not imported. Add an existing key in **CommandCode → CommandCode accounts and quota**, or use **OAuth login → CommandCode** without manually adding keys to configuration. Auth-file uploads remain available; disable and delete stay on the host auth-file page.
+- This release adds the standard CPA `QuotaProvider` capability, so CommandCode credentials show plan and remaining usage directly on the host's auth-file cards, and makes model/credential cooldowns follow CPA's own configuration instead of host defaults.
+- It also completes the DeepSeek-documented client surface on all three protocols: historical thinking is replayed (required by tool-carrying multi-turn requests), Anthropic `output_config.effort` is honoured, image `detail` survives translation, and Responses reasoning events are emitted under both the OpenAI and DeepSeek event families.
+- **Breaking**: minimum CLIProxyAPI is now `v8.0.43`; the plugin declares schema 6 and no longer loads on older hosts. Replace the library, restart CPA and refresh Management Center.
 - For a manual upgrade, replace the library for the target OS/architecture, restart CLIProxyAPI, then refresh Management Center. Updating this repository's version does not update an already running plugin.
-- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.1.4`. Each supported platform needs `commandcode-go-cliproxyapi_0.1.4_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
+- For [CPA plugin-store publication](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements), use the GitHub release tag `v0.1.5`. Each supported platform needs `commandcode-go-cliproxyapi_0.1.5_<goos>_<goarch>.zip`, plus the release-wide `checksums.txt` in SHA-256 format. The existing build workflow generates these assets when a version tag is pushed.
 - Each ZIP must contain exactly one matching library at its root: `commandcode-go-cliproxyapi.so`, `commandcode-go-cliproxyapi.dylib`, or `commandcode-go-cliproxyapi.dll`. Keep the plugin ID and repository URL unchanged; the store reads the version from the latest GitHub release.
 
 

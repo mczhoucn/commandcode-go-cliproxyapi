@@ -73,12 +73,13 @@ CommandCode GOAT / Pro / Max 通过它的 OpenAI 兼容入口访问：
 - **CLIProxyAPI**：`v8.0.43+`（首个同时支持配额提供者和本插件上报的冷却错误字段的版本）
 - **Go**：1.26+（`-buildmode=c-shared` 需要启用 CGO）
 
-## v0.1.4 升级与发布说明
+## v0.1.5 升级与发布说明
 
-- 本版本修复管理后台已勾选“记住密码”时，CommandCode 配额页和 OAuth 页仍显示“Enable Remember password”的兼容性问题。现在两处页面都能解码旧的 `enc::v1::` 和当前的 `enc::v2::` `cli-proxy-auth` 存储格式，并按 v2 要求使用当前地址推导密钥。
-- 已有认证文件继续使用。插件配置中的 `api-keys` 已停用，不会自动导入。新增账户可在 **CommandCode → CommandCode账户与额度** 输入已有 API key，或通过 **OAuth 登录 → CommandCode** 授权添加，无需再手工向配置文件添加 key；仍可自行上传认证文件，禁用和删除仍在宿主认证文件页。
+- 本版本注册 CPA 的标准配额提供者能力，CommandCode 认证文件卡片可以直接显示套餐与剩余额度；模型与凭据冷却改为完全跟随 CPA 的冷却配置。
+- 同时补齐 DeepSeek 文档定义的三种客户端协议能力：历史思考内容回传（带 tools 的多轮请求必需）、Anthropic `output_config.effort`、图片 `detail`，以及 Responses 思考事件的双族发送。
+- **不兼容变更**：最低 CLIProxyAPI 版本提高到 `v8.0.43`；插件声明 schema 6，更老的宿主将无法加载。请替换插件库、重启 CPA 并刷新管理后台。
 - 手动升级时，替换与目标操作系统、处理器架构对应的插件库，重启 CLIProxyAPI，再刷新管理后台。只修改本仓库的版本号，不会更新已经运行的插件。
-- 向 [CPA 插件仓库](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements)提交前，需要发布 GitHub 标签 `v0.1.4`。每个受支持平台应提供 `commandcode-go-cliproxyapi_0.1.4_<goos>_<goarch>.zip`，并提供汇总的 SHA-256 校验文件 `checksums.txt`。推送版本标签后，现有构建流程会生成这些文件。
+- 向 [CPA 插件仓库](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store#release-requirements)提交前，需要发布 GitHub 标签 `v0.1.5`。每个受支持平台应提供 `commandcode-go-cliproxyapi_0.1.5_<goos>_<goarch>.zip`，并提供汇总的 SHA-256 校验文件 `checksums.txt`。推送版本标签后，现有构建流程会生成这些文件。
 - 每个 ZIP 的根目录只能包含一个对应的插件库：`commandcode-go-cliproxyapi.so`、`commandcode-go-cliproxyapi.dylib` 或 `commandcode-go-cliproxyapi.dll`。插件 ID 和仓库地址保持不变；插件仓库通过最新 GitHub Release 获取版本。
 
 
